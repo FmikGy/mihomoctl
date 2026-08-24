@@ -1,0 +1,19 @@
+[Unit]
+Description=Update due mihomoctl subscriptions
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=mihomoctl profile update --due --output json
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+# The active Mihomo config is discovered at runtime and may live under /etc.
+ProtectSystem=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true

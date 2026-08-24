@@ -1,0 +1,17 @@
+/bin/
+/dist/
+/coverage.out
+*.deb
+*.rpm
+*.tar.gz
+*.test
+*.prof
+
+# Local credentials and runtime-only files.
+.env
+.env.*
+!.env.example
+client.yaml
+*.key
+*.pem
+.tmp-*

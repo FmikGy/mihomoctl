@@ -1,0 +1,98 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+project_name: mihomoctl
+
+builds:
+  - id: mihomoctl
+    main: ./cmd/mihomoctl
+    binary: mihomoctl
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - >-
+        -s -w
+        -X mihomoctl/internal/domain.Version={{.Version}}
+        -X mihomoctl/internal/domain.Commit={{.Commit}}
+        -X mihomoctl/internal/domain.Date={{.Date}}
+
+archives:
+  - id: archives
+    ids:
+      - mihomoctl
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE*
+      - README*
+      - packaging/systemd/*
+
+nfpms:
+  - id: linux-packages
+    ids:
+      - mihomoctl
+    package_name: mihomoctl
+    vendor: mihomoctl contributors
+    maintainer: mihomoctl contributors
+    description: A concise Linux command-line and TUI controller for Mihomo
+    license: MIT
+    bindir: /usr/bin
+    formats:
+      - deb
+      - rpm
+    contents:
+      - src: packaging/systemd/mihomoctl-update.service
+        dst: /usr/lib/systemd/system/mihomoctl-update.service
+        file_info:
+          mode: 0644
+      - src: packaging/systemd/mihomoctl-update.timer
+        dst: /usr/lib/systemd/system/mihomoctl-update.timer
+        file_info:
+          mode: 0644
+      - src: LICENSE
+        dst: /usr/share/doc/mihomoctl/LICENSE
+        file_info:
+          mode: 0644
+      - src: README.md
+        dst: /usr/share/doc/mihomoctl/README.md
+        file_info:
+          mode: 0644
+      - dst: /etc/mihomoctl
+        type: dir
+        file_info:
+          mode: 0700
+      - dst: /var/lib/mihomoctl
+        type: dir
+        file_info:
+          mode: 0755
+    scripts:
+      postinstall: packaging/scripts/postinstall.sh
+      preremove: packaging/scripts/preremove.sh
+      postremove: packaging/scripts/postremove.sh
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+sboms:
+  - id: archive-sbom
+    artifacts: archive
+    disable: false
+  - id: package-sbom
+    artifacts: package
+    disable: false
+
+changelog:
+  disable: true
+
+release:
+  draft: true

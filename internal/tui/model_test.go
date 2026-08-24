@@ -1,0 +1,650 @@
+package tui
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
+
+	"mihomoctl/internal/domain"
+)
+
+type fakeBackend struct {
+	status   domain.RuntimeStatus
+	groups   []domain.ProxyGroup
+	profiles []domain.Profile
+	conns    []domain.Connection
+	action   string
+	schedule *bool
+	delays   map[string]uint16
+	groupErr error
+	tested   string
+}
+
+func (f *fakeBackend) Status(context.Context) (domain.RuntimeStatus, error)     { return f.status, nil }
+func (f *fakeBackend) Groups(context.Context) ([]domain.ProxyGroup, error)      { return f.groups, nil }
+func (f *fakeBackend) Profiles(context.Context) ([]domain.Profile, error)       { return f.profiles, nil }
+func (f *fakeBackend) Connections(context.Context) ([]domain.Connection, error) { return f.conns, nil }
+func (f *fakeBackend) WatchLogs(context.Context, string) (<-chan domain.LogEntry, <-chan error) {
+	entries := make(chan domain.LogEntry)
+	errs := make(chan error)
+	return entries, errs
+}
+func (f *fakeBackend) Service(_ context.Context, action string) error { f.action = action; return nil }
+func (f *fakeBackend) SetMode(context.Context, domain.Mode) error     { return nil }
+func (f *fakeBackend) SetTUN(context.Context, bool) error             { return nil }
+func (f *fakeBackend) SetSchedule(_ context.Context, enabled bool) error {
+	f.schedule = &enabled
+	return nil
+}
+func (f *fakeBackend) ScheduleStatus(context.Context) (domain.ScheduleStatus, error) {
+	return domain.ScheduleStatus{Enabled: true, State: "running"}, nil
+}
+func (f *fakeBackend) SelectProxy(context.Context, string, string) error { return nil }
+func (f *fakeBackend) TestGroup(_ context.Context, group string) (map[string]uint16, error) {
+	f.tested = group
+	return f.delays, f.groupErr
+}
+func (f *fakeBackend) AddProfile(context.Context, string, string, time.Duration) error { return nil }
+func (f *fakeBackend) UpdateProfile(context.Context, string) error                     { return nil }
+func (f *fakeBackend) UseProfile(context.Context, string) error                        { return nil }
+func (f *fakeBackend) RemoveProfile(context.Context, string) error                     { return nil }
+func (f *fakeBackend) CloseConnection(context.Context, string) error                   { return nil }
+func (f *fakeBackend) CloseAllConnections(context.Context) error                       { return nil }
+
+func testModel() Model {
+	backend := &fakeBackend{
+		status:   domain.RuntimeStatus{Service: domain.ServiceStatus{Active: true}, ActiveProfile: "日常", Mode: domain.ModeRule, MixedPort: 7890},
+		groups:   []domain.ProxyGroup{{Name: "PROXY", Now: "香港 01", Proxies: []domain.Proxy{{Name: "香港 01", Type: "VLESS", Alive: true, Delay: 45}}}},
+		profiles: []domain.Profile{{Name: "日常", Kind: domain.ProfileRemote, Active: true}},
+		conns:    []domain.Connection{{ID: "1", Host: "example.com", Process: "curl", Download: 1024}},
+	}
+	m := New(context.Background(), backend)
+	m.width, m.height = 100, 30
+	m.status, m.groups, m.profiles, m.connections = backend.status, backend.groups, backend.profiles, backend.conns
+	return m
+}
+
+func numberedProxies(count int) []domain.Proxy {
+	proxies := make([]domain.Proxy, count)
+	for i := range proxies {
+		proxies[i] = domain.Proxy{Name: fmt.Sprintf("node-%02d", i), Type: "Hysteria2", Alive: true}
+	}
+	return proxies
+}
+
+func selectedItemVisible(view, item string) bool {
+	for _, line := range strings.Split(ansi.Strip(view), "\n") {
+		if strings.Contains(line, "›") && strings.Contains(line, item) {
+			return true
+		}
+	}
+	return false
+}
+
+func requireSelectedVisible(t *testing.T, m Model, item string) {
+	t.Helper()
+	if view := m.render(); !selectedItemVisible(view, item) {
+		t.Fatalf("selected item %q is outside the viewport:\n%s", item, ansi.Strip(view))
+	}
+}
+
+func TestRenderPagesFit(t *testing.T) {
+	for _, size := range [][2]int{{60, 16}, {80, 24}, {120, 36}} {
+		for p := pageOverview; p <= pageSettings; p++ {
+			m := testModel()
+			m.width, m.height, m.page = size[0], size[1], p
+			view := m.render()
+			lines := strings.Split(view, "\n")
+			if len(lines) != size[1] {
+				t.Fatalf("page %d at %v rendered %d lines", p, size, len(lines))
+			}
+			for lineNumber, line := range lines {
+				if width := ansi.StringWidth(line); width > size[0] {
+					t.Fatalf("page %d at %v line %d width = %d", p, size, lineNumber+1, width)
+				}
+			}
+		}
+	}
+}
+
+func TestContextualFooterHints(t *testing.T) {
+	tests := []struct {
+		page  page
+		hints []string
+	}{
+		{pageOverview, []string{"Enter启停", "r刷新", "Tab切页", "?帮助", "q退出"}},
+		{pageProxies, []string{"↑↓选", "[]组", "Enter切换", "t测速", "/筛选", "?帮助", "q退出"}},
+		{pageProfiles, []string{"↑↓选", "a添加", "u更新", "d删除", "Enter激活", "?帮助", "q退出"}},
+		{pageConnections, []string{"↑↓选", "Enter关闭", "x全部", "/筛选", "?帮助", "q退出"}},
+		{pageLogs, []string{"Space暂停", "/筛选", "r刷新", "?帮助", "q退出"}},
+		{pageSettings, []string{"↑↓选", "Enter切换", "r刷新", "?帮助", "q退出"}},
+	}
+
+	for _, tt := range tests {
+		m := testModel()
+		m.width, m.height, m.page = 60, 16, tt.page
+		view := ansi.Strip(m.render())
+		for _, hint := range tt.hints {
+			if !strings.Contains(view, hint) {
+				t.Errorf("page %d missing footer hint %q:\n%s", tt.page, hint, view)
+			}
+		}
+	}
+}
+
+func TestFooterFitsNarrowWidthsWithoutWrapping(t *testing.T) {
+	for _, width := range []int{24, 32, 48, 60} {
+		for p := pageOverview; p <= pageSettings; p++ {
+			m := testModel()
+			m.width, m.page = width, p
+			footer := ansi.Strip(m.renderFooter())
+			if strings.Contains(footer, "\n") {
+				t.Fatalf("page %d footer wrapped at width %d: %q", p, width, footer)
+			}
+			if got := ansi.StringWidth(footer); got > width {
+				t.Fatalf("page %d footer width at %d = %d: %q", p, width, got, footer)
+			}
+			for _, essential := range []string{"?帮助", "q退出"} {
+				if !strings.Contains(footer, essential) {
+					t.Fatalf("page %d footer at width %d missing %q: %q", p, width, essential, footer)
+				}
+			}
+		}
+	}
+}
+
+func TestFooterKeepsHelpAndQuitWithTransientMessages(t *testing.T) {
+	tests := []struct {
+		name  string
+		apply func(*Model)
+	}{
+		{"loading", func(m *Model) { m.loading = true }},
+		{"error", func(m *Model) { m.err = strings.Repeat("控制器不可用", 20) }},
+		{"toast", func(m *Model) { m.toast = strings.Repeat("操作完成", 20) }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := testModel()
+			m.width = 60
+			tt.apply(&m)
+			footer := ansi.Strip(m.renderFooter())
+			if strings.Contains(footer, "\n") || ansi.StringWidth(footer) > m.width {
+				t.Fatalf("transient footer overflowed: %q", footer)
+			}
+			for _, essential := range []string{"?帮助", "q退出"} {
+				if !strings.Contains(footer, essential) {
+					t.Fatalf("transient footer missing %q: %q", essential, footer)
+				}
+			}
+		})
+	}
+}
+
+func TestPausedLogsFooterShowsResume(t *testing.T) {
+	m := testModel()
+	m.width, m.page, m.logPaused = 60, pageLogs, true
+	footer := ansi.Strip(m.renderFooter())
+	if !strings.Contains(footer, "Space继续") || strings.Contains(footer, "Space暂停") {
+		t.Fatalf("paused log footer did not offer resume: %q", footer)
+	}
+}
+
+func TestSmallTerminalMessage(t *testing.T) {
+	m := testModel()
+	m.width, m.height = 40, 10
+	if got := m.render(); !strings.Contains(got, "终端空间不足") {
+		t.Fatalf("missing resize message: %q", got)
+	}
+}
+
+func TestFilterConnections(t *testing.T) {
+	m := testModel()
+	m.connections = append(m.connections, domain.Connection{ID: "2", Host: "openai.com", Process: "browser"})
+	m.filter = "openai"
+	got := m.filteredConnections()
+	if len(got) != 1 || got[0].ID != "2" {
+		t.Fatalf("unexpected filter result: %#v", got)
+	}
+}
+
+func TestFilterLogs(t *testing.T) {
+	m := testModel()
+	m.logs = []domain.LogEntry{{Level: "info", Message: "connected"}, {Level: "error", Message: "timeout"}}
+	m.filter = "TIME"
+	got := m.filteredLogs()
+	if len(got) != 1 || got[0].Message != "timeout" {
+		t.Fatalf("unexpected log filter result: %#v", got)
+	}
+}
+
+func TestSafeTextStripsUntrustedTerminalSequences(t *testing.T) {
+	malicious := "safe\x1b]52;c;Y2xpcGJvYXJk\a\x1b[31mred\x1b[0m\nnext\x00"
+	cleaned := safeText(malicious)
+	if strings.ContainsAny(cleaned, "\x1b\a\n\r\t\x00") || strings.Contains(cleaned, "Y2xpcGJvYXJk") {
+		t.Fatalf("safeText retained terminal controls: %q", cleaned)
+	}
+	for _, text := range []string{"safe", "red", "next"} {
+		if !strings.Contains(cleaned, text) {
+			t.Fatalf("safeText removed printable text %q: %q", text, cleaned)
+		}
+	}
+}
+
+func TestProfileInputMasksSource(t *testing.T) {
+	m := testModel()
+	m.page = pageProfiles
+	updated, _ := m.Update(tea.KeyPressMsg{Code: 'a', Text: "a"})
+	m = updated.(Model)
+	if m.inMode != inputProfile || m.input.EchoMode != textinput.EchoPassword || m.input.EchoCharacter != profileInputMask {
+		t.Fatal("profile input did not enable password echo mode")
+	}
+
+	source := "https://user:password@example.test/sub?token=private"
+	m.input.SetValue(source)
+	view := ansi.Strip(m.render())
+	if strings.Contains(view, source) {
+		t.Fatal("profile source is visible in the TUI")
+	}
+	if !strings.Contains(view, strings.Repeat(string(profileInputMask), len(source))) {
+		t.Fatal("profile source mask is not visible in the TUI")
+	}
+}
+
+func TestFilterInputIsVisibleAfterProfileInput(t *testing.T) {
+	m := testModel()
+	m.page = pageProfiles
+	updated, _ := m.Update(tea.KeyPressMsg{Code: 'a', Text: "a"})
+	m = updated.(Model)
+	m.input.SetValue("private source")
+	updated, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	m = updated.(Model)
+	if m.inMode != inputNone || m.input.EchoMode != textinput.EchoNormal || m.input.Value() != "" {
+		t.Fatal("canceling profile input did not reset the input model")
+	}
+
+	m.page = pageConnections
+	m.filter = "example.com"
+	updated, _ = m.Update(tea.KeyPressMsg{Code: '/', Text: "/"})
+	m = updated.(Model)
+	if m.inMode != inputFilter || m.input.EchoMode != textinput.EchoNormal {
+		t.Fatal("filter input did not use normal echo mode")
+	}
+	if view := ansi.Strip(m.render()); !strings.Contains(view, m.filter) {
+		t.Fatal("filter value is not visible in the TUI")
+	}
+}
+
+func TestSubmittingProfileResetsInput(t *testing.T) {
+	m := testModel()
+	m.page = pageProfiles
+	updated, _ := m.Update(tea.KeyPressMsg{Code: 'a', Text: "a"})
+	m = updated.(Model)
+	m.input.SetValue("ss://credentials@example.test:443")
+	updated, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("submitting profile input did not start the operation")
+	}
+	if m.inMode != inputNone || m.input.EchoMode != textinput.EchoNormal || m.input.Value() != "" || m.input.Placeholder != "" {
+		t.Fatal("submitting profile input did not reset the input model")
+	}
+	updated, _ = m.Update(cmd())
+	m = updated.(Model)
+	if m.toast != "配置已添加，请选中后按 Enter 激活" {
+		t.Fatalf("profile add toast = %q", m.toast)
+	}
+}
+
+func TestStatusErrorIsVisible(t *testing.T) {
+	m := testModel()
+	updated, _ := m.Update(statusMsg{err: errors.New("控制器不可用")})
+	model := updated.(Model)
+	if !strings.Contains(model.render(), "控制器不可用") {
+		t.Fatal("error was not rendered")
+	}
+}
+
+func TestQuitCancelsContext(t *testing.T) {
+	m := testModel()
+	_, cmd := m.Update(tea.KeyPressMsg{Code: 'q', Text: "q"})
+	if cmd == nil {
+		t.Fatal("expected quit command")
+	}
+	select {
+	case <-m.ctx.Done():
+	default:
+		t.Fatal("context was not canceled")
+	}
+}
+
+func TestCompactProxyPageShowsSelectableNodes(t *testing.T) {
+	m := testModel()
+	m.width, m.height, m.page = 70, 20, pageProxies
+	view := m.render()
+	if !strings.Contains(view, "香港 01") || !strings.Contains(view, "VLESS") {
+		t.Fatalf("compact proxy page hid node details:\n%s", view)
+	}
+}
+
+func TestProxyViewportKeepsSelectionVisible(t *testing.T) {
+	for _, size := range [][2]int{{60, 16}, {100, 30}} {
+		t.Run(fmt.Sprintf("%dx%d", size[0], size[1]), func(t *testing.T) {
+			m := testModel()
+			m.width, m.height, m.page = size[0], size[1], pageProxies
+			m.groups[0].Name = strings.Repeat("long-group-", 10)
+			m.groups[0].Now = strings.Repeat("selected-node-", 8)
+			m.groups[0].Proxies = numberedProxies(40)
+			m.syncViewports()
+
+			for i := 0; i < 40; i++ {
+				requireSelectedVisible(t, m, fmt.Sprintf("node-%02d", i))
+				m.moveCursor(1)
+			}
+			if m.proxyCursor != 39 || m.proxyOffset == 0 {
+				t.Fatalf("bottom boundary did not advance viewport: cursor=%d offset=%d", m.proxyCursor, m.proxyOffset)
+			}
+
+			for i := 39; i >= 0; i-- {
+				requireSelectedVisible(t, m, fmt.Sprintf("node-%02d", i))
+				m.moveCursor(-1)
+			}
+			if m.proxyCursor != 0 || m.proxyOffset != 0 {
+				t.Fatalf("top boundary did not reset viewport: cursor=%d offset=%d", m.proxyCursor, m.proxyOffset)
+			}
+		})
+	}
+}
+
+func TestProfileAndConnectionViewportsStayStable(t *testing.T) {
+	for _, size := range [][2]int{{60, 16}, {100, 30}} {
+		t.Run(fmt.Sprintf("profiles_%dx%d", size[0], size[1]), func(t *testing.T) {
+			m := testModel()
+			m.width, m.height, m.page = size[0], size[1], pageProfiles
+			m.profiles = make([]domain.Profile, 40)
+			for i := range m.profiles {
+				m.profiles[i] = domain.Profile{Name: fmt.Sprintf("profile-%02d", i), Kind: domain.ProfileRemote}
+			}
+			m.moveCursor(1000)
+			requireSelectedVisible(t, m, "profile-39")
+			if m.profileOffset == 0 {
+				t.Fatal("profile viewport did not advance")
+			}
+			offset := m.profileOffset
+			m.moveCursor(-1)
+			requireSelectedVisible(t, m, "profile-38")
+			if m.profileOffset != offset {
+				t.Fatalf("profile viewport moved while selection remained visible: %d -> %d", offset, m.profileOffset)
+			}
+			m.moveCursor(-1000)
+			requireSelectedVisible(t, m, "profile-00")
+			if m.profileOffset != 0 {
+				t.Fatalf("profile viewport did not return to top: %d", m.profileOffset)
+			}
+		})
+
+		t.Run(fmt.Sprintf("connections_%dx%d", size[0], size[1]), func(t *testing.T) {
+			m := testModel()
+			m.width, m.height, m.page = size[0], size[1], pageConnections
+			m.connections = make([]domain.Connection, 40)
+			for i := range m.connections {
+				m.connections[i] = domain.Connection{ID: fmt.Sprintf("id-%02d", i), Host: fmt.Sprintf("host-%02d.example", i)}
+			}
+			m.moveCursor(1000)
+			requireSelectedVisible(t, m, "host-39.example")
+			if m.connectionOffset == 0 {
+				t.Fatal("connection viewport did not advance")
+			}
+			offset := m.connectionOffset
+			m.moveCursor(-1)
+			requireSelectedVisible(t, m, "host-38.example")
+			if m.connectionOffset != offset {
+				t.Fatalf("connection viewport moved while selection remained visible: %d -> %d", offset, m.connectionOffset)
+			}
+			m.moveCursor(-1000)
+			requireSelectedVisible(t, m, "host-00.example")
+			if m.connectionOffset != 0 {
+				t.Fatalf("connection viewport did not return to top: %d", m.connectionOffset)
+			}
+		})
+	}
+}
+
+func TestGroupViewportWrapsAndKeepsSelectionVisible(t *testing.T) {
+	for _, size := range [][2]int{{60, 16}, {100, 30}} {
+		t.Run(fmt.Sprintf("%dx%d", size[0], size[1]), func(t *testing.T) {
+			m := testModel()
+			m.width, m.height, m.page = size[0], size[1], pageProxies
+			m.groups = make([]domain.ProxyGroup, 30)
+			for i := range m.groups {
+				m.groups[i] = domain.ProxyGroup{
+					Name:    fmt.Sprintf("group-%02d", i),
+					Now:     fmt.Sprintf("group-node-%02d", i),
+					Proxies: []domain.Proxy{{Name: fmt.Sprintf("group-node-%02d", i), Type: "Direct", Alive: true}},
+				}
+			}
+			for i := 0; i < 29; i++ {
+				m.moveGroup(1)
+			}
+			requireSelectedVisible(t, m, "group-node-29")
+			if m.groupCursor != 29 || m.groupOffset == 0 {
+				t.Fatalf("group viewport did not reach the last group: cursor=%d offset=%d", m.groupCursor, m.groupOffset)
+			}
+			m.moveGroup(1)
+			requireSelectedVisible(t, m, "group-node-00")
+			if m.groupCursor != 0 || m.groupOffset != 0 || m.proxyCursor != 0 || m.proxyOffset != 0 {
+				t.Fatalf("group wrap did not reset cursors and viewports: group=%d/%d proxy=%d/%d", m.groupCursor, m.groupOffset, m.proxyCursor, m.proxyOffset)
+			}
+		})
+	}
+}
+
+func TestFilteringClampsProxyAndConnectionViewports(t *testing.T) {
+	for _, size := range [][2]int{{60, 16}, {100, 30}} {
+		t.Run(fmt.Sprintf("%dx%d", size[0], size[1]), func(t *testing.T) {
+			m := testModel()
+			m.width, m.height, m.page = size[0], size[1], pageProxies
+			m.groups[0].Proxies = numberedProxies(40)
+			for _, index := range []int{10, 20, 30} {
+				m.groups[0].Proxies[index].Name = fmt.Sprintf("keep-%02d", index)
+			}
+			m.proxyCursor = 20
+			m.syncViewports()
+			m.applyFilter("keep")
+			requireSelectedVisible(t, m, "keep-20")
+			if m.proxyCursor != 1 || m.proxyOffset != 0 {
+				t.Fatalf("proxy filter did not clamp viewport: cursor=%d offset=%d", m.proxyCursor, m.proxyOffset)
+			}
+
+			m.page = pageConnections
+			m.filter = ""
+			m.connections = make([]domain.Connection, 40)
+			for i := range m.connections {
+				host := fmt.Sprintf("host-%02d.example", i)
+				if i == 10 || i == 20 || i == 30 {
+					host = fmt.Sprintf("keep-%02d.example", i)
+				}
+				m.connections[i] = domain.Connection{ID: fmt.Sprintf("id-%02d", i), Host: host}
+			}
+			m.connectionCursor = 20
+			m.syncViewports()
+			m.applyFilter("keep")
+			requireSelectedVisible(t, m, "keep-20.example")
+			if m.connectionCursor != 1 || m.connectionOffset != 0 {
+				t.Fatalf("connection filter did not clamp viewport: cursor=%d offset=%d", m.connectionCursor, m.connectionOffset)
+			}
+		})
+	}
+}
+
+func TestGroupNameFilterShowsMembersAndPreservesSelection(t *testing.T) {
+	for _, size := range [][2]int{{60, 16}, {100, 30}} {
+		t.Run(fmt.Sprintf("%dx%d", size[0], size[1]), func(t *testing.T) {
+			m := testModel()
+			m.width, m.height, m.page = size[0], size[1], pageProxies
+			m.groups = append(m.groups, domain.ProxyGroup{Name: "special-group", Proxies: numberedProxies(30)})
+			m.groupCursor, m.proxyCursor = 1, 20
+			m.syncViewports()
+
+			m.applyFilter("special-group")
+			if m.groupCursor != 0 || m.proxyCursor != 20 || len(filteredProxies(m.filteredGroups()[0], m.filter)) != 30 {
+				t.Fatalf("group-name filter lost selection: group=%d proxy=%d", m.groupCursor, m.proxyCursor)
+			}
+			requireSelectedVisible(t, m, "node-20")
+
+			m.applyFilter("")
+			if m.groupCursor != 1 || m.proxyCursor != 20 {
+				t.Fatalf("clearing group filter lost selection: group=%d proxy=%d", m.groupCursor, m.proxyCursor)
+			}
+			requireSelectedVisible(t, m, "node-20")
+		})
+	}
+}
+
+func TestSettingsSelectionVisibleAtBoundaries(t *testing.T) {
+	m := testModel()
+	m.width, m.height, m.page = 60, 16, pageSettings
+	m.moveCursor(1000)
+	requireSelectedVisible(t, m, "订阅定时更新")
+	m.moveCursor(-1000)
+	requireSelectedVisible(t, m, "Mihomo 服务")
+}
+
+func TestGroupTestAppliesReturnedDelays(t *testing.T) {
+	m := testModel()
+	m.width, m.height, m.page = 60, 16, pageProxies
+	testedGroup := domain.ProxyGroup{
+		Name: "SECOND",
+		All:  []string{"target-key", "zero-key", "omitted-key"},
+		Proxies: []domain.Proxy{
+			{Name: "target-node", Type: "VLESS", Alive: false},
+			{Name: "zero-node", Type: "VLESS", Alive: false, Delay: 44},
+			{Name: "omitted-node", Type: "VLESS", Alive: true, Delay: 88},
+		},
+	}
+	m.groups = append(m.groups, testedGroup)
+	m.filter = "target-node"
+	m.clampCursors()
+	backend := m.backend.(*fakeBackend)
+	backend.delays = map[string]uint16{"target-key": 123, "zero-key": 0}
+
+	updated, cmd := m.Update(tea.KeyPressMsg{Code: 't', Text: "t"})
+	if cmd == nil {
+		t.Fatal("group test did not start")
+	}
+	m = updated.(Model)
+	updated, _ = m.Update(cmd())
+	m = updated.(Model)
+	if backend.tested != "SECOND" {
+		t.Fatalf("tested wrong filtered group: %q", backend.tested)
+	}
+	proxies := m.groups[1].Proxies
+	if proxies[0].Delay != 123 || !proxies[0].Alive {
+		t.Fatalf("returned delay was not applied: %#v", proxies[0])
+	}
+	if proxies[1].Delay != 0 || !proxies[1].Alive {
+		t.Fatalf("present zero delay was not treated as successful: %#v", proxies[1])
+	}
+	if proxies[2].Delay != 0 || proxies[2].Alive {
+		t.Fatalf("omitted node retained stale health: %#v", proxies[2])
+	}
+	if view := ansi.Strip(m.render()); !strings.Contains(view, "123 ms") {
+		t.Fatalf("returned delay is not visible:\n%s", view)
+	}
+
+	refreshed := testedGroup
+	refreshed.Proxies = []domain.Proxy{
+		{Name: "target-node", Type: "VLESS", Alive: false},
+		{Name: "zero-node", Type: "VLESS", Alive: false, Delay: 55},
+		{Name: "omitted-node", Type: "VLESS", Alive: true, Delay: 99},
+	}
+	updated, _ = m.Update(groupsMsg{groups: []domain.ProxyGroup{refreshed}})
+	m = updated.(Model)
+	proxies = m.groups[0].Proxies
+	if proxies[0].Delay != 123 || !proxies[0].Alive || proxies[1].Delay != 0 || !proxies[1].Alive || proxies[2].Delay != 0 || proxies[2].Alive {
+		t.Fatalf("group refresh overwrote delay overlay: %#v", proxies)
+	}
+
+	coreState := refreshed
+	coreState.Proxies = []domain.Proxy{
+		{Name: "target-node", Type: "VLESS", Alive: false, Delay: 7},
+		{Name: "zero-node", Type: "VLESS", Alive: false, Delay: 8},
+		{Name: "omitted-node", Type: "VLESS", Alive: true, Delay: 99},
+	}
+	updated, _ = m.Update(groupsMsg{groups: []domain.ProxyGroup{coreState}})
+	m = updated.(Model)
+	proxies = m.groups[0].Proxies
+	if proxies[0].Delay != 7 || proxies[0].Alive || proxies[1].Delay != 8 || proxies[1].Alive || proxies[2].Delay != 99 || !proxies[2].Alive {
+		t.Fatalf("second group refresh did not trust core state: %#v", proxies)
+	}
+}
+
+func TestGroupTestErrorPreservesExistingDelayState(t *testing.T) {
+	m := testModel()
+	m.page = pageProxies
+	m.groups[0].Proxies[0].Delay = 77
+	m.groups[0].Proxies[0].Alive = false
+	backend := m.backend.(*fakeBackend)
+	backend.delays = map[string]uint16{"香港 01": 123}
+	backend.groupErr = errors.New("测速失败")
+
+	updated, cmd := m.Update(tea.KeyPressMsg{Code: 't', Text: "t"})
+	m = updated.(Model)
+	updated, _ = m.Update(cmd())
+	m = updated.(Model)
+	proxy := m.groups[0].Proxies[0]
+	if proxy.Delay != 77 || proxy.Alive {
+		t.Fatalf("failed group test mutated the node: %#v", proxy)
+	}
+	if m.loading || m.err != "测速失败" {
+		t.Fatalf("failed group test state = loading %v, error %q", m.loading, m.err)
+	}
+}
+
+func TestGroupTestWithoutUsableDelayIsExplicit(t *testing.T) {
+	m := testModel()
+	m.page = pageProxies
+	backend := m.backend.(*fakeBackend)
+	backend.delays = map[string]uint16{}
+
+	updated, cmd := m.Update(tea.KeyPressMsg{Code: 't', Text: "t"})
+	m = updated.(Model)
+	updated, _ = m.Update(cmd())
+	m = updated.(Model)
+	if m.toast != "测速完成，未获得可用延迟" {
+		t.Fatalf("empty group test result toast = %q", m.toast)
+	}
+}
+
+func TestGroupNavigationWraps(t *testing.T) {
+	m := testModel()
+	m.groups = append(m.groups, domain.ProxyGroup{Name: "备用", Proxies: []domain.Proxy{{Name: "东京 01"}}})
+	m.moveGroup(-1)
+	if m.groupCursor != 1 || m.proxyCursor != 0 {
+		t.Fatalf("unexpected wrapped cursors: group=%d proxy=%d", m.groupCursor, m.proxyCursor)
+	}
+}
+
+func TestScheduleSettingTogglesKnownState(t *testing.T) {
+	m := testModel()
+	m.page, m.settingCursor = pageSettings, 4
+	m.scheduleOK = true
+	m.schedule.Enabled = true
+	backend := m.backend.(*fakeBackend)
+	backend.action = ""
+	_, cmd := m.activateSetting()
+	if cmd == nil {
+		t.Fatal("expected schedule operation")
+	}
+	_ = cmd()
+	if backend.schedule == nil || *backend.schedule {
+		t.Fatalf("enabled schedule was not toggled off: %#v", backend.schedule)
+	}
+}
