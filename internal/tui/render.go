@@ -15,23 +15,29 @@ import (
 )
 
 type palette struct {
-	text, muted, accent, good, warn, bad, surface, border color.Color
+	text, muted, accent, onAccent, good, warn, bad, surface, border color.Color
 }
 
 func colors() palette {
-	if _, disabled := os.LookupEnv("NO_COLOR"); disabled {
+	if colorsDisabled() {
 		return palette{}
 	}
 	return palette{
-		text:    lipgloss.Color("252"),
-		muted:   lipgloss.Color("245"),
-		accent:  lipgloss.Color("81"),
-		good:    lipgloss.Color("42"),
-		warn:    lipgloss.Color("214"),
-		bad:     lipgloss.Color("203"),
-		surface: lipgloss.Color("236"),
-		border:  lipgloss.Color("240"),
+		text:     lipgloss.Color("252"),
+		muted:    lipgloss.Color("245"),
+		accent:   lipgloss.Color("81"),
+		onAccent: lipgloss.Color("16"),
+		good:     lipgloss.Color("42"),
+		warn:     lipgloss.Color("214"),
+		bad:      lipgloss.Color("203"),
+		surface:  lipgloss.Color("236"),
+		border:   lipgloss.Color("240"),
 	}
+}
+
+func colorsDisabled() bool {
+	_, disabled := os.LookupEnv("NO_COLOR")
+	return disabled
 }
 
 func (m Model) View() tea.View {
@@ -118,22 +124,110 @@ func (m Model) renderBody() string {
 
 func (m Model) renderOverview(height int) string {
 	c := colors()
-	label := lipgloss.NewStyle().Foreground(c.muted).Width(14)
-	value := lipgloss.NewStyle().Foreground(c.text)
+	contentWidth := max(1, m.width-4)
+	graphWidth := min(trafficHistoryLimit, max(1, contentWidth-22))
+	down, up, peak := trafficChartSeries(m.trafficHistory, graphWidth)
 	rows := []string{
+		sectionTitle("实时速度"),
+		trafficChartLine("↓ 下载", m.status.Traffic.Down, trafficSparkline(down, graphWidth, peak), c.accent),
+		trafficChartLine("↑ 上传", m.status.Traffic.Up, trafficSparkline(up, graphWidth, peak), c.good),
+		overviewColumns(contentWidth,
+			overviewMetric("累计下载", formatBytes(m.status.Traffic.DownTotal)),
+			overviewMetric("累计上传", formatBytes(m.status.Traffic.UpTotal))),
+		overviewColumns(contentWidth,
+			overviewMetric("活动连接", fmt.Sprintf("%d", m.status.ConnectionCount)),
+			overviewMetric("内存", formatBytes(m.status.Memory))),
 		sectionTitle("运行状态"),
-		label.Render("活动配置") + value.Render(empty(m.status.ActiveProfile, "未接管")),
-		label.Render("核心版本") + value.Render(empty(m.status.CoreVersion, "未连接")),
-		label.Render("运行模式") + value.Render(modeLabel(m.status.Mode)),
-		label.Render("TUN") + value.Render(onOff(m.status.TUN)),
-		label.Render("混合端口") + value.Render(portLabel(m.status.MixedPort)),
-		"",
-		sectionTitle("实时统计"),
-		label.Render("下载") + value.Render(formatRate(m.status.Traffic.Down)) + "    " + label.Render("上传") + value.Render(formatRate(m.status.Traffic.Up)),
-		label.Render("累计下载") + value.Render(formatBytes(m.status.Traffic.DownTotal)) + "    " + label.Render("累计上传") + value.Render(formatBytes(m.status.Traffic.UpTotal)),
-		label.Render("活动连接") + value.Render(fmt.Sprintf("%d", m.status.ConnectionCount)) + "    " + label.Render("内存") + value.Render(formatBytes(m.status.Memory)),
+		overviewColumns(contentWidth,
+			overviewMetric("活动配置", empty(m.status.ActiveProfile, "未接管")),
+			overviewMetric("核心版本", empty(m.status.CoreVersion, "未连接"))),
+		overviewColumns(contentWidth,
+			overviewMetric("模式", modeLabel(m.status.Mode)),
+			overviewMetric("TUN", onOff(m.status.TUN)),
+			overviewMetric("混合端口", portLabel(m.status.MixedPort))),
 	}
-	return lipgloss.NewStyle().Padding(1, 2).Height(height).Render(strings.Join(rows, "\n"))
+	return lipgloss.NewStyle().Padding(1, 2).Render(strings.Join(rows, "\n"))
+}
+
+const trafficLevels = "▁▂▃▄▅▆▇█"
+
+func trafficChartSeries(history []trafficSample, width int) (down, up []int64, peak int64) {
+	if width <= 0 || len(history) == 0 {
+		return nil, nil, 0
+	}
+	if len(history) > width {
+		history = history[len(history)-width:]
+	}
+	down = make([]int64, len(history))
+	up = make([]int64, len(history))
+	for index, sample := range history {
+		down[index] = nonNegativeTraffic(sample.down)
+		up[index] = nonNegativeTraffic(sample.up)
+		if down[index] > peak {
+			peak = down[index]
+		}
+		if up[index] > peak {
+			peak = up[index]
+		}
+	}
+	return down, up, peak
+}
+
+func trafficSparkline(values []int64, width int, peak int64) string {
+	if width <= 0 {
+		return ""
+	}
+	if len(values) > width {
+		values = values[len(values)-width:]
+	}
+	levels := []rune(trafficLevels)
+	result := make([]rune, width)
+	missing := width - len(values)
+	for index := range missing {
+		result[index] = ' '
+	}
+	for index, value := range values {
+		value = nonNegativeTraffic(value)
+		level := 0
+		if peak > 0 && value > 0 {
+			level = int(float64(value) / float64(peak) * float64(len(levels)-1))
+			level = max(1, min(level, len(levels)-1))
+		}
+		result[missing+index] = levels[level]
+	}
+	return string(result)
+}
+
+func trafficChartLine(label string, rate int64, graph string, chartColor color.Color) string {
+	labelText := lipgloss.NewStyle().Bold(true).Foreground(chartColor).Render(padRight(label, 8))
+	rateText := lipgloss.NewStyle().Foreground(colors().text).Render(padLeft(formatRate(rate), 12))
+	chart := lipgloss.NewStyle().Foreground(chartColor).Render(graph)
+	return labelText + rateText + "  " + chart
+}
+
+func overviewMetric(label, value string) string {
+	c := colors()
+	return lipgloss.NewStyle().Foreground(c.muted).Render(safeText(label)+" ") +
+		lipgloss.NewStyle().Foreground(c.text).Render(safeText(value))
+}
+
+func overviewColumns(width int, cells ...string) string {
+	if width <= 0 || len(cells) == 0 {
+		return ""
+	}
+	gapWidth := 2
+	available := max(0, width-gapWidth*(len(cells)-1))
+	baseWidth, remainder := available/len(cells), available%len(cells)
+	columns := make([]string, len(cells))
+	for index, cell := range cells {
+		columnWidth := baseWidth
+		if index < remainder {
+			columnWidth++
+		}
+		cell = ansi.Truncate(cell, columnWidth, "…")
+		columns[index] = cell + strings.Repeat(" ", max(0, columnWidth-lipgloss.Width(cell)))
+	}
+	return strings.Join(columns, strings.Repeat(" ", gapWidth))
 }
 
 func (m Model) renderProxies(height int) string {
@@ -159,7 +253,7 @@ func (m Model) renderProxies(height int) string {
 				latency = fmt.Sprintf("%d ms", node.Delay)
 			}
 			detail := latency + "  " + node.Type
-			lines = append(lines, selectedRow(i == m.proxyCursor, node.Name, detail, m.width-6))
+			lines = append(lines, selectedNodeRow(i == m.proxyCursor, node.Name, detail, m.width-6))
 		}
 		return lipgloss.NewStyle().Padding(1, 2).Render(strings.Join(lines, "\n"))
 	}
@@ -183,18 +277,17 @@ func (m Model) renderProxies(height int) string {
 		if node.Delay > 0 {
 			latency = fmt.Sprintf("%d ms", node.Delay)
 		}
+		nameWidth := max(10, rightWidth-26)
+		details := " " + padRight(node.Name, nameWidth) + " " + padLeft(latency, 8) + "  " + truncate(node.Type, 9)
+		if i == m.proxyCursor {
+			right = append(right, selectedWideNodeRow(node.Alive, details, rightWidth-2))
+			continue
+		}
 		alive := lipgloss.NewStyle().Foreground(c.bad).Render("●")
 		if node.Alive {
 			alive = lipgloss.NewStyle().Foreground(c.good).Render("●")
 		}
-		nameWidth := max(10, rightWidth-26)
-		line := alive + " " + padRight(node.Name, nameWidth) + " " + padLeft(latency, 8) + "  " + truncate(node.Type, 9)
-		if i == m.proxyCursor {
-			line = lipgloss.NewStyle().Foreground(c.accent).Bold(true).Render("› " + line)
-		} else {
-			line = "  " + line
-		}
-		right = append(right, line)
+		right = append(right, highlightNodeRow(false, alive+details, rightWidth-2))
 	}
 	return lipgloss.JoinHorizontal(lipgloss.Top,
 		lipgloss.NewStyle().Width(leftWidth).Padding(1, 1).Render(strings.Join(left, "\n")),
@@ -448,6 +541,46 @@ func selectedRow(selected bool, name, detail string, width int) string {
 		return lipgloss.NewStyle().Foreground(c.accent).Bold(true).Render("› " + line)
 	}
 	return "  " + line
+}
+
+func selectedNodeRow(selected bool, name, detail string, width int) string {
+	name, detail = safeText(name), safeText(detail)
+	detailWidth := min(max(8, lipgloss.Width(detail)), max(8, width/2))
+	nameWidth := max(8, width-detailWidth-4)
+	line := padRight(name, nameWidth) + "  " + padLeft(detail, detailWidth)
+	return highlightNodeRow(selected, line, width)
+}
+
+func highlightNodeRow(selected bool, line string, width int) string {
+	width = max(0, width)
+	contentWidth := max(0, width-2)
+	line = ansi.Truncate(line, contentWidth, "")
+	line += strings.Repeat(" ", max(0, contentWidth-lipgloss.Width(line)))
+	if !selected {
+		return "  " + line
+	}
+	return nodeHighlightStyle(width).Render("› " + line)
+}
+
+func nodeHighlightStyle(width int) lipgloss.Style {
+	style := lipgloss.NewStyle().Bold(true).Width(width)
+	if colorsDisabled() {
+		return style.Reverse(true)
+	}
+	c := colors()
+	return style.Foreground(c.onAccent).Background(c.accent)
+}
+
+func selectedWideNodeRow(alive bool, details string, width int) string {
+	width = max(0, width)
+	detailWidth := max(0, width-3)
+	details = ansi.Truncate(details, detailWidth, "")
+	details += strings.Repeat(" ", max(0, detailWidth-lipgloss.Width(details)))
+	health := "○"
+	if alive {
+		health = "●"
+	}
+	return nodeHighlightStyle(width).Render("› " + health + details)
 }
 
 func padRight(value string, width int) string {

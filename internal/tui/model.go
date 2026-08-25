@@ -33,7 +33,10 @@ const (
 	inputFilter
 )
 
-const profileInputMask = '*'
+const (
+	profileInputMask    = '*'
+	trafficHistoryLimit = 120
+)
 
 type confirmMode int
 
@@ -54,19 +57,21 @@ type Model struct {
 	height int
 	page   page
 
-	status             domain.RuntimeStatus
-	schedule           domain.ScheduleStatus
-	scheduleOK         bool
-	groups             []domain.ProxyGroup
-	profiles           []domain.Profile
-	connections        []domain.Connection
-	logs               []domain.LogEntry
-	pendingGroupDelays map[string]map[string]uint16
-	groupSnapshotFloor time.Time
-	logLevel           string
-	logPaused          bool
-	logCh              <-chan domain.LogEntry
-	logErrCh           <-chan error
+	status              domain.RuntimeStatus
+	trafficHistory      []trafficSample
+	statusSnapshotFloor time.Time
+	schedule            domain.ScheduleStatus
+	scheduleOK          bool
+	groups              []domain.ProxyGroup
+	profiles            []domain.Profile
+	connections         []domain.Connection
+	logs                []domain.LogEntry
+	pendingGroupDelays  map[string]map[string]uint16
+	groupSnapshotFloor  time.Time
+	logLevel            string
+	logPaused           bool
+	logCh               <-chan domain.LogEntry
+	logErrCh            <-chan error
 
 	groupCursor      int
 	proxyCursor      int
@@ -91,9 +96,14 @@ type Model struct {
 }
 
 type tickMsg time.Time
+type trafficSample struct {
+	up   int64
+	down int64
+}
 type statusMsg struct {
-	status domain.RuntimeStatus
-	err    error
+	status      domain.RuntimeStatus
+	err         error
+	requestedAt time.Time
 }
 type scheduleMsg struct {
 	status domain.ScheduleStatus
@@ -160,9 +170,10 @@ func tick() tea.Cmd {
 }
 
 func (m Model) refreshStatus() tea.Cmd {
+	requestedAt := time.Now()
 	return func() tea.Msg {
 		status, err := m.backend.Status(m.ctx)
-		return statusMsg{status: status, err: err}
+		return statusMsg{status: status, err: err, requestedAt: requestedAt}
 	}
 }
 
@@ -257,16 +268,15 @@ func (m Model) testGroup(group string) tea.Cmd {
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	if m.inMode != inputNone {
-		return m.updateInput(msg)
-	}
-
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.input.SetWidth(max(20, min(72, m.width-10)))
 		m.syncViewports()
 	case tea.KeyPressMsg:
+		if m.inMode != inputNone {
+			return m.updateInput(msg)
+		}
 		return m.updateKey(msg)
 	case tickMsg:
 		if m.toast != "" {
@@ -275,10 +285,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(m.refreshStatus(), m.refreshPage(), tick())
 	case statusMsg:
+		if !msg.requestedAt.IsZero() && msg.requestedAt.Before(m.statusSnapshotFloor) {
+			return m, nil
+		}
+		if msg.requestedAt.After(m.statusSnapshotFloor) {
+			m.statusSnapshotFloor = msg.requestedAt
+		}
 		if msg.err != nil {
 			m.err = msg.err.Error()
 		} else {
 			m.status = msg.status
+			if msg.status.Service.Active {
+				m.recordTraffic(msg.status.Traffic)
+			} else {
+				m.trafficHistory = nil
+			}
 			m.err = ""
 		}
 	case scheduleMsg:
@@ -380,8 +401,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = msg.err.Error()
 		}
 		m.logErrCh = nil
+	default:
+		if m.inMode != inputNone {
+			return m.updateInput(msg)
+		}
 	}
 	return m, nil
+}
+
+func (m *Model) recordTraffic(traffic domain.Traffic) {
+	m.trafficHistory = append(m.trafficHistory, trafficSample{
+		up:   nonNegativeTraffic(traffic.Up),
+		down: nonNegativeTraffic(traffic.Down),
+	})
+	if len(m.trafficHistory) <= trafficHistoryLimit {
+		return
+	}
+	copy(m.trafficHistory, m.trafficHistory[len(m.trafficHistory)-trafficHistoryLimit:])
+	m.trafficHistory = m.trafficHistory[:trafficHistoryLimit]
+}
+
+func nonNegativeTraffic(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
 }
 
 func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {

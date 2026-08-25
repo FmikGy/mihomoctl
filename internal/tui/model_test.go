@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -96,7 +97,7 @@ func requireSelectedVisible(t *testing.T, m Model, item string) {
 }
 
 func TestRenderPagesFit(t *testing.T) {
-	for _, size := range [][2]int{{60, 16}, {80, 24}, {120, 36}} {
+	for _, size := range [][2]int{{60, 16}, {80, 24}, {90, 24}, {120, 36}} {
 		for p := pageOverview; p <= pageSettings; p++ {
 			m := testModel()
 			m.width, m.height, m.page = size[0], size[1], p
@@ -312,6 +313,167 @@ func TestStatusErrorIsVisible(t *testing.T) {
 	}
 }
 
+func TestStatusSamplesBoundedTrafficHistory(t *testing.T) {
+	m := testModel()
+	m.trafficHistory = nil
+	started := time.Unix(100, 0)
+	for index := range trafficHistoryLimit + 5 {
+		updated, _ := m.Update(statusMsg{
+			status: domain.RuntimeStatus{
+				Service: domain.ServiceStatus{Active: true},
+				Traffic: domain.Traffic{Up: int64(index), Down: int64(index * 2)},
+			},
+			requestedAt: started.Add(time.Duration(index) * time.Second),
+		})
+		m = updated.(Model)
+	}
+	if len(m.trafficHistory) != trafficHistoryLimit {
+		t.Fatalf("traffic history length = %d, want %d", len(m.trafficHistory), trafficHistoryLimit)
+	}
+	if first := m.trafficHistory[0]; first.up != 5 || first.down != 10 {
+		t.Fatalf("traffic history did not retain the newest samples: %#v", first)
+	}
+
+	updated, _ := m.Update(statusMsg{err: errors.New("temporary failure"), requestedAt: started.Add(3 * time.Minute)})
+	m = updated.(Model)
+	if len(m.trafficHistory) != trafficHistoryLimit {
+		t.Fatalf("status error changed traffic history length: %d", len(m.trafficHistory))
+	}
+
+	updated, _ = m.Update(statusMsg{
+		status:      domain.RuntimeStatus{Service: domain.ServiceStatus{Active: false}},
+		requestedAt: started.Add(4 * time.Minute),
+	})
+	m = updated.(Model)
+	if len(m.trafficHistory) != 0 {
+		t.Fatalf("inactive service retained traffic history: %#v", m.trafficHistory)
+	}
+}
+
+func TestStatusIgnoresLateTrafficSnapshot(t *testing.T) {
+	m := testModel()
+	m.trafficHistory = nil
+	newer := time.Unix(200, 0)
+	updated, _ := m.Update(statusMsg{
+		status: domain.RuntimeStatus{
+			Service: domain.ServiceStatus{Active: true},
+			Traffic: domain.Traffic{Down: 200},
+		},
+		requestedAt: newer,
+	})
+	m = updated.(Model)
+	updated, _ = m.Update(statusMsg{
+		status: domain.RuntimeStatus{
+			Service: domain.ServiceStatus{Active: true},
+			Traffic: domain.Traffic{Down: 100},
+		},
+		requestedAt: newer.Add(-time.Second),
+	})
+	m = updated.(Model)
+	if m.status.Traffic.Down != 200 || len(m.trafficHistory) != 1 || m.trafficHistory[0].down != 200 {
+		t.Fatalf("late snapshot overwrote traffic state: status=%#v history=%#v", m.status.Traffic, m.trafficHistory)
+	}
+}
+
+func TestInputModeKeepsBackgroundRefreshRunning(t *testing.T) {
+	m := testModel()
+	m.inMode = inputFilter
+	m.input.SetValue("keep typing")
+
+	updated, cmd := m.Update(tickMsg(time.Unix(300, 0)))
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("tick in input mode did not schedule the next refresh")
+	}
+	batch, ok := cmd().(tea.BatchMsg)
+	if !ok || len(batch) != 2 {
+		t.Fatalf("tick in input mode returned %#v, want status and next-tick commands", batch)
+	}
+	if m.inMode != inputFilter || m.input.Value() != "keep typing" {
+		t.Fatalf("background tick disturbed input state: mode=%v value=%q", m.inMode, m.input.Value())
+	}
+
+	updated, _ = m.Update(statusMsg{
+		status: domain.RuntimeStatus{
+			Service: domain.ServiceStatus{Active: true},
+			Traffic: domain.Traffic{Down: 4096},
+		},
+		requestedAt: time.Unix(301, 0),
+	})
+	m = updated.(Model)
+	if len(m.trafficHistory) != 1 || m.trafficHistory[0].down != 4096 {
+		t.Fatalf("status update was lost in input mode: %#v", m.trafficHistory)
+	}
+	if m.inMode != inputFilter || m.input.Value() != "keep typing" {
+		t.Fatalf("background status disturbed input state: mode=%v value=%q", m.inMode, m.input.Value())
+	}
+}
+
+func TestTrafficSparklineScalingAndWidth(t *testing.T) {
+	tests := []struct {
+		name   string
+		values []int64
+		width  int
+		peak   int64
+		want   string
+	}{
+		{name: "empty", width: 4, want: "    "},
+		{name: "zero baseline", values: []int64{0, 0}, width: 4, want: "  ▁▁"},
+		{name: "shared scale", values: []int64{0, 25, 50, 75, 100}, width: 5, peak: 100, want: "▁▂▄▆█"},
+		{name: "tail only", values: []int64{0, 25, 50, 75, 100}, width: 3, peak: 100, want: "▄▆█"},
+		{name: "negative is zero", values: []int64{-1}, width: 1, peak: 10, want: "▁"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := trafficSparkline(tt.values, tt.width, tt.peak)
+			if got != tt.want {
+				t.Fatalf("trafficSparkline() = %q, want %q", got, tt.want)
+			}
+			if width := ansi.StringWidth(got); width != tt.width {
+				t.Fatalf("sparkline width = %d, want %d", width, tt.width)
+			}
+		})
+	}
+}
+
+func TestOverviewShowsTrafficChartsAtMinimumSize(t *testing.T) {
+	m := testModel()
+	m.width, m.height, m.page = 60, 16, pageOverview
+	m.status.CoreVersion = "v1.19.30"
+	m.status.TUN = true
+	m.status.Traffic = domain.Traffic{Down: 8192, Up: 2048, DownTotal: 1 << 30, UpTotal: 1 << 28}
+	m.status.ConnectionCount = 3
+	m.status.Memory = 64 << 20
+	m.trafficHistory = []trafficSample{{down: 1024, up: 128}, {down: 8192, up: 2048}}
+	m.connections = []domain.Connection{{ID: "private-id", Host: "private.example", Process: "private-process"}}
+
+	view := ansi.Strip(m.render())
+	for _, text := range []string{
+		"实时速度", "下载", "上传", "█", "累计下载", "累计上传",
+		"活动连接", "内存", "运行状态", "活动配置", "核心版本", "模式", "TUN", "混合端口",
+	} {
+		if !strings.Contains(view, text) {
+			t.Fatalf("minimum overview missing %q:\n%s", text, view)
+		}
+	}
+	for _, secret := range []string{"private-id", "private.example", "private-process"} {
+		if strings.Contains(view, secret) {
+			t.Fatalf("overview exposed connection identity %q", secret)
+		}
+	}
+	for _, label := range []string{"↓ 下载", "↑ 上传"} {
+		for _, line := range strings.Split(view, "\n") {
+			if strings.Contains(line, label) && strings.ContainsAny(line, trafficLevels) {
+				label = ""
+				break
+			}
+		}
+		if label != "" {
+			t.Fatalf("overview line %q has no traffic graph:\n%s", label, view)
+		}
+	}
+}
+
 func TestQuitCancelsContext(t *testing.T) {
 	m := testModel()
 	_, cmd := m.Update(tea.KeyPressMsg{Code: 'q', Text: "q"})
@@ -331,6 +493,66 @@ func TestCompactProxyPageShowsSelectableNodes(t *testing.T) {
 	view := m.render()
 	if !strings.Contains(view, "香港 01") || !strings.Contains(view, "VLESS") {
 		t.Fatalf("compact proxy page hid node details:\n%s", view)
+	}
+}
+
+func TestSelectedNodeRowUsesFullWidthMonochromeHighlight(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	const width = 42
+	selected := selectedNodeRow(true, "selected node", "52 ms  AnyTLS", width)
+	unselected := selectedNodeRow(false, "other node", "85 ms  VMess", width)
+	if got := ansi.StringWidth(selected); got != width {
+		t.Fatalf("selected node row width = %d, want %d", got, width)
+	}
+	if got := ansi.StringWidth(unselected); got != width {
+		t.Fatalf("unselected node row width = %d, want %d", got, width)
+	}
+	if !nodeHighlightStyle(width).GetReverse() {
+		t.Fatal("selected node style has no monochrome reverse highlight")
+	}
+	if selected == ansi.Strip(selected) || unselected != ansi.Strip(unselected) {
+		t.Fatalf("highlight ANSI mismatch: selected=%q unselected=%q", selected, unselected)
+	}
+	if stripped := ansi.Strip(selected); !strings.HasPrefix(stripped, "› ") || !strings.Contains(stripped, "selected node") {
+		t.Fatalf("selected node marker or label missing: %q", stripped)
+	}
+}
+
+func TestSelectedNodeStyleUsesHighContrastColorBackground(t *testing.T) {
+	value, existed := os.LookupEnv("NO_COLOR")
+	if err := os.Unsetenv("NO_COLOR"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if existed {
+			_ = os.Setenv("NO_COLOR", value)
+		} else {
+			_ = os.Unsetenv("NO_COLOR")
+		}
+	})
+
+	style := nodeHighlightStyle(42)
+	if style.GetReverse() {
+		t.Fatal("colored selected node style unexpectedly uses reverse video")
+	}
+	if style.GetBackground() == nil {
+		t.Fatal("colored selected node style has no background highlight")
+	}
+	if got, want := style.GetBackground(), colors().accent; got != want {
+		t.Fatalf("selected node background = %v, want accent %v", got, want)
+	}
+	if got, want := style.GetForeground(), colors().onAccent; got != want {
+		t.Fatalf("selected node foreground = %v, want high-contrast text %v", got, want)
+	}
+	row := selectedWideNodeRow(true, " selected node        52 ms  AnyTLS", 42)
+	if got := ansi.StringWidth(row); got != 42 {
+		t.Fatalf("colored wide selected node row width = %d, want 42", got)
+	}
+	if stripped := ansi.Strip(row); !strings.HasPrefix(stripped, "› ● selected node") {
+		t.Fatalf("colored wide selected node markers missing: %q", stripped)
+	}
+	if stripped := ansi.Strip(selectedWideNodeRow(false, " offline node", 42)); !strings.HasPrefix(stripped, "› ○ offline node") {
+		t.Fatalf("offline wide selected node marker missing: %q", stripped)
 	}
 }
 
