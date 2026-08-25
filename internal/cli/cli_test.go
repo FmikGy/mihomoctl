@@ -518,6 +518,16 @@ func TestRootWithoutTTYShowsHelp(t *testing.T) {
 	}
 }
 
+func TestProxyTestHelpDescribesDirectMembers(t *testing.T) {
+	stdout, _, err := runCommand(t, &fakeBackend{}, "proxy", "test", "--help")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout, "直接成员") || strings.Contains(stdout, "全部节点") {
+		t.Fatalf("proxy test help = %q", stdout)
+	}
+}
+
 func TestRootRequiresBothInputAndOutputTTY(t *testing.T) {
 	previousCheck := isTerminalStream
 	checks := 0

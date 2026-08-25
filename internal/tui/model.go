@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -61,6 +62,7 @@ type Model struct {
 	connections        []domain.Connection
 	logs               []domain.LogEntry
 	pendingGroupDelays map[string]map[string]uint16
+	groupSnapshotFloor time.Time
 	logLevel           string
 	logPaused          bool
 	logCh              <-chan domain.LogEntry
@@ -77,14 +79,15 @@ type Model struct {
 	connectionOffset int
 	settingOffset    int
 
-	loading bool
-	err     string
-	toast   string
-	help    bool
-	filter  string
-	input   textinput.Model
-	inMode  inputMode
-	confirm confirmMode
+	loading      bool
+	err          string
+	toast        string
+	toastWarning bool
+	help         bool
+	filter       string
+	input        textinput.Model
+	inMode       inputMode
+	confirm      confirmMode
 }
 
 type tickMsg time.Time
@@ -97,8 +100,9 @@ type scheduleMsg struct {
 	err    error
 }
 type groupsMsg struct {
-	groups []domain.ProxyGroup
-	err    error
+	groups      []domain.ProxyGroup
+	err         error
+	requestedAt time.Time
 }
 type profilesMsg struct {
 	profiles []domain.Profile
@@ -113,9 +117,10 @@ type operationMsg struct {
 	err     error
 }
 type groupTestMsg struct {
-	group  string
-	delays map[string]uint16
-	err    error
+	group       string
+	delays      map[string]uint16
+	err         error
+	completedAt time.Time
 }
 type logMsg struct {
 	entry domain.LogEntry
@@ -164,10 +169,7 @@ func (m Model) refreshStatus() tea.Cmd {
 func (m Model) refreshPage() tea.Cmd {
 	switch m.page {
 	case pageProxies:
-		return func() tea.Msg {
-			groups, err := m.backend.Groups(m.ctx)
-			return groupsMsg{groups: groups, err: err}
-		}
+		return m.refreshGroups()
 	case pageProfiles:
 		return func() tea.Msg {
 			profiles, err := m.backend.Profiles(m.ctx)
@@ -186,6 +188,14 @@ func (m Model) refreshPage() tea.Cmd {
 		return m.refreshSchedule()
 	}
 	return nil
+}
+
+func (m Model) refreshGroups() tea.Cmd {
+	requestedAt := time.Now()
+	return func() tea.Msg {
+		groups, err := m.backend.Groups(m.ctx)
+		return groupsMsg{groups: groups, err: err, requestedAt: requestedAt}
+	}
 }
 
 type scheduleBackend interface {
@@ -242,7 +252,7 @@ func (m Model) operation(message string, fn func(context.Context) error) tea.Cmd
 func (m Model) testGroup(group string) tea.Cmd {
 	return func() tea.Msg {
 		delays, err := m.backend.TestGroup(m.ctx, group)
-		return groupTestMsg{group: group, delays: delays, err: err}
+		return groupTestMsg{group: group, delays: delays, err: err, completedAt: time.Now()}
 	}
 }
 
@@ -261,6 +271,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		if m.toast != "" {
 			m.toast = ""
+			m.toastWarning = false
 		}
 		return m, tea.Batch(m.refreshStatus(), m.refreshPage(), tick())
 	case statusMsg:
@@ -280,6 +291,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = ""
 		}
 	case groupsMsg:
+		if !msg.requestedAt.IsZero() && msg.requestedAt.Before(m.groupSnapshotFloor) {
+			return m, nil
+		}
 		m.loading = false
 		if msg.err != nil {
 			m.err = msg.err.Error()
@@ -312,20 +326,41 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.err = ""
 			m.toast = msg.message
+			m.toastWarning = false
 		}
 		return m, tea.Batch(m.refreshStatus(), m.refreshPage())
 	case groupTestMsg:
 		m.loading = false
+		m.toast = ""
+		m.toastWarning = false
+		completedAt := msg.completedAt
+		if completedAt.IsZero() {
+			completedAt = time.Now()
+		}
+		if completedAt.After(m.groupSnapshotFloor) {
+			m.groupSnapshotFloor = completedAt
+		}
 		if msg.err != nil {
 			m.err = msg.err.Error()
-		} else {
-			m.err = ""
-			m.toast = "测速完成"
-			m.rememberGroupDelays(msg.group, msg.delays)
-			if m.applyGroupDelays(msg.group, msg.delays) == 0 {
-				m.toast = "测速完成，未获得可用延迟"
-			}
+			return m, m.refreshGroups()
 		}
+
+		m.err = ""
+		stats := m.applyGroupDelays(msg.group, msg.delays)
+		if stats.succeeded == 0 {
+			if stats.total == 0 {
+				m.toast = "测速完成，未获得可用延迟"
+			} else {
+				m.toast = stats.notice()
+			}
+			m.toastWarning = true
+			return m, m.refreshGroups()
+		}
+
+		m.toast = stats.notice()
+		m.toastWarning = stats.failed() > 0
+		m.rememberGroupDelays(msg.group, msg.delays)
+		return m, m.refreshGroups()
 	case logChannelsMsg:
 		m.logCh, m.logErrCh = msg.entries, msg.errs
 		return m, tea.Batch(waitLog(m.logCh), waitLogError(m.logErrCh))
@@ -736,34 +771,93 @@ func viewportBounds(total, cursor, offset, capacity int) (int, int) {
 	return start, min(total, start+max(1, capacity))
 }
 
-func (m *Model) applyGroupDelays(group string, delays map[string]uint16) int {
+type groupDelayStats struct {
+	total            int
+	succeeded        int
+	leafSucceeded    int
+	groupSucceeded   int
+	builtinSucceeded int
+	unknownSucceeded int
+}
+
+func (s groupDelayStats) failed() int {
+	return max(0, s.total-s.succeeded)
+}
+
+func (s groupDelayStats) notice() string {
+	kinds := fmt.Sprintf("叶%d/组%d/内置%d", s.leafSucceeded, s.groupSucceeded, s.builtinSucceeded)
+	if s.unknownSucceeded > 0 {
+		kinds += fmt.Sprintf("/未知%d", s.unknownSucceeded)
+	}
+	return fmt.Sprintf("测速：成功%d（%s）失败%d", s.succeeded, kinds, s.failed())
+}
+
+func (m *Model) applyGroupDelays(group string, delays map[string]uint16) groupDelayStats {
 	for groupIndex := range m.groups {
 		if m.groups[groupIndex].Name != group {
 			continue
 		}
-		applied := 0
+		stats := groupDelayStats{total: len(m.groups[groupIndex].Proxies)}
+		for proxyIndex := range m.groups[groupIndex].Proxies {
+			if _, ok := groupMemberDelay(m.groups[groupIndex], proxyIndex, delays); ok {
+				stats.succeeded++
+				switch proxyDelayKind(m.groups[groupIndex].Proxies[proxyIndex].Type) {
+				case "leaf":
+					stats.leafSucceeded++
+				case "group":
+					stats.groupSucceeded++
+				case "builtin":
+					stats.builtinSucceeded++
+				default:
+					stats.unknownSucceeded++
+				}
+			}
+		}
+		if stats.succeeded == 0 {
+			return stats
+		}
 		for proxyIndex := range m.groups[groupIndex].Proxies {
 			proxy := &m.groups[groupIndex].Proxies[proxyIndex]
-			member := proxy.Name
-			if proxyIndex < len(m.groups[groupIndex].All) && m.groups[groupIndex].All[proxyIndex] != "" {
-				member = m.groups[groupIndex].All[proxyIndex]
-			}
-			delay, ok := delays[member]
-			if !ok && member != proxy.Name {
-				delay, ok = delays[proxy.Name]
-			}
+			delay, ok := groupMemberDelay(m.groups[groupIndex], proxyIndex, delays)
 			if ok {
 				proxy.Delay = delay
 				proxy.Alive = true
-				applied++
 			} else {
 				proxy.Delay = 0
 				proxy.Alive = false
 			}
 		}
-		return applied
+		return stats
 	}
-	return 0
+	return groupDelayStats{}
+}
+
+func proxyDelayKind(proxyType string) string {
+	normalized := strings.ToLower(proxyType)
+	normalized = strings.NewReplacer("-", "", "_", "", " ", "").Replace(normalized)
+	switch normalized {
+	case "selector", "urltest", "fallback", "loadbalance", "relay":
+		return "group"
+	case "direct", "reject", "rejectdrop", "pass", "compatible":
+		return "builtin"
+	case "":
+		return "unknown"
+	default:
+		return "leaf"
+	}
+}
+
+func groupMemberDelay(group domain.ProxyGroup, proxyIndex int, delays map[string]uint16) (uint16, bool) {
+	proxy := group.Proxies[proxyIndex]
+	member := proxy.Name
+	if proxyIndex < len(group.All) && group.All[proxyIndex] != "" {
+		member = group.All[proxyIndex]
+	}
+	delay, ok := delays[member]
+	if !ok && member != proxy.Name {
+		delay, ok = delays[proxy.Name]
+	}
+	return delay, ok
 }
 
 func (m *Model) rememberGroupDelays(group string, delays map[string]uint16) {
@@ -779,7 +873,7 @@ func (m *Model) rememberGroupDelays(group string, delays map[string]uint16) {
 
 func (m *Model) applyGroupDelayOverlays() {
 	for group, delays := range m.pendingGroupDelays {
-		m.applyGroupDelays(group, delays)
+		_ = m.applyGroupDelays(group, delays)
 		delete(m.pendingGroupDelays, group)
 	}
 }

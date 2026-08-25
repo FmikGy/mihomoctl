@@ -163,6 +163,17 @@ func ApplyManagedOverlay(doc *yaml.Node, options OverlayOptions) error {
 		setMapValue(root, "dns", dns)
 		setMapValueIfMissing(profile, "store-fake-ip", scalarBool(true))
 	}
+	if dns := mapValue(root, "dns"); shouldAddProxyServerNameserver(dns) {
+		// Keep proxy endpoint lookup independent from subscription DNS. An
+		// explicit proxy resolver in the source always takes precedence.
+		setMapValueIfMissing(dns, "proxy-server-nameserver", &yaml.Node{
+			Kind: yaml.SequenceNode,
+			Tag:  "!!seq",
+			Content: []*yaml.Node{
+				scalarString("system"),
+			},
+		})
+	}
 
 	tun, err := ensureMapValue(root, "tun")
 	if err != nil {
@@ -184,6 +195,22 @@ func ApplyManagedOverlay(doc *yaml.Node, options OverlayOptions) error {
 		})
 	}
 	return nil
+}
+
+func shouldAddProxyServerNameserver(dns *yaml.Node) bool {
+	if dns == nil || dns.Kind != yaml.MappingNode {
+		return false
+	}
+	var semantic map[string]any
+	if err := dns.Decode(&semantic); err != nil {
+		return false
+	}
+	enabled, ok := semantic["enable"].(bool)
+	if !ok || !enabled {
+		return false
+	}
+	_, configured := semantic["proxy-server-nameserver"]
+	return !configured
 }
 
 func defaultDNSConfig(ipv6 bool) map[string]any {

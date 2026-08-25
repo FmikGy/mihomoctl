@@ -446,7 +446,7 @@ func (a *application) proxyCommand() *cobra.Command {
 	})
 	cmd.AddCommand(&cobra.Command{
 		Use:   "test <group>",
-		Short: "测试策略组内全部节点",
+		Short: "测试策略组的直接成员",
 		Args:  exactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := requireNonBlank("策略组", args[0]); err != nil {

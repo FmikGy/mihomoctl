@@ -1,6 +1,7 @@
 package profile
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -173,9 +174,111 @@ tun:
 	if got := yamlStringSlice(t, dns["nameserver"]); len(got) != 1 || got[0] != "192.0.2.53" {
 		t.Fatalf("existing nameserver was changed: %#v", got)
 	}
+	if _, exists := dns["proxy-server-nameserver"]; exists {
+		t.Fatalf("disabled DNS gained proxy-server-nameserver: %#v", dns)
+	}
 	tun := config["tun"].(map[string]any)
 	if got := yamlStringSlice(t, tun["dns-hijack"]); len(got) != 1 || got[0] != "udp://0.0.0.0:53" {
 		t.Fatalf("existing dns-hijack was changed: %#v", got)
+	}
+}
+
+func TestMergeManagedConfigAddsSystemProxyServerNameserver(t *testing.T) {
+	raw := []byte(`dns:
+  enable: true
+  nameserver:
+    - 192.0.2.53
+`)
+	got, err := MergeManagedConfig(raw, OverlayOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config map[string]any
+	if err := yaml.Unmarshal(got, &config); err != nil {
+		t.Fatal(err)
+	}
+	dns := config["dns"].(map[string]any)
+	if got := yamlStringSlice(t, dns["proxy-server-nameserver"]); len(got) != 1 || got[0] != "system" {
+		t.Fatalf("proxy-server-nameserver = %#v", got)
+	}
+}
+
+func TestMergeManagedConfigPreservesExplicitProxyServerNameserver(t *testing.T) {
+	tests := map[string]string{
+		"custom list": "\n    - https://resolver.example/dns-query",
+		"empty list":  " []",
+		"null":        " null",
+		"scalar":      " custom-resolver",
+	}
+	for name, resolver := range tests {
+		t.Run(name, func(t *testing.T) {
+			raw := []byte("dns:\n  enable: true\n  nameserver:\n    - 192.0.2.53\n  proxy-server-nameserver:" + resolver + "\n")
+			var before map[string]any
+			if err := yaml.Unmarshal(raw, &before); err != nil {
+				t.Fatal(err)
+			}
+			got, err := MergeManagedConfig(raw, OverlayOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var after map[string]any
+			if err := yaml.Unmarshal(got, &after); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(after["dns"], before["dns"]) {
+				t.Fatalf("explicit proxy-server-nameserver changed: before=%#v after=%#v", before["dns"], after["dns"])
+			}
+		})
+	}
+}
+
+func TestMergeManagedConfigDoesNotAddProxyServerNameserverWithoutEnabledDNS(t *testing.T) {
+	tests := map[string]string{
+		"disabled":       "dns:\n  enable: false\n  nameserver: [192.0.2.53]\n",
+		"missing enable": "dns:\n  nameserver: [192.0.2.53]\n",
+	}
+	for name, raw := range tests {
+		t.Run(name, func(t *testing.T) {
+			got, err := MergeManagedConfig([]byte(raw), OverlayOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var config map[string]any
+			if err := yaml.Unmarshal(got, &config); err != nil {
+				t.Fatal(err)
+			}
+			dns := config["dns"].(map[string]any)
+			if _, exists := dns["proxy-server-nameserver"]; exists {
+				t.Fatalf("DNS unexpectedly gained proxy-server-nameserver: %#v", dns)
+			}
+		})
+	}
+}
+
+func TestMergeManagedConfigPreservesMergedProxyServerNameserver(t *testing.T) {
+	raw := []byte(`dns-defaults: &dns-defaults
+  enable: true
+  proxy-server-nameserver:
+    - https://resolver.example/dns-query
+dns:
+  <<: *dns-defaults
+  nameserver:
+    - 192.0.2.53
+`)
+	got, err := MergeManagedConfig(raw, OverlayOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(got), "- system") {
+		t.Fatalf("merged proxy-server-nameserver was overridden:\n%s", got)
+	}
+	var config map[string]any
+	if err := yaml.Unmarshal(got, &config); err != nil {
+		t.Fatal(err)
+	}
+	dns := config["dns"].(map[string]any)
+	if got := yamlStringSlice(t, dns["proxy-server-nameserver"]); len(got) != 1 || got[0] != "https://resolver.example/dns-query" {
+		t.Fatalf("merged proxy-server-nameserver changed: %#v", got)
 	}
 }
 

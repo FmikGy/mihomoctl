@@ -312,7 +312,11 @@ func (m Model) renderFooter() string {
 		messageStyle = messageStyle.Foreground(c.bad)
 	} else if m.toast != "" {
 		message = safeText(m.toast)
-		messageStyle = messageStyle.Foreground(c.good)
+		if m.toastWarning {
+			messageStyle = messageStyle.Foreground(c.warn)
+		} else {
+			messageStyle = messageStyle.Foreground(c.good)
+		}
 	} else if m.filter != "" {
 		message = "筛选  " + safeText(m.filter)
 	}

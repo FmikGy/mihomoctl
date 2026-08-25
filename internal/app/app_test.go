@@ -366,6 +366,43 @@ func TestStatusReturnsUnavailableWhenRunningControllerFails(t *testing.T) {
 	}
 }
 
+func TestGroupDelayUsesConfiguredTestURL(t *testing.T) {
+	const configuredURL = "https://probe.example/generate_204?source=profile"
+	testedURLs := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/proxies":
+			_, _ = writer.Write([]byte(`{"proxies":{"Node":{"name":"Node","type":"VLESS","alive":true},"AUTO":{"name":"AUTO","type":"URLTest","all":["Node"],"testUrl":"` + configuredURL + `"}}}`))
+		case "/group/AUTO/delay":
+			testedURLs <- request.URL.Query().Get("url")
+			if timeout := request.URL.Query().Get("timeout"); timeout != "5000" {
+				t.Errorf("delay timeout = %q, want 5000", timeout)
+			}
+			_, _ = writer.Write([]byte(`{"Node":123}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	api, err := mihomo.New(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	application := &App{api: api, euid: func() int { return 1000 }}
+	delays, err := application.TestGroup(context.Background(), "AUTO")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delays["Node"] != 123 {
+		t.Fatalf("delays = %#v", delays)
+	}
+	if testedURL := <-testedURLs; testedURL != configuredURL {
+		t.Fatalf("delay URL = %q, want %q", testedURL, configuredURL)
+	}
+}
+
 func TestNewAllowsPublicStateOutsideDefaultDataDirectory(t *testing.T) {
 	root := t.TempDir()
 	paths := testPaths(root)

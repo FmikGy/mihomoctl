@@ -13,6 +13,8 @@ import (
 	"mihomoctl/internal/platform"
 )
 
+const defaultDelayTestURL = "https://www.gstatic.com/generate_204"
+
 func (a *App) Status(ctx context.Context) (domain.RuntimeStatus, error) {
 	systemd, err := platform.NewSystemd(a.runner, a.serviceName())
 	if err != nil {
@@ -131,7 +133,21 @@ func (a *App) TestGroup(ctx context.Context, group string) (map[string]uint16, e
 	if err != nil {
 		return nil, err
 	}
-	delays, err := client.TestGroup(ctx, group, "https://www.gstatic.com/generate_204", 5*time.Second)
+	groups, err := client.Groups(ctx)
+	if err != nil {
+		return nil, controllerError(err)
+	}
+	testURL := defaultDelayTestURL
+	for key, candidate := range groups {
+		if key != group && candidate.Name != group {
+			continue
+		}
+		if candidate.TestURL != "" {
+			testURL = candidate.TestURL
+		}
+		break
+	}
+	delays, err := client.TestGroup(ctx, group, testURL, 5*time.Second)
 	return delays, controllerError(err)
 }
 
