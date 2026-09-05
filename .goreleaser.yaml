@@ -95,4 +95,4 @@ changelog:
   disable: true
 
 release:
-  draft: true
+  draft: false
