@@ -21,18 +21,13 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.repository.default_branch || github.ref }}
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Validate release version
+      - name: Prepare release version
+        id: version
         if: github.event_name == 'workflow_dispatch'
         env:
           RELEASE_VERSION: ${{ inputs.version }}
@@ -41,17 +36,28 @@ jobs:
             echo "::error::Invalid version: $RELEASE_VERSION (expected e.g. v0.1.0)"
             exit 1
           fi
+
           git fetch --tags --force
+
           if git rev-parse --verify --quiet "refs/tags/$RELEASE_VERSION" >/dev/null; then
-            echo "::error::Tag $RELEASE_VERSION already exists"
-            exit 1
+            echo "Tag $RELEASE_VERSION already exists; retrying release from that tag."
+            echo "tag_exists=true" >> "$GITHUB_OUTPUT"
+            git checkout --detach "$RELEASE_VERSION"
+          else
+            echo "tag_exists=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
 
       - name: Test
         run: go test ./...
 
       - name: Create release tag
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && steps.version.outputs.tag_exists == 'false'
         env:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
@@ -60,8 +66,13 @@ jobs:
           git tag -a "$RELEASE_VERSION" -m "Release $RELEASE_VERSION"
           git push origin "$RELEASE_VERSION"
 
+      - name: Install Syft
+        run: |
+          curl -sSfL https://get.anchore.io/syft | sudo sh -s -- -b /usr/local/bin
+          syft version
+
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
+        uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
           version: "~> v2"
