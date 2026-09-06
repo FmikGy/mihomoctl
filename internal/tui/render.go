@@ -324,46 +324,18 @@ func (m Model) renderProxies(height int) string {
 	nodes := filteredProxies(group, m.filter)
 	nodeStart, nodeEnd := viewportBounds(len(nodes), m.proxyCursor, m.proxyOffset, m.listCapacity())
 	rowWidth := max(1, m.width-4)
-
-	if m.width < 90 {
-		position := fmt.Sprintf("组 %s  节点 %s", listPosition(groupIndex, len(groups)), listPosition(m.proxyCursor, len(nodes)))
-		lines := []string{
-			titleLine("节点 · "+group.Name, position, rowWidth),
-			proxyTableHeader(rowWidth),
-		}
-		if len(nodes) == 0 {
-			lines = append(lines, mutedLine("没有匹配节点", rowWidth))
-		}
-		for i := nodeStart; i < nodeEnd; i++ {
-			lines = append(lines, m.proxyTableRow(group, nodes[i], i == m.proxyCursor, rowWidth))
-		}
-		return renderPage(lines, m.width, height)
-	}
-
-	innerWidth := max(1, m.width-4)
-	leftWidth := max(24, innerWidth/3)
-	rightWidth := max(1, innerWidth-leftWidth-1)
-	groupStart, groupEnd := viewportBounds(len(groups), groupIndex, m.groupOffset, m.listCapacity())
-	groupNameWidth := max(8, leftWidth-2-2-12-1)
-	left := []string{
-		titleLine("策略组", listPosition(groupIndex, len(groups)), leftWidth),
-		tableHeader([]string{"名称", "当前节点"}, []int{groupNameWidth, 12}, leftWidth),
-	}
-	for i := groupStart; i < groupEnd; i++ {
-		item := groups[i]
-		left = append(left, selectedRow(i == groupIndex, item.Name, empty(item.Now, "--"), leftWidth))
-	}
-	right := []string{
-		titleLine(group.Name, listPosition(m.proxyCursor, len(nodes)), rightWidth),
-		proxyTableHeader(rightWidth),
+	position := fmt.Sprintf("组 %s  节点 %s", listPosition(groupIndex, len(groups)), listPosition(m.proxyCursor, len(nodes)))
+	lines := []string{
+		titleLine("节点 · "+group.Name, position, rowWidth),
+		proxyTableHeader(rowWidth),
 	}
 	if len(nodes) == 0 {
-		right = append(right, mutedLine("没有匹配节点", rightWidth))
+		lines = append(lines, mutedLine("没有匹配节点", rowWidth))
 	}
 	for i := nodeStart; i < nodeEnd; i++ {
-		right = append(right, m.proxyTableRow(group, nodes[i], i == m.proxyCursor, rightWidth))
+		lines = append(lines, m.proxyTableRow(group, nodes[i], i == m.proxyCursor, rowWidth))
 	}
-	return renderSplitPage(left, right, leftWidth, rightWidth, m.width, height)
+	return renderPage(lines, m.width, height)
 }
 
 func (m Model) renderProfiles(height int) string {
@@ -398,8 +370,8 @@ func (m Model) renderProfiles(height int) string {
 			{text: profile.Name, width: nameWidth},
 			{text: kind, width: widths[2]},
 			{text: updated, width: widths[3]},
-			{text: quota, width: widths[4], alignRight: true, foreground: quotaColor},
-			{text: expiry, width: widths[5], alignRight: true, foreground: expiryColor},
+			{text: quota, width: widths[4], alignment: tableAlignRight, foreground: quotaColor},
+			{text: expiry, width: widths[5], alignment: tableAlignRight, foreground: expiryColor},
 		}
 		lines = append(lines, tableDataRow(i == m.profileCursor, cells, rowWidth))
 	}
@@ -433,7 +405,7 @@ func (m Model) renderConnections(height int) string {
 		cells := []tableCell{
 			{text: target, width: targetWidth},
 			{text: process, width: processWidth},
-			{text: formatBytes(connection.Upload + connection.Download), width: 11, alignRight: true},
+			{text: formatBytes(connection.Upload + connection.Download), width: 11, alignment: tableAlignRight},
 			{text: empty(connection.Rule, "--"), width: ruleWidth},
 		}
 		lines = append(lines, tableDataRow(i == m.connectionCursor, cells, rowWidth))
@@ -770,23 +742,50 @@ func mutedLine(text string, width int) string {
 type tableCell struct {
 	text       string
 	width      int
-	alignRight bool
+	alignment  tableAlignment
 	foreground color.Color
 	bold       bool
 }
 
+type tableAlignment uint8
+
+const (
+	tableAlignLeft tableAlignment = iota
+	tableAlignCenter
+	tableAlignRight
+)
+
 func tableHeader(labels []string, widths []int, rowWidth int) string {
-	parts := make([]string, 0, len(widths))
+	cells := make([]tableCell, 0, len(widths))
 	for index, width := range widths {
 		label := ""
 		if index < len(labels) {
 			label = labels[index]
 		}
-		parts = append(parts, padRight(label, width))
+		cells = append(cells, tableCell{text: label, width: width})
+	}
+	return tableHeaderCells(cells, rowWidth)
+}
+
+func tableHeaderCells(cells []tableCell, rowWidth int) string {
+	parts := make([]string, 0, len(cells))
+	for _, cell := range cells {
+		parts = append(parts, alignTableCell(cell.text, cell.width, cell.alignment))
 	}
 	content := strings.Join(parts, " ")
 	line := "  " + fitLine(content, max(0, rowWidth-2))
 	return lipgloss.NewStyle().Foreground(colors().muted).Render(fitLine(line, rowWidth))
+}
+
+func alignTableCell(value string, width int, alignment tableAlignment) string {
+	switch alignment {
+	case tableAlignCenter:
+		return centerText(value, width)
+	case tableAlignRight:
+		return padLeft(value, width)
+	default:
+		return padRight(value, width)
+	}
 }
 
 func tableDataRow(selected bool, cells []tableCell, rowWidth int) string {
@@ -794,11 +793,7 @@ func tableDataRow(selected bool, cells []tableCell, rowWidth int) string {
 	styledParts := make([]string, 0, len(cells))
 	for _, cell := range cells {
 		value := safeText(cell.text)
-		if cell.alignRight {
-			value = padLeft(value, cell.width)
-		} else {
-			value = padRight(value, cell.width)
-		}
+		value = alignTableCell(value, cell.width, cell.alignment)
 		plainParts = append(plainParts, value)
 		style := lipgloss.NewStyle()
 		if cell.foreground != nil {
@@ -817,7 +812,7 @@ func selectableRow(selected bool, plain, styled string, width int) string {
 	contentWidth := max(0, width-2)
 	plain = fitLine(safeText(plain), contentWidth)
 	if selected {
-		return nodeHighlightStyle(width).Render("› " + plain)
+		return nodeHighlightStyle(width).Render("> " + plain)
 	}
 	styled = fitLine(styled, contentWidth)
 	return "  " + styled
@@ -885,40 +880,47 @@ func connectionColumnWidths(contentWidth int) (target, process, rule int) {
 
 func proxyColumnWidths(contentWidth int) []int {
 	const (
-		activeWidth = 2
+		activeWidth = 1
 		aliveWidth  = 4
 		testWidth   = 10
 		typeWidth   = 10
 		gapCount    = 4
 	)
 	nameWidth := max(4, contentWidth-activeWidth-aliveWidth-testWidth-typeWidth-gapCount)
-	return []int{activeWidth, aliveWidth, nameWidth, testWidth, typeWidth}
+	return []int{activeWidth, aliveWidth, testWidth, typeWidth, nameWidth}
 }
 
 func proxyTableHeader(rowWidth int) string {
-	return tableHeader([]string{"", "在线", "节点", "测速", "类型"}, proxyColumnWidths(max(0, rowWidth-2)), rowWidth)
+	widths := proxyColumnWidths(max(0, rowWidth-2))
+	return tableHeaderCells([]tableCell{
+		{text: "", width: widths[0], alignment: tableAlignCenter},
+		{text: "在线", width: widths[1], alignment: tableAlignCenter},
+		{text: "测速", width: widths[2]},
+		{text: "类型", width: widths[3]},
+		{text: "节点", width: widths[4]},
+	}, rowWidth)
 }
 
 func (m Model) proxyTableRow(group domain.ProxyGroup, proxy domain.Proxy, selected bool, rowWidth int) string {
 	c := colors()
 	active := ""
 	if group.Now == proxy.Name {
-		active = "◆"
+		active = "*"
 	}
-	alive, aliveColor := "○", c.bad
+	alive, aliveColor := "否", c.bad
 	if proxy.Alive {
-		alive, aliveColor = "●", c.good
+		alive, aliveColor = "是", c.good
 	}
 	sourceIndex := proxySourceIndex(group, proxy)
 	testState, delay := m.proxyDisplayState(group.Name, group, sourceIndex)
 	test, testColor := proxyTestLabel(testState, delay)
 	widths := proxyColumnWidths(max(0, rowWidth-2))
 	cells := []tableCell{
-		{text: active, width: widths[0], foreground: c.accent, bold: active != ""},
-		{text: alive, width: widths[1], foreground: aliveColor},
-		{text: proxy.Name, width: widths[2]},
-		{text: test, width: widths[3], alignRight: true, foreground: testColor},
-		{text: empty(proxy.Type, "--"), width: widths[4]},
+		{text: active, width: widths[0], alignment: tableAlignCenter, foreground: c.accent, bold: active != ""},
+		{text: alive, width: widths[1], alignment: tableAlignCenter, foreground: aliveColor},
+		{text: test, width: widths[2], foreground: testColor},
+		{text: empty(proxy.Type, "--"), width: widths[3]},
+		{text: proxy.Name, width: widths[4]},
 	}
 	return tableDataRow(selected, cells, rowWidth)
 }
@@ -1005,7 +1007,7 @@ func highlightNodeRow(selected bool, line string, width int) string {
 	if !selected {
 		return "  " + line
 	}
-	return nodeHighlightStyle(width).Render("› " + line)
+	return nodeHighlightStyle(width).Render("> " + line)
 }
 
 func nodeHighlightStyle(width int) lipgloss.Style {
@@ -1021,11 +1023,11 @@ func selectedWideNodeRow(alive bool, details string, width int) string {
 	width = max(0, width)
 	detailWidth := max(0, width-3)
 	details = fitLine(safeText(details), detailWidth)
-	health := "○"
+	health := "-"
 	if alive {
-		health = "●"
+		health = "+"
 	}
-	return nodeHighlightStyle(width).Render("› " + health + details)
+	return nodeHighlightStyle(width).Render("> " + health + details)
 }
 
 func padRight(value string, width int) string {

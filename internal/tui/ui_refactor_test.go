@@ -175,7 +175,7 @@ func TestUIRefactorSelectedNodeVisibleInColorAndNoColor(t *testing.T) {
 			m.proxyCursor = 1
 			m.syncViewports()
 			line := selectedRenderLine(m.render(), "selected-full-view-node")
-			if line == "" || !strings.Contains(ansi.Strip(line), "›") {
+			if line == "" || !strings.Contains(ansi.Strip(line), ">") {
 				t.Fatalf("selected node is not visibly marked: %q", ansi.Strip(line))
 			}
 			if !strings.Contains(line, "\x1b[") {

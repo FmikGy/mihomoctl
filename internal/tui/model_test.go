@@ -100,7 +100,7 @@ func numberedProxies(count int) []domain.Proxy {
 
 func selectedItemVisible(view, item string) bool {
 	for _, line := range strings.Split(ansi.Strip(view), "\n") {
-		if strings.Contains(line, "›") && strings.Contains(line, item) {
+		if strings.Contains(line, ">") && strings.Contains(line, item) {
 			return true
 		}
 	}
@@ -514,6 +514,159 @@ func TestCompactProxyPageShowsSelectableNodes(t *testing.T) {
 	}
 }
 
+func proxyTableSegments(line string, widths []int) []string {
+	segments := make([]string, 0, len(widths))
+	start := 2
+	for _, width := range widths {
+		segments = append(segments, ansi.Strip(ansi.Cut(line, start, start+width)))
+		start += width + 1
+	}
+	return segments
+}
+
+func TestProxyTableColumnsStayAlignedAtResponsiveWidths(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	testCases := []struct {
+		name      string
+		state     proxyTestState
+		delay     uint16
+		coreDelay uint16
+		want      string
+		recorded  bool
+	}{
+		{name: "untested", want: "未测试"},
+		{name: "core delay", coreDelay: 88, want: "核心 88ms"},
+		{name: "success", state: proxyTestSuccess, delay: 45, want: "45 ms", recorded: true},
+		{name: "timeout", state: proxyTestTimeout, want: "超时", recorded: true},
+		{name: "failed", state: proxyTestFailed, want: "失败", recorded: true},
+	}
+
+	for _, rowWidth := range []int{56, 66, 86, 116} {
+		for _, tt := range testCases {
+			for _, selected := range []bool{false, true} {
+				name := fmt.Sprintf("width-%d/%s/selected-%t", rowWidth, tt.name, selected)
+				t.Run(name, func(t *testing.T) {
+					nodeName := "香港-超长节点-" + strings.Repeat("区域", 24)
+					proxy := domain.Proxy{Name: nodeName, Type: "Hysteria2", Alive: selected, Delay: tt.coreDelay}
+					group := domain.ProxyGroup{Name: "PROXY", Now: nodeName, Proxies: []domain.Proxy{proxy}}
+					m := testModel()
+					m.groups = []domain.ProxyGroup{group}
+					m.proxyTestStates = make(map[string]map[string]proxyTestResult)
+					if tt.recorded {
+						m.proxyTestStates[group.Name] = map[string]proxyTestResult{
+							nodeName: {state: tt.state, delay: tt.delay},
+						}
+					}
+
+					widths := proxyColumnWidths(rowWidth - 2)
+					header := proxyTableHeader(rowWidth)
+					row := m.proxyTableRow(group, proxy, selected, rowWidth)
+					if got := ansi.StringWidth(header); got != rowWidth {
+						t.Fatalf("header width = %d, want %d", got, rowWidth)
+					}
+					if got := ansi.StringWidth(row); got != rowWidth {
+						t.Fatalf("row width = %d, want %d", got, rowWidth)
+					}
+
+					headerCells := proxyTableSegments(header, widths)
+					rowCells := proxyTableSegments(row, widths)
+					if got := strings.TrimSpace(headerCells[1]); got != "在线" {
+						t.Fatalf("online header escaped its column: %q", headerCells[1])
+					}
+					if got := rowCells[1]; got != map[bool]string{false: " 否 ", true: " 是 "}[selected] {
+						t.Fatalf("online value is not centered: %q", got)
+					}
+					if !strings.HasPrefix(headerCells[2], "测速") || !strings.HasPrefix(rowCells[2], tt.want) || strings.TrimSpace(rowCells[2]) != tt.want {
+						t.Fatalf("test column is not left aligned: header=%q row=%q", headerCells[2], rowCells[2])
+					}
+					if !strings.HasPrefix(headerCells[3], "类型") || !strings.HasPrefix(rowCells[3], "Hysteria2") {
+						t.Fatalf("type column is not left aligned: header=%q row=%q", headerCells[3], rowCells[3])
+					}
+					if !strings.HasPrefix(headerCells[4], "节点") || !strings.HasPrefix(rowCells[4], "香港") {
+						t.Fatalf("node column is not left aligned: header=%q row=%q", headerCells[4], rowCells[4])
+					}
+					if rowCells[0] != "*" {
+						t.Fatalf("active marker is not fixed-width ASCII: %q", rowCells[0])
+					}
+					if selected && !strings.HasPrefix(ansi.Strip(row), "> ") {
+						t.Fatalf("selection marker is not fixed-width ASCII: %q", ansi.Strip(row))
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestWideProxyRowsAlignWithLegacyTerminalWidths(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	nodeNames := []string{
+		"Proxies",
+		"🎯Direct",
+		"邮箱客服juzimao2333@gmail.com",
+		"最新官网 ok.riolu.work",
+		"支持AI:新日美台港",
+		"🇭🇰 香港01",
+		"🇭🇰 香港02",
+		"🇭🇰 香港03",
+		"🇭🇰 香港04",
+		"🇯🇵 日本01",
+		"🇯🇵 日本02",
+		"🇯🇵 日本03",
+		"🇯🇵 日本04",
+		"🇸🇬 新加坡01",
+		"🇸🇬 新加坡02",
+	}
+	proxies := make([]domain.Proxy, len(nodeNames))
+	for index, name := range nodeNames {
+		proxies[index] = domain.Proxy{Name: name, Type: "AnyTLS", Alive: true}
+	}
+	groupNames := []string{
+		"AI", "Apple", "Bilibili", "Disney", "GLOBAL", "Game", "Google", "Microsoft",
+		"Netflix", "Proxies", "Telegram", "TikTok", "YouTube", "✈️Final", "🎯Direct",
+	}
+	groups := make([]domain.ProxyGroup, len(groupNames))
+	for index, name := range groupNames {
+		groups[index] = domain.ProxyGroup{Name: name, Now: "Proxies"}
+	}
+	groups[0].Proxies = proxies
+
+	m := testModel()
+	m.width, m.height, m.page = 180, 32, pageProxies
+	m.groups = groups
+	m.syncViewports()
+	lines := strings.Split(ansi.Strip(m.render()), "\n")
+	wantGraphemeColumns := [4]int{-1, -1, -1, -1}
+	wantLegacyColumns := [4]int{-1, -1, -1, -1}
+	for _, nodeName := range nodeNames {
+		found := false
+		for _, line := range lines {
+			if !strings.Contains(line, nodeName) || !strings.Contains(line, "未测试") {
+				continue
+			}
+			found = true
+			for tokenIndex, token := range []string{"是", "未测试", "AnyTLS", nodeName} {
+				index := strings.Index(line, token)
+				graphemeColumn := ansi.StringWidth(line[:index])
+				legacyColumn := ansi.StringWidthWc(line[:index])
+				if wantGraphemeColumns[tokenIndex] < 0 {
+					wantGraphemeColumns[tokenIndex] = graphemeColumn
+					wantLegacyColumns[tokenIndex] = legacyColumn
+					continue
+				}
+				if graphemeColumn != wantGraphemeColumns[tokenIndex] || legacyColumn != wantLegacyColumns[tokenIndex] {
+					t.Fatalf("%q field %q columns = grapheme %d / legacy %d, want %d / %d:\n%s",
+						nodeName, token, graphemeColumn, legacyColumn,
+						wantGraphemeColumns[tokenIndex], wantLegacyColumns[tokenIndex], line)
+				}
+			}
+			break
+		}
+		if !found {
+			t.Fatalf("rendered view does not contain proxy row %q", nodeName)
+		}
+	}
+}
+
 func TestSelectedNodeRowUsesFullWidthMonochromeHighlight(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
 	const width = 42
@@ -531,7 +684,7 @@ func TestSelectedNodeRowUsesFullWidthMonochromeHighlight(t *testing.T) {
 	if selected == ansi.Strip(selected) || unselected != ansi.Strip(unselected) {
 		t.Fatalf("highlight ANSI mismatch: selected=%q unselected=%q", selected, unselected)
 	}
-	if stripped := ansi.Strip(selected); !strings.HasPrefix(stripped, "› ") || !strings.Contains(stripped, "selected node") {
+	if stripped := ansi.Strip(selected); !strings.HasPrefix(stripped, "> ") || !strings.Contains(stripped, "selected node") {
 		t.Fatalf("selected node marker or label missing: %q", stripped)
 	}
 }
@@ -566,10 +719,10 @@ func TestSelectedNodeStyleUsesHighContrastColorBackground(t *testing.T) {
 	if got := ansi.StringWidth(row); got != 42 {
 		t.Fatalf("colored wide selected node row width = %d, want 42", got)
 	}
-	if stripped := ansi.Strip(row); !strings.HasPrefix(stripped, "› ● selected node") {
+	if stripped := ansi.Strip(row); !strings.HasPrefix(stripped, "> + selected node") {
 		t.Fatalf("colored wide selected node markers missing: %q", stripped)
 	}
-	if stripped := ansi.Strip(selectedWideNodeRow(false, " offline node", 42)); !strings.HasPrefix(stripped, "› ○ offline node") {
+	if stripped := ansi.Strip(selectedWideNodeRow(false, " offline node", 42)); !strings.HasPrefix(stripped, "> - offline node") {
 		t.Fatalf("offline wide selected node marker missing: %q", stripped)
 	}
 }
