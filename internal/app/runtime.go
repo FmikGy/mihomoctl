@@ -25,6 +25,9 @@ func (a *App) Status(ctx context.Context) (domain.RuntimeStatus, error) {
 		return domain.RuntimeStatus{}, err
 	}
 	status := domain.RuntimeStatus{Service: service}
+	if settings, available, settingsErr := a.readPublicSettings(); settingsErr == nil && available {
+		applyEffectiveConfig(&status, settings)
+	}
 	if profiles, profileErr := a.Profiles(ctx); profileErr == nil {
 		for _, item := range profiles {
 			if item.Active {
@@ -66,17 +69,17 @@ func (a *App) Status(ctx context.Context) (domain.RuntimeStatus, error) {
 	go func() { defer wait.Done(); connections, _ = api.Connections(requestCtx) }()
 	wait.Wait()
 
+	if configErr == nil {
+		applyEffectiveConfig(&status, domain.EffectiveConfig{
+			Mode: config.Mode, TUN: config.TUN.Enable, MixedPort: config.MixedPort,
+			AllowLAN: config.AllowLAN, IPv6: config.IPv6, LogLevel: config.LogLevel,
+		})
+	}
 	if versionErr != nil || configErr != nil {
 		status.CoreVersion = "控制器不可用"
 		return status, &UnavailableError{Message: "Mihomo 控制器不可用", Cause: errors.Join(versionErr, configErr)}
 	}
 	status.CoreVersion = version.Version
-	status.Mode = config.Mode
-	status.TUN = config.TUN.Enable
-	status.MixedPort = config.MixedPort
-	status.AllowLAN = config.AllowLAN
-	status.IPv6 = config.IPv6
-	status.LogLevel = config.LogLevel
 	status.Traffic = traffic
 	status.Memory = memory.InUse
 	if connections.Memory > status.Memory {
@@ -90,6 +93,16 @@ func (a *App) Status(ctx context.Context) (domain.RuntimeStatus, error) {
 		status.Traffic.UpTotal = connections.UploadTotal
 	}
 	return status, nil
+}
+
+func applyEffectiveConfig(status *domain.RuntimeStatus, config domain.EffectiveConfig) {
+	status.ConfigAvailable = true
+	status.Mode = config.Mode
+	status.TUN = config.TUN
+	status.MixedPort = config.MixedPort
+	status.AllowLAN = config.AllowLAN
+	status.IPv6 = config.IPv6
+	status.LogLevel = config.LogLevel
 }
 
 func (a *App) Groups(ctx context.Context) ([]domain.ProxyGroup, error) {

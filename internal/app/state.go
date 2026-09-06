@@ -61,8 +61,9 @@ type clientState struct {
 }
 
 type publicState struct {
-	SchemaVersion int             `json:"schema_version"`
-	Profiles      []publicProfile `json:"profiles"`
+	SchemaVersion int                     `json:"schema_version"`
+	Profiles      []publicProfile         `json:"profiles"`
+	Settings      *domain.EffectiveConfig `json:"settings,omitempty"`
 }
 
 // publicProfile deliberately omits Source, ETag and LastModified. public.json
@@ -309,7 +310,19 @@ func (a *App) writePublicProfiles(profiles []domain.Profile) error {
 			Subscription: item.Subscription,
 		})
 	}
-	content, err := json.MarshalIndent(publicState{SchemaVersion: 1, Profiles: public}, "", "  ")
+	state := publicState{SchemaVersion: stateVersion, Profiles: public}
+	if a.state != nil && a.state.Installation.ConfigPath != "" {
+		content, err := os.ReadFile(a.state.Installation.ConfigPath)
+		if err != nil {
+			return fmt.Errorf("读取活动 Mihomo 配置失败: %w", err)
+		}
+		settings, err := effectiveConfigFromYAML(content)
+		if err != nil {
+			return fmt.Errorf("读取活动 Mihomo 设置失败: %w", err)
+		}
+		state.Settings = &settings
+	}
+	content, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -317,16 +330,9 @@ func (a *App) writePublicProfiles(profiles []domain.Profile) error {
 }
 
 func (a *App) readPublicProfiles() ([]domain.Profile, error) {
-	content, err := os.ReadFile(a.paths.PublicFile)
+	state, err := a.readPublicState()
 	if err != nil {
 		return nil, err
-	}
-	var state publicState
-	if err := json.Unmarshal(content, &state); err != nil {
-		return nil, &InvalidStateError{Cause: fmt.Errorf("读取公开状态失败: %w", err)}
-	}
-	if state.SchemaVersion != 1 {
-		return nil, &InvalidStateError{Cause: fmt.Errorf("不支持的公开状态版本 %d", state.SchemaVersion)}
 	}
 	profiles := make([]domain.Profile, 0, len(state.Profiles))
 	for _, item := range state.Profiles {
@@ -337,6 +343,65 @@ func (a *App) readPublicProfiles() ([]domain.Profile, error) {
 		})
 	}
 	return profiles, nil
+}
+
+func (a *App) readPublicSettings() (domain.EffectiveConfig, bool, error) {
+	state, err := a.readPublicState()
+	if err != nil {
+		return domain.EffectiveConfig{}, false, err
+	}
+	if state.Settings == nil {
+		return domain.EffectiveConfig{}, false, nil
+	}
+	return *state.Settings, true, nil
+}
+
+func (a *App) readPublicState() (publicState, error) {
+	content, err := os.ReadFile(a.paths.PublicFile)
+	if err != nil {
+		return publicState{}, err
+	}
+	var state publicState
+	if err := json.Unmarshal(content, &state); err != nil {
+		return publicState{}, &InvalidStateError{Cause: fmt.Errorf("读取公开状态失败: %w", err)}
+	}
+	if state.SchemaVersion != stateVersion {
+		return publicState{}, &InvalidStateError{Cause: fmt.Errorf("不支持的公开状态版本 %d", state.SchemaVersion)}
+	}
+	return state, nil
+}
+
+func effectiveConfigFromYAML(content []byte) (domain.EffectiveConfig, error) {
+	var source struct {
+		Mode      domain.Mode `yaml:"mode"`
+		MixedPort int         `yaml:"mixed-port"`
+		AllowLAN  bool        `yaml:"allow-lan"`
+		IPv6      bool        `yaml:"ipv6"`
+		LogLevel  string      `yaml:"log-level"`
+		TUN       struct {
+			Enable bool `yaml:"enable"`
+		} `yaml:"tun"`
+	}
+	if err := yaml.Unmarshal(content, &source); err != nil {
+		return domain.EffectiveConfig{}, err
+	}
+	switch source.Mode {
+	case domain.ModeRule, domain.ModeGlobal, domain.ModeDirect:
+	default:
+		source.Mode = domain.ModeRule
+	}
+	switch source.LogLevel {
+	case "silent", "error", "warning", "info", "debug":
+	default:
+		source.LogLevel = "info"
+	}
+	if source.MixedPort < 1 || source.MixedPort > 65535 {
+		source.MixedPort = 0
+	}
+	return domain.EffectiveConfig{
+		Mode: source.Mode, TUN: source.TUN.Enable, MixedPort: source.MixedPort,
+		AllowLAN: source.AllowLAN, IPv6: source.IPv6, LogLevel: source.LogLevel,
+	}, nil
 }
 
 func isMissing(err error) bool {

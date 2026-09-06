@@ -312,6 +312,29 @@ func (a *App) SetConfig(ctx context.Context, key, value string) error {
 	})
 }
 
+// SyncPublicState rebuilds the non-sensitive status snapshot from the active
+// profile and the already-applied Mihomo configuration. It never applies a
+// configuration or changes service state.
+func (a *App) SyncPublicState(ctx context.Context) error {
+	if !a.isRoot() {
+		if err := a.requireManagedInstallation(); err != nil {
+			return err
+		}
+		return a.runElevated(ctx, []string{"--output", "json", "config", "sync-public-state"}, "")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, store, err := a.requireRootState()
+	if err != nil {
+		return err
+	}
+	profiles, err := store.List()
+	if err != nil {
+		return err
+	}
+	return a.writePublicProfiles(profiles)
+}
+
 func (a *App) ValidateConfigValue(key, value string) error {
 	switch strings.ToLower(strings.TrimSpace(key)) {
 	case "mixed-port":
@@ -358,7 +381,14 @@ func (a *App) changeSettings(ctx context.Context, mutate func(*domain.ManagedSet
 	}
 	a.rebuildAPI()
 	active, _ := store.Active()
-	return a.saveClient(state, active.Name)
+	if err := a.saveClient(state, active.Name); err != nil {
+		return err
+	}
+	profiles, err := store.List()
+	if err != nil {
+		return err
+	}
+	return a.writePublicProfiles(profiles)
 }
 
 func inferSettings(raw []byte) domain.ManagedSettings {

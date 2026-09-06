@@ -125,15 +125,22 @@ func (a *App) Doctor(ctx context.Context, fix bool) ([]domain.DoctorCheck, error
 		if err != nil {
 			return checks, err
 		}
-		profiles, _ := store.List()
-		_ = a.writePublicProfiles(profiles)
+		profiles, err := store.List()
+		if err != nil {
+			return checks, err
+		}
+		if err := a.writePublicProfiles(profiles); err != nil {
+			return checks, err
+		}
 		active := ""
 		for _, item := range profiles {
 			if item.Active {
 				active = item.Name
 			}
 		}
-		_ = a.saveClient(state, active)
+		if err := a.saveClient(state, active); err != nil {
+			return checks, err
+		}
 		for index := range checks {
 			if checks[index].Name == "mihomoctl 初始化" || checks[index].Name == "活动配置" {
 				checks[index].Fixed = true

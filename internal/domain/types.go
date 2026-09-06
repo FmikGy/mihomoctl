@@ -28,6 +28,7 @@ type RuntimeStatus struct {
 	Service         ServiceStatus `json:"service"`
 	CoreVersion     string        `json:"core_version,omitempty"`
 	ActiveProfile   string        `json:"active_profile,omitempty"`
+	ConfigAvailable bool          `json:"config_available"`
 	Mode            Mode          `json:"mode,omitempty"`
 	TUN             bool          `json:"tun"`
 	MixedPort       int           `json:"mixed_port,omitempty"`
@@ -37,6 +38,17 @@ type RuntimeStatus struct {
 	Memory          int64         `json:"memory,omitempty"`
 	ConnectionCount int           `json:"connection_count"`
 	Traffic         Traffic       `json:"traffic"`
+}
+
+// EffectiveConfig is the non-sensitive subset of the active Mihomo
+// configuration that remains useful while the controller is offline.
+type EffectiveConfig struct {
+	Mode      Mode   `json:"mode"`
+	TUN       bool   `json:"tun"`
+	MixedPort int    `json:"mixed_port"`
+	AllowLAN  bool   `json:"allow_lan"`
+	IPv6      bool   `json:"ipv6"`
+	LogLevel  string `json:"log_level"`
 }
 
 type DelaySample struct {

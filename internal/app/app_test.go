@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -138,6 +139,25 @@ func TestInitializeImportsAndAppliesWithoutStartingService(t *testing.T) {
 	}
 	if len(profiles) != 1 || !profiles[0].Active || profiles[0].Name != "系统原配置" {
 		t.Fatalf("unexpected imported profiles: %#v", profiles)
+	}
+	if err := application.SetConfig(context.Background(), "mixed-port", "8899"); err != nil {
+		t.Fatal(err)
+	}
+	settings, available, err := application.readPublicSettings()
+	if err != nil || !available || settings.MixedPort != 8899 {
+		t.Fatalf("updated public settings = %#v available=%v err=%v", settings, available, err)
+	}
+	updatedConfig, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(updatedConfig), "mixed-port: 8899") || !strings.Contains(string(updatedConfig), "custom-field: keep-me") {
+		t.Fatalf("setting update did not preserve and publish active config:\n%s", updatedConfig)
+	}
+	for _, call := range runner.snapshotCalls() {
+		if strings.Contains(call, "systemctl start") || strings.Contains(call, "systemctl restart") {
+			t.Fatalf("changing settings for an inactive service changed its runtime state: %s", call)
+		}
 	}
 	for _, path := range []string{paths.ConfigFile, paths.ClientFile} {
 		info, err := os.Stat(path)
@@ -295,6 +315,214 @@ func TestPublicProfilesNeverContainSourcesOrValidators(t *testing.T) {
 	}
 }
 
+func TestPublicStateUsesEffectiveAppliedConfig(t *testing.T) {
+	root := t.TempDir()
+	paths := testPaths(root)
+	configPath := filepath.Join(root, "mihomo", "config.yaml")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("mode: direct\nmixed-port: 8899\nallow-lan: true\nipv6: true\nlog-level: warning\ntun:\n  enable: true\nsecret: must-not-leak\nproxy-providers:\n  private:\n    url: https://example.test/sub?token=must-not-leak\n")
+	if err := os.WriteFile(configPath, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	managedPort := 7890
+	application := &App{
+		paths: paths,
+		state: &persistedState{
+			Installation: platform.Installation{ConfigPath: configPath},
+			Settings:     domain.ManagedSettings{Mode: domain.ModeGlobal, MixedPort: &managedPort},
+		},
+	}
+	if err := application.writePublicProfiles([]domain.Profile{{ID: "active", Name: "日常", Active: true}}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := application.readPublicState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := domain.EffectiveConfig{
+		Mode: domain.ModeDirect, TUN: true, MixedPort: 8899,
+		AllowLAN: true, IPv6: true, LogLevel: "warning",
+	}
+	if state.SchemaVersion != 1 || state.Settings == nil || *state.Settings != want {
+		t.Fatalf("public state = %#v, want settings %#v", state, want)
+	}
+	publicContent, err := os.ReadFile(paths.PublicFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(publicContent), "must-not-leak") || strings.Contains(string(publicContent), "example.test") {
+		t.Fatalf("public settings leaked private config: %s", publicContent)
+	}
+}
+
+func TestEffectiveConfigDefaultsAndLegacyPublicState(t *testing.T) {
+	settings, err := effectiveConfigFromYAML([]byte("proxies: []\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := domain.EffectiveConfig{Mode: domain.ModeRule, LogLevel: "info"}
+	if settings != want {
+		t.Fatalf("default settings = %#v, want %#v", settings, want)
+	}
+
+	paths := testPaths(t.TempDir())
+	if err := os.MkdirAll(paths.DataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := []byte(`{"schema_version":1,"profiles":[{"id":"old","name":"旧配置","kind":"local","active":true}]}`)
+	if err := os.WriteFile(paths.PublicFile, legacy, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	application := &App{paths: paths}
+	if _, available, err := application.readPublicSettings(); err != nil || available {
+		t.Fatalf("legacy settings available=%v err=%v", available, err)
+	}
+	profiles, err := application.readPublicProfiles()
+	if err != nil || len(profiles) != 1 || profiles[0].Name != "旧配置" {
+		t.Fatalf("legacy profiles = %#v, err=%v", profiles, err)
+	}
+}
+
+func TestStatusUsesSnapshotWhileServiceIsStopped(t *testing.T) {
+	paths := testPaths(t.TempDir())
+	if err := os.MkdirAll(paths.DataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	settings := domain.EffectiveConfig{
+		Mode: domain.ModeGlobal, TUN: true, MixedPort: 8899,
+		AllowLAN: true, IPv6: true, LogLevel: "debug",
+	}
+	content, err := json.Marshal(publicState{SchemaVersion: 1, Profiles: []publicProfile{}, Settings: &settings})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.PublicFile, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	application := &App{
+		paths: paths, runner: &fakeRunner{}, euid: func() int { return 1000 },
+		client: &clientState{Service: "mihomo.service"},
+	}
+	status, err := application.Status(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !status.ConfigAvailable || status.Mode != settings.Mode || status.MixedPort != settings.MixedPort || !status.TUN || !status.AllowLAN || !status.IPv6 || status.LogLevel != settings.LogLevel {
+		t.Fatalf("stopped status did not retain settings: %#v", status)
+	}
+}
+
+func TestStatusLiveAPIOverridesPublicSnapshot(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/version":
+			_, _ = writer.Write([]byte(`{"version":"1.19.0"}`))
+		case "/configs":
+			_, _ = writer.Write([]byte(`{"mode":"global","mixed-port":9999,"allow-lan":true,"ipv6":true,"log-level":"debug","tun":{"enable":true}}`))
+		case "/traffic":
+			_, _ = writer.Write([]byte(`{"up":1,"down":2}`))
+		case "/memory":
+			_, _ = writer.Write([]byte(`{"inuse":3}`))
+		case "/connections":
+			_, _ = writer.Write([]byte(`{"connections":[]}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	api, err := mihomo.New(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := testPaths(t.TempDir())
+	if err := os.MkdirAll(paths.DataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := domain.EffectiveConfig{Mode: domain.ModeDirect, MixedPort: 7777, LogLevel: "warning"}
+	publicContent, err := json.Marshal(publicState{SchemaVersion: 1, Profiles: []publicProfile{}, Settings: &snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.PublicFile, publicContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	application := &App{
+		paths: paths, runner: &fakeRunner{active: true}, euid: func() int { return 1000 },
+		client: &clientState{Service: "mihomo.service"}, api: api,
+	}
+	status, err := application.Status(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !status.ConfigAvailable || status.Mode != domain.ModeGlobal || status.MixedPort != 9999 || !status.TUN || !status.AllowLAN || !status.IPv6 || status.LogLevel != "debug" {
+		t.Fatalf("live config did not override snapshot: %#v", status)
+	}
+}
+
+func TestSyncPublicStateIsIdempotentAndDoesNotTouchRuntime(t *testing.T) {
+	root := t.TempDir()
+	paths := testPaths(root)
+	configDir := filepath.Join(root, "mihomo")
+	configPath := filepath.Join(configDir, "config.yaml")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	original := []byte("mixed-port: 7898\nallow-lan: true\nmode: rule\nlog-level: info\nproxies: []\nproxy-groups: []\nrules:\n  - MATCH,DIRECT\n")
+	if err := os.WriteFile(configPath, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binaryDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binaryDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(binaryDir, "mihomo")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeRunner{binary: binary, configDir: configDir}
+	application, err := New(WithPaths(paths), WithRunner(runner), WithEUID(func() int { return 0 }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := application.Initialize(context.Background(), domain.InitOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	legacy := []byte(`{"schema_version":1,"profiles":[]}`)
+	if err := os.WriteFile(paths.PublicFile, legacy, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runner.mu.Lock()
+	runner.calls = nil
+	runner.mu.Unlock()
+	appliedBefore, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := application.SyncPublicState(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls := runner.snapshotCalls(); len(calls) != 0 {
+		t.Fatalf("public sync touched runtime: %v", calls)
+	}
+	appliedAfter, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(appliedBefore, appliedAfter) {
+		t.Fatal("public sync changed the active Mihomo config")
+	}
+	settings, available, err := application.readPublicSettings()
+	if err != nil || !available || settings.MixedPort != 7898 || !settings.AllowLAN {
+		t.Fatalf("synced settings = %#v available=%v err=%v", settings, available, err)
+	}
+}
+
 func TestSetConfigRejectsInvalidValueBeforeMutation(t *testing.T) {
 	runner := &fakeRunner{}
 	application, err := New(
@@ -349,8 +577,20 @@ func TestStatusReturnsUnavailableWhenRunningControllerFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	paths := testPaths(t.TempDir())
+	if err := os.MkdirAll(paths.DataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := domain.EffectiveConfig{Mode: domain.ModeDirect, MixedPort: 7777, AllowLAN: true, LogLevel: "warning"}
+	publicContent, err := json.Marshal(publicState{SchemaVersion: 1, Profiles: []publicProfile{}, Settings: &snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.PublicFile, publicContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	application := &App{
-		paths:  testPaths(t.TempDir()),
+		paths:  paths,
 		runner: &fakeRunner{active: true},
 		euid:   func() int { return 1000 },
 		client: &clientState{Service: "mihomo.service", ActiveProfile: "日常"},
@@ -359,6 +599,9 @@ func TestStatusReturnsUnavailableWhenRunningControllerFails(t *testing.T) {
 	status, err := application.Status(context.Background())
 	if !status.Service.Active || status.CoreVersion != "控制器不可用" {
 		t.Fatalf("partial status = %#v", status)
+	}
+	if !status.ConfigAvailable || status.Mode != snapshot.Mode || status.MixedPort != snapshot.MixedPort || !status.AllowLAN || status.LogLevel != snapshot.LogLevel {
+		t.Fatalf("controller failure discarded snapshot: %#v", status)
 	}
 	var coded interface{ ExitCode() int }
 	if !errors.As(err, &coded) || coded.ExitCode() != 4 {

@@ -43,6 +43,7 @@ type Backend interface {
 	Initialize(context.Context, domain.InitOptions) error
 	UpdateProfiles(context.Context, domain.ProfileUpdateOptions) error
 	SetConfig(context.Context, string, string) error
+	SyncPublicState(context.Context) error
 	ScheduleStatus(context.Context) (domain.ScheduleStatus, error)
 	Doctor(context.Context, bool) ([]domain.DoctorCheck, error)
 }
@@ -359,6 +360,17 @@ func (a *application) configCommand() *cobra.Command {
 				return err
 			}
 			return a.writeResult(map[string]any{"key": key, "value": value}, key+" 已更新")
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:    "sync-public-state",
+		Hidden: true,
+		Args:   noArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := a.backend.SyncPublicState(cmd.Context()); err != nil {
+				return err
+			}
+			return a.writeResult(map[string]any{"synced": true}, "公开状态已同步")
 		},
 	})
 	return cmd

@@ -17,15 +17,19 @@ import (
 )
 
 type fakeBackend struct {
-	status   domain.RuntimeStatus
-	groups   []domain.ProxyGroup
-	profiles []domain.Profile
-	conns    []domain.Connection
-	action   string
-	schedule *bool
-	delays   map[string]uint16
-	groupErr error
-	tested   string
+	status      domain.RuntimeStatus
+	groups      []domain.ProxyGroup
+	profiles    []domain.Profile
+	conns       []domain.Connection
+	action      string
+	schedule    *bool
+	delays      map[string]uint16
+	groupErr    error
+	tested      string
+	configKey   string
+	configValue string
+	configCalls int
+	configErr   error
 }
 
 func (f *fakeBackend) Status(context.Context) (domain.RuntimeStatus, error)     { return f.status, nil }
@@ -45,6 +49,12 @@ func (f *fakeBackend) WatchLogs(context.Context, string) (<-chan domain.LogEntry
 func (f *fakeBackend) Service(_ context.Context, action string) error { f.action = action; return nil }
 func (f *fakeBackend) SetMode(context.Context, domain.Mode) error     { return nil }
 func (f *fakeBackend) SetTUN(context.Context, bool) error             { return nil }
+func (f *fakeBackend) SetConfig(_ context.Context, key, value string) error {
+	f.configKey = key
+	f.configValue = value
+	f.configCalls++
+	return f.configErr
+}
 func (f *fakeBackend) SetSchedule(_ context.Context, enabled bool) error {
 	f.schedule = &enabled
 	return nil
@@ -66,7 +76,10 @@ func (f *fakeBackend) CloseAllConnections(context.Context) error                
 
 func testModel() Model {
 	backend := &fakeBackend{
-		status:   domain.RuntimeStatus{Service: domain.ServiceStatus{Active: true}, ActiveProfile: "日常", Mode: domain.ModeRule, MixedPort: 7890},
+		status: domain.RuntimeStatus{
+			Service: domain.ServiceStatus{Active: true}, ActiveProfile: "日常",
+			Mode: domain.ModeRule, MixedPort: 7890, LogLevel: "info", ConfigAvailable: true,
+		},
 		groups:   []domain.ProxyGroup{{Name: "PROXY", Now: "香港 01", Proxies: []domain.Proxy{{Name: "香港 01", Type: "VLESS", Alive: true, Delay: 45}}}},
 		profiles: []domain.Profile{{Name: "日常", Kind: domain.ProfileRemote, Active: true}},
 		conns:    []domain.Connection{{ID: "1", Host: "example.com", Process: "curl", Download: 1024}},
@@ -130,7 +143,7 @@ func TestContextualFooterHints(t *testing.T) {
 		{pageProfiles, []string{"↑↓选", "a添加", "u更新", "d删除", "Enter激活", "?帮助", "q退出"}},
 		{pageConnections, []string{"↑↓选", "Enter关闭", "x全部", "/筛选", "?帮助", "q退出"}},
 		{pageLogs, []string{"Space暂停", "/筛选", "r刷新", "?帮助", "q退出"}},
-		{pageSettings, []string{"↑↓选", "Enter切换", "r刷新", "?帮助", "q退出"}},
+		{pageSettings, []string{"↑↓选", "Enter修改", "r刷新", "?帮助", "q退出"}},
 	}
 
 	for _, tt := range tests {
@@ -739,7 +752,7 @@ func TestSettingsSelectionVisibleAtBoundaries(t *testing.T) {
 	m := testModel()
 	m.width, m.height, m.page = 60, 16, pageSettings
 	m.moveCursor(1000)
-	requireSelectedVisible(t, m, "订阅定时更新")
+	requireSelectedVisible(t, m, "日志级别")
 	m.moveCursor(-1000)
 	requireSelectedVisible(t, m, "Mihomo 服务")
 }
@@ -1022,7 +1035,7 @@ func TestGroupNavigationWraps(t *testing.T) {
 
 func TestScheduleSettingTogglesKnownState(t *testing.T) {
 	m := testModel()
-	m.page, m.settingCursor = pageSettings, 4
+	m.page, m.settingCursor = pageSettings, settingCursorFor(t, settingSchedule)
 	m.scheduleOK = true
 	m.schedule.Enabled = true
 	backend := m.backend.(*fakeBackend)

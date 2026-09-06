@@ -69,6 +69,8 @@ func (m Model) render() string {
 		content = m.renderOverlay(m.confirmText())
 	} else if m.inMode != inputNone {
 		content = m.renderOverlay(m.renderInput())
+	} else if m.picker != pickerNone {
+		content = m.renderOverlay(m.renderPicker())
 	}
 	return fitBlock(content, m.width, m.height)
 }
@@ -493,34 +495,56 @@ func (m Model) renderLogs(height int) string {
 }
 
 func (m Model) renderSettings(height int) string {
-	schedule := "未检测"
-	if m.scheduleOK {
-		schedule = onOff(m.schedule.Enabled)
-	}
-	rows := []struct {
-		name, value string
-		enabled     *bool
-	}{
-		{"Mihomo 服务", activeLabel(m.status.Service.Active), boolPointer(m.status.Service.Active)},
-		{"开机启动", onOff(m.status.Service.Enabled), boolPointer(m.status.Service.Enabled)},
-		{"运行模式", modeLabel(m.status.Mode), nil},
-		{"TUN 透明代理", onOff(m.status.TUN), boolPointer(m.status.TUN)},
-		{"订阅定时更新", schedule, scheduleToggle(m.scheduleOK, m.schedule.Enabled)},
-	}
+	rows := m.settingRows()
 	rowWidth := max(1, m.width-4)
-	lines := []string{titleLine("设置", "Enter 切换", rowWidth)}
+	meta := listPosition(m.settingCursor, len(rows)) + "  Enter 修改"
+	lines := []string{titleLine("设置", meta, rowWidth)}
 	start, end := viewportBounds(len(rows), m.settingCursor, m.settingOffset, m.settingsCapacity())
+	group := ""
 	for i := start; i < end; i++ {
 		row := rows[i]
-		value := row.value
-		if row.enabled != nil {
-			value = toggleLabel(*row.enabled)
+		if row.group != group {
+			group = row.group
+			lines = append(lines, lipgloss.NewStyle().Foreground(colors().muted).Render(safeText(group)))
 		}
-		lines = append(lines, selectedRow(i == m.settingCursor, row.name, value, rowWidth))
+		lines = append(lines, selectedRow(i == m.settingCursor, row.name, row.value, rowWidth))
 	}
-	listen := fmt.Sprintf("混合端口 %s   局域网 %s   IPv6 %s", portLabel(m.status.MixedPort), compactOnOff(m.status.AllowLAN), compactOnOff(m.status.IPv6))
-	lines = append(lines, "", titleLine("监听与网络", "", rowWidth), mutedLine(listen, rowWidth))
 	return renderPage(lines, m.width, height)
+}
+
+type settingViewRow struct {
+	id          settingID
+	group       string
+	name, value string
+}
+
+func (m Model) settingRows() []settingViewRow {
+	known := m.status.ConfigAvailable
+	schedule := "未知"
+	if m.scheduleOK {
+		schedule = toggleLabel(m.schedule.Enabled)
+	}
+	mode, tun, port := "未知", "未知", "未知"
+	allowLAN, ipv6, logLevel := "未知", "未知", "未知"
+	if known {
+		mode = modeLabel(m.status.Mode)
+		tun = toggleLabel(m.status.TUN)
+		port = portLabel(m.status.MixedPort)
+		allowLAN = toggleLabel(m.status.AllowLAN)
+		ipv6 = toggleLabel(m.status.IPv6)
+		logLevel = strings.ToUpper(empty(m.status.LogLevel, "info"))
+	}
+	return []settingViewRow{
+		{id: settingService, group: "服务与运行", name: "Mihomo 服务", value: toggleLabel(m.status.Service.Active)},
+		{id: settingStartup, group: "服务与运行", name: "开机启动", value: toggleLabel(m.status.Service.Enabled)},
+		{id: settingMode, group: "服务与运行", name: "运行模式", value: mode},
+		{id: settingTUN, group: "服务与运行", name: "TUN 透明代理", value: tun},
+		{id: settingSchedule, group: "服务与运行", name: "订阅定时更新", value: schedule},
+		{id: settingMixedPort, group: "监听与网络", name: "混合端口", value: port},
+		{id: settingAllowLAN, group: "监听与网络", name: "允许局域网", value: allowLAN},
+		{id: settingIPv6, group: "监听与网络", name: "IPv6", value: ipv6},
+		{id: settingLogLevel, group: "日志", name: "日志级别", value: logLevel},
+	}
 }
 
 func (m Model) renderFooter() string {
@@ -576,7 +600,7 @@ func (m Model) pageHints() []string {
 		}
 		return []string{pause, "/筛选", "r刷新", "PgUp/PgDn浏览", "Home/End首尾"}
 	case pageSettings:
-		return []string{"↑↓选", "Enter切换", "r刷新"}
+		return []string{"↑↓选", "Enter修改", "r刷新"}
 	default:
 		return nil
 	}
@@ -635,6 +659,8 @@ func (m Model) renderInput() string {
 	title := "筛选"
 	if m.inMode == inputProfile {
 		title = "添加配置"
+	} else if m.inMode == inputMixedPort {
+		title = "修改混合端口"
 	}
 	value := safeText(m.input.Value())
 	if m.inMode == inputProfile {
@@ -646,7 +672,32 @@ func (m Model) renderInput() string {
 	inputWidth := max(12, min(64, m.width-18))
 	field := lipgloss.NewStyle().Foreground(colors().text).Background(colors().surfaceAlt).
 		Render(" " + padRight(value, max(1, inputWidth-2)) + " ")
-	return sectionTitle(title) + "\n\n" + field + "\n\nEnter 确认  ·  Esc 取消"
+	lines := []string{sectionTitle(title), "", field}
+	if m.inputError != "" {
+		lines = append(lines, "", lipgloss.NewStyle().Foreground(colors().bad).Render(safeText(m.inputError)))
+	}
+	lines = append(lines, "", "Enter 确认  ·  Esc 取消")
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderPicker() string {
+	title := "选择设置"
+	switch m.picker {
+	case pickerTUN:
+		title = "TUN 透明代理"
+	case pickerAllowLAN:
+		title = "允许局域网"
+	case pickerIPv6:
+		title = "IPv6"
+	case pickerLogLevel:
+		title = "日志级别"
+	}
+	lines := []string{sectionTitle(title), ""}
+	for index, option := range m.pickerOptions() {
+		lines = append(lines, selectedRow(index == m.pickerCursor, option.label, "", 28))
+	}
+	lines = append(lines, "", "↑↓ 选择  ·  Enter 确认  ·  Esc 取消")
+	return strings.Join(lines, "\n")
 }
 
 func (m Model) confirmText() string {
@@ -660,6 +711,8 @@ func (m Model) confirmText() string {
 		message = "关闭全部活动连接？"
 	case confirmStopService:
 		message = "停止 Mihomo 服务？"
+	case confirmEnableLAN:
+		message = "开启局域网访问？\n代理端口将对同一局域网开放。\n控制器仍仅限本机。"
 	}
 	if m.confirmTarget.label != "" && m.confirm != confirmCloseAll && m.confirm != confirmStopService {
 		message += "\n" + lipgloss.NewStyle().Foreground(colors().muted).Render(
@@ -675,7 +728,7 @@ func (m Model) helpText() string {
 		lines = append(lines,
 			"Tab / ←→  切页     ↑↓ / jk  选择",
 			"Home / End 首尾    PgUp / PgDn 翻页",
-			"Enter 执行         r 刷新",
+			"Enter 执行 / 修改  r 刷新",
 			"/ 筛选             t 测速",
 			"[ ] 策略组         a / u / d 配置",
 			"Space 暂停日志     x 关闭全部连接",
@@ -686,7 +739,7 @@ func (m Model) helpText() string {
 	lines = append(lines,
 		"Tab / ← →     切换页面          Home / End     移到首尾",
 		"j k / ↑ ↓     移动选择          PgUp / PgDn     翻页浏览",
-		"Enter          执行当前操作      r               刷新",
+		"Enter          执行或修改当前项  r               刷新",
 		"/              筛选              t               测试策略组延迟",
 		"[ ]            切换策略组        a / u / d       添加、更新、删除配置",
 		"Space          暂停或继续日志    x               关闭全部连接",

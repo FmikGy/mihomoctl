@@ -18,6 +18,7 @@ type Backend interface {
 	Service(context.Context, string) error
 	SetMode(context.Context, domain.Mode) error
 	SetTUN(context.Context, bool) error
+	SetConfig(context.Context, string, string) error
 	SetSchedule(context.Context, bool) error
 	SelectProxy(context.Context, string, string) error
 	TestGroup(context.Context, string) (map[string]uint16, error)

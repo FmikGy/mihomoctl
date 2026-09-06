@@ -114,6 +114,10 @@ if ((install_units)); then
 	fi
 fi
 
+if [[ -z "$destdir" ]]; then
+	"${install_prefix[@]}" "$bindir/mihomoctl" config sync-public-state >/dev/null 2>&1 || true
+fi
+
 echo "installed $bindir/mihomoctl"
 if ((install_units)); then
 	echo "installed disabled timer; after init, run 'mihomoctl schedule enable' to opt in"

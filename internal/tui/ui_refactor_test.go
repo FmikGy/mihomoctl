@@ -25,10 +25,12 @@ type uiRecordingBackend struct {
 type uiLogRecordingBackend struct {
 	*fakeBackend
 	watchLogsCalls int
+	levels         []string
 }
 
-func (b *uiLogRecordingBackend) WatchLogs(context.Context, string) (<-chan domain.LogEntry, <-chan error) {
+func (b *uiLogRecordingBackend) WatchLogs(_ context.Context, level string) (<-chan domain.LogEntry, <-chan error) {
 	b.watchLogsCalls++
+	b.levels = append(b.levels, level)
 	return make(chan domain.LogEntry), make(chan error)
 }
 
@@ -116,7 +118,7 @@ func TestUIRefactorResponsiveLayoutsWithLongCJK(t *testing.T) {
 				}
 				m.groups = []domain.ProxyGroup{{Name: "策略组" + longText, Now: proxies[len(proxies)-1].Name, Proxies: proxies}}
 				m.profiles, m.connections, m.logs = profiles, connections, logs
-				m.proxyCursor, m.profileCursor, m.connectionCursor, m.settingCursor = len(proxies)-1, len(profiles)-1, len(connections)-1, 4
+				m.proxyCursor, m.profileCursor, m.connectionCursor, m.settingCursor = len(proxies)-1, len(profiles)-1, len(connections)-1, len(settingOrder)-1
 				m.clampCursors()
 
 				view := m.render()
@@ -411,7 +413,7 @@ func TestUIRefactorListNavigationKeys(t *testing.T) {
 			cursor: func(m Model) int { return m.connectionCursor },
 		},
 		{
-			name: "settings", page: pageSettings, maximum: 4,
+			name: "settings", page: pageSettings, maximum: len(settingOrder) - 1,
 			setup:  func(*Model) {},
 			cursor: func(m Model) int { return m.settingCursor },
 		},

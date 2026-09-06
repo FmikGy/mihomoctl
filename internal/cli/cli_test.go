@@ -49,6 +49,7 @@ type fakeBackend struct {
 	selection      [2]string
 	add            addCall
 	config         configCall
+	syncCalls      int
 	usedProfile    string
 	removedProfile string
 	closedID       string
@@ -157,6 +158,11 @@ func (f *fakeBackend) SetConfig(_ context.Context, key, value string) error {
 	return f.err
 }
 
+func (f *fakeBackend) SyncPublicState(context.Context) error {
+	f.syncCalls++
+	return f.err
+}
+
 func (f *fakeBackend) ScheduleStatus(context.Context) (domain.ScheduleStatus, error) {
 	return f.scheduleValue, f.err
 }
@@ -230,6 +236,24 @@ func TestCommandRoutingAndFlags(t *testing.T) {
 		}
 		if backend.config != (configCall{key: "allow-lan", value: "true"}) {
 			t.Fatalf("SetConfig call = %#v", backend.config)
+		}
+	})
+
+	t.Run("hidden public state sync", func(t *testing.T) {
+		backend := &fakeBackend{}
+		stdout, _, err := runCommand(t, backend, "config", "sync-public-state", "--output", "json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if backend.syncCalls != 1 || !strings.Contains(stdout, `"synced":true`) {
+			t.Fatalf("sync routing failed: calls=%d output=%q", backend.syncCalls, stdout)
+		}
+		help, _, err := runCommand(t, backend, "config", "--help")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(help, "sync-public-state") {
+			t.Fatalf("hidden migration command appeared in help: %s", help)
 		}
 	})
 

@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,7 +32,49 @@ const (
 	inputNone inputMode = iota
 	inputProfile
 	inputFilter
+	inputMixedPort
 )
+
+type settingID string
+
+const (
+	settingService   settingID = "service"
+	settingStartup   settingID = "startup"
+	settingMode      settingID = "mode"
+	settingTUN       settingID = "tun"
+	settingSchedule  settingID = "schedule"
+	settingMixedPort settingID = "mixed-port"
+	settingAllowLAN  settingID = "allow-lan"
+	settingIPv6      settingID = "ipv6"
+	settingLogLevel  settingID = "log-level"
+)
+
+var settingOrder = []settingID{
+	settingService,
+	settingStartup,
+	settingMode,
+	settingTUN,
+	settingSchedule,
+	settingMixedPort,
+	settingAllowLAN,
+	settingIPv6,
+	settingLogLevel,
+}
+
+type settingPicker int
+
+const (
+	pickerNone settingPicker = iota
+	pickerTUN
+	pickerAllowLAN
+	pickerIPv6
+	pickerLogLevel
+)
+
+type pickerOption struct {
+	label string
+	value string
+}
 
 const (
 	profileInputMask       = '*'
@@ -53,6 +96,7 @@ const (
 	confirmCloseConnection
 	confirmCloseAll
 	confirmStopService
+	confirmEnableLAN
 )
 
 type confirmTarget struct {
@@ -172,6 +216,9 @@ type Model struct {
 	filter             string
 	input              textinput.Model
 	inMode             inputMode
+	inputError         string
+	picker             settingPicker
+	pickerCursor       int
 	confirm            confirmMode
 	confirmTarget      confirmTarget
 	mutationGeneration uint64
@@ -212,9 +259,11 @@ type connectionsMsg struct {
 	generation  uint64
 }
 type operationMsg struct {
-	message    string
-	err        error
-	generation uint64
+	message     string
+	err         error
+	generation  uint64
+	configKey   string
+	configValue string
 }
 type groupTestMsg struct {
 	group       string
@@ -635,6 +684,21 @@ func (m *Model) beginOperation(message string, fn func(context.Context) error) t
 	}
 }
 
+func (m *Model) beginConfigOperation(message, key, value string) tea.Cmd {
+	operation := m.beginOperation(message, func(ctx context.Context) error {
+		return m.backend.SetConfig(ctx, key, value)
+	})
+	if operation == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		result := operation().(operationMsg)
+		result.configKey = key
+		result.configValue = value
+		return result
+	}
+}
+
 func (m *Model) beginGroupTest(group string) tea.Cmd {
 	if m.loading {
 		return nil
@@ -704,6 +768,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.inMode != inputNone {
 			return m.updateInput(msg)
 		}
+		if m.picker != pickerNone {
+			return m.updatePicker(msg)
+		}
 		return m.updateKey(msg)
 	case tickMsg:
 		now := time.Time(msg)
@@ -735,6 +802,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusSnapshotFloor = msg.requestedAt
 		}
 		if msg.err != nil {
+			if msg.status.ConfigAvailable {
+				mergeConfigStatus(&m.status, msg.status)
+			}
 			m.setSourceError(errorStatus, msg.err)
 		} else {
 			currentTraffic := m.status.Traffic
@@ -764,11 +834,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.clearSourceError(errorStatus)
 		}
+		logLevelChanged := false
+		if m.status.ConfigAvailable {
+			if level, ok := normalizeLogLevel(m.status.LogLevel); ok && level != m.logLevel {
+				m.logLevel = level
+				logLevelChanged = true
+			}
+		}
 		var trafficCmd, logCmd tea.Cmd
 		if msg.generation != 0 && msg.err == nil && msg.status.Service.Active {
 			trafficCmd = m.beginTraffic(false)
 			if m.page == pageLogs {
-				logCmd = m.beginLogs(false)
+				logCmd = m.beginLogs(logLevelChanged)
 			}
 		}
 		return m, tea.Batch(next(), trafficCmd, logCmd)
@@ -851,6 +928,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.setSourceError(errorOperation, msg.err)
 		} else {
+			if msg.configKey == string(settingLogLevel) {
+				if level, ok := normalizeLogLevel(msg.configValue); ok {
+					m.logLevel = level
+				}
+			}
 			m.clearSourceError(errorOperation)
 			m.showToast(msg.message, false, time.Now())
 		}
@@ -1188,11 +1270,21 @@ func (m Model) updateInput(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			value := strings.TrimSpace(m.input.Value())
 			mode := m.inMode
-			m.resetInput()
 			if mode == inputFilter {
+				m.resetInput()
 				m.applyFilter(value)
 				return m, nil
 			}
+			if mode == inputMixedPort {
+				normalized, err := normalizeMixedPort(value)
+				if err != nil {
+					m.inputError = err.Error()
+					return m, nil
+				}
+				m.resetInput()
+				return m, m.beginConfigOperation("混合端口已更新", string(settingMixedPort), normalized)
+			}
+			m.resetInput()
 			if value == "" {
 				return m, nil
 			}
@@ -1201,6 +1293,9 @@ func (m Model) updateInput(msg tea.Msg) (tea.Model, tea.Cmd) {
 			})
 		}
 	}
+	if _, ok := msg.(tea.KeyPressMsg); ok {
+		m.inputError = ""
+	}
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
 	return m, cmd
@@ -1208,6 +1303,7 @@ func (m Model) updateInput(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *Model) focusInput(mode inputMode, placeholder, value string) tea.Cmd {
 	m.inMode = mode
+	m.inputError = ""
 	m.input.Placeholder = placeholder
 	m.input.SetValue(value)
 	m.input.EchoMode = textinput.EchoNormal
@@ -1225,6 +1321,110 @@ func (m *Model) resetInput() {
 	m.input.EchoMode = textinput.EchoNormal
 	m.input.EchoCharacter = profileInputMask
 	m.inMode = inputNone
+	m.inputError = ""
+}
+
+func (m Model) updatePicker(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	options := m.pickerOptions()
+	if len(options) == 0 {
+		m.closePicker()
+		return m, nil
+	}
+	switch msg.String() {
+	case "esc", "q":
+		m.closePicker()
+	case "up", "k":
+		m.pickerCursor = clamp(m.pickerCursor-1, 0, len(options)-1)
+	case "down", "j":
+		m.pickerCursor = clamp(m.pickerCursor+1, 0, len(options)-1)
+	case "home":
+		m.pickerCursor = 0
+	case "end":
+		m.pickerCursor = len(options) - 1
+	case "enter", "space":
+		kind := m.picker
+		value := options[clamp(m.pickerCursor, 0, len(options)-1)].value
+		m.closePicker()
+		switch kind {
+		case pickerTUN:
+			enabled := value == "on"
+			return m, m.beginOperation("TUN 设置已更新", func(ctx context.Context) error {
+				return m.backend.SetTUN(ctx, enabled)
+			})
+		case pickerAllowLAN:
+			if value == "on" {
+				m.confirm = confirmEnableLAN
+				return m, nil
+			}
+			return m, m.beginConfigOperation("局域网访问已关闭", string(settingAllowLAN), value)
+		case pickerIPv6:
+			return m, m.beginConfigOperation("IPv6 设置已更新", string(settingIPv6), value)
+		case pickerLogLevel:
+			return m, m.beginConfigOperation("日志级别已更新", string(settingLogLevel), value)
+		}
+	}
+	return m, nil
+}
+
+func (m *Model) openPicker(kind settingPicker, current string) {
+	m.picker = kind
+	m.pickerCursor = 0
+	for index, option := range m.pickerOptions() {
+		if option.value == current {
+			m.pickerCursor = index
+			break
+		}
+	}
+}
+
+func (m *Model) closePicker() {
+	m.picker = pickerNone
+	m.pickerCursor = 0
+}
+
+func (m Model) pickerOptions() []pickerOption {
+	switch m.picker {
+	case pickerTUN, pickerAllowLAN, pickerIPv6:
+		return []pickerOption{{label: "关闭", value: "off"}, {label: "开启", value: "on"}}
+	case pickerLogLevel:
+		return []pickerOption{
+			{label: "DEBUG", value: "debug"},
+			{label: "INFO", value: "info"},
+			{label: "WARNING", value: "warning"},
+			{label: "ERROR", value: "error"},
+			{label: "SILENT", value: "silent"},
+		}
+	default:
+		return nil
+	}
+}
+
+func normalizeLogLevel(value string) (string, bool) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "debug", "info", "warning", "error", "silent":
+		return value, true
+	default:
+		return "", false
+	}
+}
+
+func mergeConfigStatus(target *domain.RuntimeStatus, source domain.RuntimeStatus) {
+	target.ConfigAvailable = true
+	target.Mode = source.Mode
+	target.TUN = source.TUN
+	target.MixedPort = source.MixedPort
+	target.AllowLAN = source.AllowLAN
+	target.IPv6 = source.IPv6
+	target.LogLevel = source.LogLevel
+}
+
+func normalizeMixedPort(value string) (string, error) {
+	port, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || port < 1 || port > 65535 {
+		return "", fmt.Errorf("端口必须是 1 到 65535")
+	}
+	return strconv.Itoa(port), nil
 }
 
 func (m Model) activate() (tea.Model, tea.Cmd) {
@@ -1277,8 +1477,8 @@ func (m Model) activate() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) activateSetting() (tea.Model, tea.Cmd) {
-	switch m.settingCursor {
-	case 0:
+	switch m.selectedSetting() {
+	case settingService:
 		action, message := "start", "Mihomo 已启动"
 		if m.status.Service.Active {
 			m.confirm = confirmStopService
@@ -1286,14 +1486,14 @@ func (m Model) activateSetting() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, m.beginOperation(message, func(ctx context.Context) error { return m.backend.Service(ctx, action) })
-	case 1:
+	case settingStartup:
 		action := "enable"
 		message := "开机启动已启用"
 		if m.status.Service.Enabled {
 			action, message = "disable", "开机启动已关闭"
 		}
 		return m, m.beginOperation(message, func(ctx context.Context) error { return m.backend.Service(ctx, action) })
-	case 2:
+	case settingMode:
 		next := domain.ModeRule
 		if m.status.Mode == domain.ModeRule {
 			next = domain.ModeGlobal
@@ -1301,16 +1501,62 @@ func (m Model) activateSetting() (tea.Model, tea.Cmd) {
 			next = domain.ModeDirect
 		}
 		return m, m.beginOperation("运行模式已切换", func(ctx context.Context) error { return m.backend.SetMode(ctx, next) })
-	case 3:
+	case settingTUN:
+		if !m.status.ConfigAvailable {
+			m.openPicker(pickerTUN, "")
+			return m, nil
+		}
 		return m, m.beginOperation("TUN 设置已更新", func(ctx context.Context) error { return m.backend.SetTUN(ctx, !m.status.TUN) })
-	case 4:
+	case settingSchedule:
 		enabled := true
 		if m.scheduleOK {
 			enabled = !m.schedule.Enabled
 		}
 		return m, m.beginOperation("定时更新设置已更新", func(ctx context.Context) error { return m.backend.SetSchedule(ctx, enabled) })
+	case settingMixedPort:
+		value := "7890"
+		if m.status.ConfigAvailable && m.status.MixedPort > 0 {
+			value = strconv.Itoa(m.status.MixedPort)
+		}
+		return m, m.focusInput(inputMixedPort, "1 - 65535", value)
+	case settingAllowLAN:
+		if !m.status.ConfigAvailable {
+			m.openPicker(pickerAllowLAN, "")
+			return m, nil
+		}
+		if m.status.AllowLAN {
+			return m, m.beginConfigOperation("局域网访问已关闭", string(settingAllowLAN), "off")
+		}
+		m.confirm = confirmEnableLAN
+		return m, nil
+	case settingIPv6:
+		if !m.status.ConfigAvailable {
+			m.openPicker(pickerIPv6, "")
+			return m, nil
+		}
+		value := "on"
+		if m.status.IPv6 {
+			value = "off"
+		}
+		return m, m.beginConfigOperation("IPv6 设置已更新", string(settingIPv6), value)
+	case settingLogLevel:
+		current := "info"
+		if m.status.ConfigAvailable {
+			if level, ok := normalizeLogLevel(m.status.LogLevel); ok {
+				current = level
+			}
+		}
+		m.openPicker(pickerLogLevel, current)
+		return m, nil
 	}
 	return m, nil
+}
+
+func (m Model) selectedSetting() settingID {
+	if len(settingOrder) == 0 {
+		return ""
+	}
+	return settingOrder[clamp(m.settingCursor, 0, len(settingOrder)-1)]
 }
 
 func (m Model) runConfirmed() (tea.Model, tea.Cmd) {
@@ -1332,6 +1578,8 @@ func (m Model) runConfirmed() (tea.Model, tea.Cmd) {
 		return m, m.beginOperation("全部连接已关闭", m.backend.CloseAllConnections)
 	case confirmStopService:
 		return m, m.beginOperation("Mihomo 已停止", func(ctx context.Context) error { return m.backend.Service(ctx, "stop") })
+	case confirmEnableLAN:
+		return m, m.beginConfigOperation("局域网访问已开启", string(settingAllowLAN), "on")
 	}
 	return m, nil
 }
@@ -1398,7 +1646,11 @@ func (m *Model) moveByPage(direction int) {
 		m.scrollLogs(-direction * m.logCapacity())
 		return
 	}
-	m.moveCursor(direction * m.listCapacity())
+	capacity := m.listCapacity()
+	if m.page == pageSettings {
+		capacity = m.settingsCapacity()
+	}
+	m.moveCursor(direction * capacity)
 }
 
 func (m *Model) moveCursorBoundary(end bool) {
@@ -1428,7 +1680,7 @@ func (m *Model) moveCursorBoundary(end bool) {
 	case pageSettings:
 		m.settingCursor = 0
 		if end {
-			m.settingCursor = 4
+			m.settingCursor = max(0, len(settingOrder)-1)
 		}
 	}
 	m.syncViewports()
@@ -1449,7 +1701,7 @@ func (m *Model) moveCursor(delta int) {
 	case pageConnections:
 		m.connectionCursor = clamp(m.connectionCursor+delta, 0, max(0, len(m.filteredConnections())-1))
 	case pageSettings:
-		m.settingCursor = clamp(m.settingCursor+delta, 0, 4)
+		m.settingCursor = clamp(m.settingCursor+delta, 0, max(0, len(settingOrder)-1))
 	}
 }
 
@@ -1474,7 +1726,7 @@ func (m *Model) clampCursors() {
 	}
 	m.profileCursor = clamp(m.profileCursor, 0, max(0, len(m.profiles)-1))
 	m.connectionCursor = clamp(m.connectionCursor, 0, max(0, len(m.filteredConnections())-1))
-	m.settingCursor = clamp(m.settingCursor, 0, 4)
+	m.settingCursor = clamp(m.settingCursor, 0, max(0, len(settingOrder)-1))
 	m.syncViewports()
 }
 
@@ -1646,7 +1898,7 @@ func (m *Model) syncViewports() {
 	m.proxyOffset = viewportOffset(nodeCount, m.proxyCursor, m.proxyOffset, m.listCapacity())
 	m.profileOffset = viewportOffset(len(m.profiles), m.profileCursor, m.profileOffset, m.listCapacity())
 	m.connectionOffset = viewportOffset(len(m.filteredConnections()), m.connectionCursor, m.connectionOffset, m.listCapacity())
-	m.settingOffset = viewportOffset(5, m.settingCursor, m.settingOffset, m.settingsCapacity())
+	m.settingOffset = viewportOffset(len(settingOrder), m.settingCursor, m.settingOffset, m.settingsCapacity())
 }
 
 func viewportOffset(total, cursor, offset, capacity int) int {
