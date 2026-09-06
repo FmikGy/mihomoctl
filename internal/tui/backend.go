@@ -12,6 +12,7 @@ type Backend interface {
 	Groups(context.Context) ([]domain.ProxyGroup, error)
 	Profiles(context.Context) ([]domain.Profile, error)
 	Connections(context.Context) ([]domain.Connection, error)
+	WatchTraffic(context.Context) (<-chan domain.Traffic, <-chan error)
 	WatchLogs(context.Context, string) (<-chan domain.LogEntry, <-chan error)
 
 	Service(context.Context, string) error

@@ -74,6 +74,12 @@ func (f *fakeBackend) Connections(context.Context) ([]domain.Connection, error) 
 	return f.connsValue, f.err
 }
 
+func (f *fakeBackend) WatchTraffic(context.Context) (<-chan domain.Traffic, <-chan error) {
+	traffic := make(chan domain.Traffic)
+	errs := make(chan error)
+	return traffic, errs
+}
+
 func (f *fakeBackend) WatchLogs(ctx context.Context, _ string) (<-chan domain.LogEntry, <-chan error) {
 	f.logContext = ctx
 	return f.logEntries, f.logErrors

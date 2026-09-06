@@ -34,8 +34,15 @@ const (
 )
 
 const (
-	profileInputMask    = '*'
-	trafficHistoryLimit = 120
+	profileInputMask       = '*'
+	trafficHistoryLimit    = 120
+	statusRefreshEvery     = 5 * time.Second
+	groupRefreshEvery      = 5 * time.Second
+	connectionRefreshEvery = 2 * time.Second
+	profileRefreshEvery    = 30 * time.Second
+	settingsRefreshEvery   = 30 * time.Second
+	toastLifetime          = 3 * time.Second
+	streamRetryMaximum     = 30 * time.Second
 )
 
 type confirmMode int
@@ -48,6 +55,54 @@ const (
 	confirmStopService
 )
 
+type confirmTarget struct {
+	label string
+	id    string
+	name  string
+}
+
+type proxyTestState int
+
+const (
+	proxyTestUnknown proxyTestState = iota
+	proxyTestSuccess
+	proxyTestTimeout
+	proxyTestFailed
+)
+
+type proxyTestResult struct {
+	state    proxyTestState
+	delay    uint16
+	testedAt time.Time
+}
+
+type requestState struct {
+	inFlight   bool
+	queued     bool
+	generation uint64
+	lastStart  time.Time
+	cancel     context.CancelFunc
+}
+
+type errorSource string
+
+const (
+	errorStatus      errorSource = "status"
+	errorGroups      errorSource = "groups"
+	errorProfiles    errorSource = "profiles"
+	errorConnections errorSource = "connections"
+	errorSchedule    errorSource = "schedule"
+	errorTraffic     errorSource = "traffic"
+	errorLogs        errorSource = "logs"
+	errorOperation   errorSource = "operation"
+	errorGroupTest   errorSource = "group-test"
+)
+
+type sourceError struct {
+	message  string
+	sequence uint64
+}
+
 type Model struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -57,21 +112,41 @@ type Model struct {
 	height int
 	page   page
 
-	status              domain.RuntimeStatus
-	trafficHistory      []trafficSample
-	statusSnapshotFloor time.Time
-	schedule            domain.ScheduleStatus
-	scheduleOK          bool
-	groups              []domain.ProxyGroup
-	profiles            []domain.Profile
-	connections         []domain.Connection
-	logs                []domain.LogEntry
-	pendingGroupDelays  map[string]map[string]uint16
-	groupSnapshotFloor  time.Time
-	logLevel            string
-	logPaused           bool
-	logCh               <-chan domain.LogEntry
-	logErrCh            <-chan error
+	status                  domain.RuntimeStatus
+	trafficHistory          []trafficSample
+	statusSnapshotFloor     time.Time
+	lastTrafficAt           time.Time
+	schedule                domain.ScheduleStatus
+	scheduleOK              bool
+	groups                  []domain.ProxyGroup
+	profiles                []domain.Profile
+	connections             []domain.Connection
+	logs                    []domain.LogEntry
+	proxyTestStates         map[string]map[string]proxyTestResult
+	logLevel                string
+	logPaused               bool
+	logOffset               int
+	logUnread               int
+	logCh                   <-chan domain.LogEntry
+	logErrCh                <-chan error
+	logCancel               context.CancelFunc
+	logConnecting           bool
+	logGeneration           uint64
+	logRetry                int
+	logReconnectPending     bool
+	trafficCh               <-chan domain.Traffic
+	trafficErrCh            <-chan error
+	trafficCancel           context.CancelFunc
+	trafficConnecting       bool
+	trafficGeneration       uint64
+	trafficRetry            int
+	trafficReconnectPending bool
+
+	statusRequest     requestState
+	groupRequest      requestState
+	profileRequest    requestState
+	connectionRequest requestState
+	scheduleRequest   requestState
 
 	groupCursor      int
 	proxyCursor      int
@@ -84,19 +159,28 @@ type Model struct {
 	connectionOffset int
 	settingOffset    int
 
-	loading      bool
-	err          string
-	toast        string
-	toastWarning bool
-	help         bool
-	filter       string
-	input        textinput.Model
-	inMode       inputMode
-	confirm      confirmMode
+	// loading only tracks a user-triggered mutation or delay test. Background
+	// refreshes remain non-blocking and never change it.
+	loading            bool
+	err                string
+	errors             map[errorSource]sourceError
+	errorSequence      uint64
+	toast              string
+	toastWarning       bool
+	toastExpires       time.Time
+	help               bool
+	filter             string
+	input              textinput.Model
+	inMode             inputMode
+	confirm            confirmMode
+	confirmTarget      confirmTarget
+	mutationGeneration uint64
 }
 
 type tickMsg time.Time
+type bootstrapMsg struct{}
 type trafficSample struct {
+	at   time.Time
 	up   int64
 	down int64
 }
@@ -104,51 +188,91 @@ type statusMsg struct {
 	status      domain.RuntimeStatus
 	err         error
 	requestedAt time.Time
+	generation  uint64
 }
 type scheduleMsg struct {
-	status domain.ScheduleStatus
-	err    error
+	status     domain.ScheduleStatus
+	err        error
+	generation uint64
 }
 type groupsMsg struct {
 	groups      []domain.ProxyGroup
 	err         error
 	requestedAt time.Time
+	generation  uint64
 }
 type profilesMsg struct {
-	profiles []domain.Profile
-	err      error
+	profiles   []domain.Profile
+	err        error
+	generation uint64
 }
 type connectionsMsg struct {
 	connections []domain.Connection
 	err         error
+	generation  uint64
 }
 type operationMsg struct {
-	message string
-	err     error
+	message    string
+	err        error
+	generation uint64
 }
 type groupTestMsg struct {
 	group       string
 	delays      map[string]uint16
 	err         error
 	completedAt time.Time
+	generation  uint64
 }
 type logMsg struct {
-	entry domain.LogEntry
-	ok    bool
+	entry      domain.LogEntry
+	ok         bool
+	generation uint64
 }
-type logErrMsg struct{ err error }
+type logErrMsg struct {
+	err        error
+	ok         bool
+	generation uint64
+}
+type logChannelsMsg struct {
+	entries    <-chan domain.LogEntry
+	errs       <-chan error
+	generation uint64
+}
+type logReconnectMsg struct{ generation uint64 }
+type trafficMsg struct {
+	traffic    domain.Traffic
+	at         time.Time
+	ok         bool
+	generation uint64
+}
+type trafficErrMsg struct {
+	err        error
+	ok         bool
+	generation uint64
+}
+type trafficChannelsMsg struct {
+	traffic    <-chan domain.Traffic
+	errs       <-chan error
+	generation uint64
+}
+type trafficReconnectMsg struct{ generation uint64 }
 
 func New(ctx context.Context, backend Backend) Model {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	child, cancel := context.WithCancel(ctx)
 	input := textinput.New()
 	input.CharLimit = 4096
 	input.SetWidth(64)
 	return Model{
-		ctx:      child,
-		cancel:   cancel,
-		backend:  backend,
-		logLevel: "info",
-		input:    input,
+		ctx:             child,
+		cancel:          cancel,
+		backend:         backend,
+		logLevel:        "info",
+		input:           input,
+		errors:          make(map[errorSource]sourceError),
+		proxyTestStates: make(map[string]map[string]proxyTestResult),
 	}
 }
 
@@ -162,113 +286,414 @@ func Run(ctx context.Context, backend Backend) error {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.refreshStatus(), m.refreshPage(), tick())
+	return tea.Batch(func() tea.Msg { return bootstrapMsg{} }, tick())
 }
 
 func tick() tea.Cmd {
 	return tea.Tick(time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
-func (m Model) refreshStatus() tea.Cmd {
-	requestedAt := time.Now()
-	return func() tea.Msg {
-		status, err := m.backend.Status(m.ctx)
-		return statusMsg{status: status, err: err, requestedAt: requestedAt}
-	}
-}
-
-func (m Model) refreshPage() tea.Cmd {
-	switch m.page {
-	case pageProxies:
-		return m.refreshGroups()
-	case pageProfiles:
-		return func() tea.Msg {
-			profiles, err := m.backend.Profiles(m.ctx)
-			return profilesMsg{profiles: profiles, err: err}
-		}
-	case pageConnections:
-		return func() tea.Msg {
-			connections, err := m.backend.Connections(m.ctx)
-			return connectionsMsg{connections: connections, err: err}
-		}
-	case pageLogs:
-		if m.logCh == nil {
-			return m.startLogs()
-		}
-	case pageSettings:
-		return m.refreshSchedule()
-	}
-	return nil
-}
-
-func (m Model) refreshGroups() tea.Cmd {
-	requestedAt := time.Now()
-	return func() tea.Msg {
-		groups, err := m.backend.Groups(m.ctx)
-		return groupsMsg{groups: groups, err: err, requestedAt: requestedAt}
-	}
-}
-
 type scheduleBackend interface {
 	ScheduleStatus(context.Context) (domain.ScheduleStatus, error)
 }
 
-func (m Model) refreshSchedule() tea.Cmd {
-	backend, ok := m.backend.(scheduleBackend)
+func requestDue(state requestState, now time.Time, interval time.Duration) bool {
+	return state.lastStart.IsZero() || !now.Before(state.lastStart.Add(interval))
+}
+
+func acceptResponse(state *requestState, generation uint64) bool {
+	// A zero generation is accepted for compatibility with synthetic messages
+	// used by in-package callers. Production requests always carry a generation.
+	if generation == 0 {
+		if state.cancel != nil {
+			state.cancel()
+		}
+		state.cancel = nil
+		state.inFlight = false
+		return true
+	}
+	if !state.inFlight || state.generation != generation {
+		return false
+	}
+	if state.cancel != nil {
+		state.cancel()
+	}
+	state.cancel = nil
+	state.inFlight = false
+	return true
+}
+
+func queueOrStart(state *requestState, now time.Time, interval time.Duration, force bool) (uint64, bool) {
+	if state.inFlight {
+		if force {
+			state.queued = true
+		}
+		return 0, false
+	}
+	if !force && !requestDue(*state, now, interval) {
+		return 0, false
+	}
+	state.inFlight = true
+	state.queued = false
+	state.generation++
+	state.lastStart = now
+	return state.generation, true
+}
+
+func takeQueued(state *requestState) bool {
+	queued := state.queued
+	state.queued = false
+	return queued
+}
+
+func cancelRequest(state *requestState) {
+	if state.cancel != nil {
+		state.cancel()
+	}
+	state.cancel = nil
+	state.inFlight = false
+	state.queued = false
+	state.generation++
+}
+
+func (m *Model) beginStatusRefresh(now time.Time, force bool) tea.Cmd {
+	generation, ok := queueOrStart(&m.statusRequest, now, statusRefreshEvery, force)
 	if !ok {
 		return nil
 	}
+	requestCtx, cancel := context.WithCancel(m.ctx)
+	m.statusRequest.cancel = cancel
+	requestedAt := now
 	return func() tea.Msg {
-		status, err := backend.ScheduleStatus(m.ctx)
-		return scheduleMsg{status: status, err: err}
+		status, err := m.backend.Status(requestCtx)
+		return statusMsg{status: status, err: err, requestedAt: requestedAt, generation: generation}
 	}
 }
 
-func (m Model) startLogs() tea.Cmd {
+func (m *Model) beginGroupsRefresh(now time.Time, force bool) tea.Cmd {
+	generation, ok := queueOrStart(&m.groupRequest, now, groupRefreshEvery, force)
+	if !ok {
+		return nil
+	}
+	requestCtx, cancel := context.WithCancel(m.ctx)
+	m.groupRequest.cancel = cancel
+	requestedAt := now
 	return func() tea.Msg {
-		entries, errs := m.backend.WatchLogs(m.ctx, m.logLevel)
-		return logChannelsMsg{entries: entries, errs: errs}
+		groups, err := m.backend.Groups(requestCtx)
+		return groupsMsg{groups: groups, err: err, requestedAt: requestedAt, generation: generation}
 	}
 }
 
-type logChannelsMsg struct {
-	entries <-chan domain.LogEntry
-	errs    <-chan error
+func (m *Model) beginProfilesRefresh(now time.Time, force bool) tea.Cmd {
+	generation, ok := queueOrStart(&m.profileRequest, now, profileRefreshEvery, force)
+	if !ok {
+		return nil
+	}
+	requestCtx, cancel := context.WithCancel(m.ctx)
+	m.profileRequest.cancel = cancel
+	return func() tea.Msg {
+		profiles, err := m.backend.Profiles(requestCtx)
+		return profilesMsg{profiles: profiles, err: err, generation: generation}
+	}
 }
 
-func waitLog(entries <-chan domain.LogEntry) tea.Cmd {
+func (m *Model) beginConnectionsRefresh(now time.Time, force bool) tea.Cmd {
+	generation, ok := queueOrStart(&m.connectionRequest, now, connectionRefreshEvery, force)
+	if !ok {
+		return nil
+	}
+	requestCtx, cancel := context.WithCancel(m.ctx)
+	m.connectionRequest.cancel = cancel
+	return func() tea.Msg {
+		connections, err := m.backend.Connections(requestCtx)
+		return connectionsMsg{connections: connections, err: err, generation: generation}
+	}
+}
+
+func (m *Model) beginScheduleRefresh(now time.Time, force bool) tea.Cmd {
+	backend, ok := m.backend.(scheduleBackend)
+	if !ok {
+		m.scheduleRequest.lastStart = now
+		return nil
+	}
+	generation, ok := queueOrStart(&m.scheduleRequest, now, settingsRefreshEvery, force)
+	if !ok {
+		return nil
+	}
+	requestCtx, cancel := context.WithCancel(m.ctx)
+	m.scheduleRequest.cancel = cancel
+	return func() tea.Msg {
+		status, err := backend.ScheduleStatus(requestCtx)
+		return scheduleMsg{status: status, err: err, generation: generation}
+	}
+}
+
+func (m *Model) beginPageRefresh(target page, now time.Time, force bool) tea.Cmd {
+	switch target {
+	case pageProxies:
+		return m.beginGroupsRefresh(now, force)
+	case pageProfiles:
+		return m.beginProfilesRefresh(now, force)
+	case pageConnections:
+		return m.beginConnectionsRefresh(now, force)
+	case pageLogs:
+		return m.beginLogs(force)
+	case pageSettings:
+		return m.beginScheduleRefresh(now, force)
+	default:
+		return nil
+	}
+}
+
+func (m *Model) cancelPageWork(target page) {
+	switch target {
+	case pageProxies:
+		cancelRequest(&m.groupRequest)
+	case pageProfiles:
+		cancelRequest(&m.profileRequest)
+	case pageConnections:
+		cancelRequest(&m.connectionRequest)
+	case pageLogs:
+		m.stopLogs()
+	case pageSettings:
+		cancelRequest(&m.scheduleRequest)
+	}
+}
+
+func waitLog(entries <-chan domain.LogEntry, generation uint64) tea.Cmd {
 	return func() tea.Msg {
 		entry, ok := <-entries
-		return logMsg{entry: entry, ok: ok}
+		return logMsg{entry: entry, ok: ok, generation: generation}
 	}
 }
 
-func waitLogError(errs <-chan error) tea.Cmd {
+func waitLogError(errs <-chan error, generation uint64) tea.Cmd {
 	return func() tea.Msg {
 		err, ok := <-errs
-		if !ok {
-			return logErrMsg{}
-		}
-		return logErrMsg{err: err}
+		return logErrMsg{err: err, ok: ok, generation: generation}
 	}
 }
 
-func (m Model) operation(message string, fn func(context.Context) error) tea.Cmd {
+func waitTraffic(traffic <-chan domain.Traffic, generation uint64) tea.Cmd {
+	return func() tea.Msg {
+		sample, ok := <-traffic
+		return trafficMsg{traffic: sample, at: time.Now(), ok: ok, generation: generation}
+	}
+}
+
+func waitTrafficError(errs <-chan error, generation uint64) tea.Cmd {
+	return func() tea.Msg {
+		err, ok := <-errs
+		return trafficErrMsg{err: err, ok: ok, generation: generation}
+	}
+}
+
+func streamBackoff(attempt int) time.Duration {
+	delay := time.Second
+	for range min(max(attempt, 0), 5) {
+		delay *= 2
+	}
+	return minDuration(delay, streamRetryMaximum)
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (m *Model) beginLogs(force bool) tea.Cmd {
+	if force {
+		m.stopLogs()
+	}
+	if m.page != pageLogs || m.logConnecting || m.logCh != nil || m.logErrCh != nil || m.logReconnectPending || m.ctx.Err() != nil {
+		return nil
+	}
+	m.logGeneration++
+	generation := m.logGeneration
+	streamCtx, cancel := context.WithCancel(m.ctx)
+	m.logCancel = cancel
+	m.logConnecting = true
+	return func() tea.Msg {
+		entries, errs := m.backend.WatchLogs(streamCtx, m.logLevel)
+		return logChannelsMsg{entries: entries, errs: errs, generation: generation}
+	}
+}
+
+func (m *Model) beginTraffic(force bool) tea.Cmd {
+	if force {
+		m.stopTraffic()
+	}
+	if m.trafficConnecting || m.trafficCh != nil || m.trafficErrCh != nil || m.trafficReconnectPending || m.ctx.Err() != nil {
+		return nil
+	}
+	m.trafficGeneration++
+	generation := m.trafficGeneration
+	streamCtx, cancel := context.WithCancel(m.ctx)
+	m.trafficCancel = cancel
+	m.trafficConnecting = true
+	return func() tea.Msg {
+		traffic, errs := m.backend.WatchTraffic(streamCtx)
+		return trafficChannelsMsg{traffic: traffic, errs: errs, generation: generation}
+	}
+}
+
+func (m *Model) scheduleLogReconnect() tea.Cmd {
+	if m.page != pageLogs || m.logReconnectPending || m.ctx.Err() != nil {
+		return nil
+	}
+	m.logReconnectPending = true
+	generation := m.logGeneration
+	delay := streamBackoff(m.logRetry)
+	m.logRetry++
+	return tea.Tick(delay, func(time.Time) tea.Msg { return logReconnectMsg{generation: generation} })
+}
+
+func (m *Model) scheduleTrafficReconnect() tea.Cmd {
+	if m.trafficReconnectPending || m.ctx.Err() != nil {
+		return nil
+	}
+	m.trafficReconnectPending = true
+	generation := m.trafficGeneration
+	delay := streamBackoff(m.trafficRetry)
+	m.trafficRetry++
+	return tea.Tick(delay, func(time.Time) tea.Msg { return trafficReconnectMsg{generation: generation} })
+}
+
+func (m *Model) disconnectLogs(generation uint64, err error) tea.Cmd {
+	if generation != m.logGeneration {
+		return nil
+	}
+	if m.logCancel != nil {
+		m.logCancel()
+	}
+	m.logCancel = nil
+	m.logCh, m.logErrCh = nil, nil
+	m.logConnecting = false
+	m.logGeneration++
+	if err != nil && m.ctx.Err() == nil {
+		m.setSourceError(errorLogs, err)
+	}
+	return m.scheduleLogReconnect()
+}
+
+func (m *Model) disconnectTraffic(generation uint64, err error) tea.Cmd {
+	if generation != m.trafficGeneration {
+		return nil
+	}
+	if m.trafficCancel != nil {
+		m.trafficCancel()
+	}
+	m.trafficCancel = nil
+	m.trafficCh, m.trafficErrCh = nil, nil
+	m.trafficConnecting = false
+	m.trafficGeneration++
+	if err != nil && m.ctx.Err() == nil && m.status.Service.Active {
+		m.setSourceError(errorTraffic, err)
+	}
+	return m.scheduleTrafficReconnect()
+}
+
+func (m *Model) stopLogs() {
+	if m.logCancel != nil {
+		m.logCancel()
+	}
+	m.logCancel = nil
+	m.logCh, m.logErrCh = nil, nil
+	m.logConnecting = false
+	m.logReconnectPending = false
+	m.logRetry = 0
+	m.logGeneration++
+}
+
+func (m *Model) stopTraffic() {
+	if m.trafficCancel != nil {
+		m.trafficCancel()
+	}
+	m.trafficCancel = nil
+	m.trafficCh, m.trafficErrCh = nil, nil
+	m.trafficConnecting = false
+	m.trafficReconnectPending = false
+	m.trafficRetry = 0
+	m.trafficGeneration++
+}
+
+func (m *Model) beginOperation(message string, fn func(context.Context) error) tea.Cmd {
+	if m.loading {
+		return nil
+	}
+	m.loading = true
+	m.mutationGeneration++
+	m.clearSourceError(errorOperation)
+	generation := m.mutationGeneration
 	return func() tea.Msg {
 		err := fn(m.ctx)
-		return operationMsg{message: message, err: err}
+		return operationMsg{message: message, err: err, generation: generation}
 	}
 }
 
-func (m Model) testGroup(group string) tea.Cmd {
+func (m *Model) beginGroupTest(group string) tea.Cmd {
+	if m.loading {
+		return nil
+	}
+	m.loading = true
+	m.mutationGeneration++
+	m.clearSourceError(errorGroupTest)
+	generation := m.mutationGeneration
 	return func() tea.Msg {
 		delays, err := m.backend.TestGroup(m.ctx, group)
-		return groupTestMsg{group: group, delays: delays, err: err, completedAt: time.Now()}
+		return groupTestMsg{group: group, delays: delays, err: err, completedAt: time.Now(), generation: generation}
 	}
+}
+
+func (m *Model) setSourceError(source errorSource, err error) {
+	if err == nil {
+		m.clearSourceError(source)
+		return
+	}
+	if m.errors == nil {
+		m.errors = make(map[errorSource]sourceError)
+	}
+	m.errorSequence++
+	m.errors[source] = sourceError{message: err.Error(), sequence: m.errorSequence}
+	m.syncVisibleError()
+}
+
+func (m *Model) clearSourceError(source errorSource) {
+	delete(m.errors, source)
+	m.syncVisibleError()
+}
+
+func (m *Model) syncVisibleError() {
+	m.err = ""
+	var latest uint64
+	for _, item := range m.errors {
+		if item.sequence >= latest {
+			latest = item.sequence
+			m.err = item.message
+		}
+	}
+}
+
+func (m *Model) showToast(message string, warning bool, now time.Time) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	m.toast = message
+	m.toastWarning = warning
+	m.toastExpires = now.Add(toastLifetime)
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case bootstrapMsg:
+		now := time.Now()
+		return m, tea.Batch(
+			m.beginStatusRefresh(now, true),
+			m.beginPageRefresh(m.page, now, true),
+			m.beginTraffic(false),
+		)
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.input.SetWidth(max(20, min(72, m.width-10)))
@@ -279,128 +704,286 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m.updateKey(msg)
 	case tickMsg:
-		if m.toast != "" {
+		now := time.Time(msg)
+		if m.toast != "" && !m.toastExpires.IsZero() && !now.Before(m.toastExpires) {
 			m.toast = ""
 			m.toastWarning = false
+			m.toastExpires = time.Time{}
 		}
-		return m, tea.Batch(m.refreshStatus(), m.refreshPage(), tick())
+		return m, tea.Batch(
+			m.beginStatusRefresh(now, false),
+			m.beginPageRefresh(m.page, now, false),
+			tick(),
+		)
 	case statusMsg:
-		if !msg.requestedAt.IsZero() && msg.requestedAt.Before(m.statusSnapshotFloor) {
+		if !acceptResponse(&m.statusRequest, msg.generation) {
 			return m, nil
+		}
+		queued := takeQueued(&m.statusRequest)
+		next := func() tea.Cmd {
+			if queued {
+				return m.beginStatusRefresh(time.Now(), true)
+			}
+			return nil
+		}
+		if !msg.requestedAt.IsZero() && msg.requestedAt.Before(m.statusSnapshotFloor) {
+			return m, next()
 		}
 		if msg.requestedAt.After(m.statusSnapshotFloor) {
 			m.statusSnapshotFloor = msg.requestedAt
 		}
 		if msg.err != nil {
-			m.err = msg.err.Error()
+			m.setSourceError(errorStatus, msg.err)
 		} else {
+			currentTraffic := m.status.Traffic
 			m.status = msg.status
-			if msg.status.Service.Active {
-				m.recordTraffic(msg.status.Traffic)
+			if !msg.requestedAt.IsZero() && msg.requestedAt.Before(m.lastTrafficAt) {
+				m.status.Traffic.Up = currentTraffic.Up
+				m.status.Traffic.Down = currentTraffic.Down
+			} else if msg.status.Service.Active && !m.trafficStreamActive() {
+				m.recordTrafficAt(msg.status.Traffic, msg.requestedAt)
 			} else {
-				m.trafficHistory = nil
+				m.status.Traffic.Up = currentTraffic.Up
+				m.status.Traffic.Down = currentTraffic.Down
 			}
-			m.err = ""
+			if !msg.status.Service.Active {
+				m.trafficHistory = nil
+				m.lastTrafficAt = time.Time{}
+				m.status.Traffic = msg.status.Traffic
+				m.status.Traffic.Up, m.status.Traffic.Down = 0, 0
+				m.clearSourceError(errorTraffic)
+				if m.trafficStreamPresent() {
+					m.stopTraffic()
+				}
+			}
+			m.clearSourceError(errorStatus)
 		}
+		var trafficCmd tea.Cmd
+		if msg.generation != 0 && msg.err == nil && msg.status.Service.Active {
+			trafficCmd = m.beginTraffic(false)
+		}
+		return m, tea.Batch(next(), trafficCmd)
 	case scheduleMsg:
+		if !acceptResponse(&m.scheduleRequest, msg.generation) {
+			return m, nil
+		}
+		queued := takeQueued(&m.scheduleRequest)
 		if msg.err != nil {
 			m.scheduleOK = false
-			m.err = msg.err.Error()
+			m.setSourceError(errorSchedule, msg.err)
 		} else {
 			m.schedule = msg.status
 			m.scheduleOK = true
-			m.err = ""
+			m.clearSourceError(errorSchedule)
 		}
+		if queued && m.page == pageSettings {
+			return m, m.beginScheduleRefresh(time.Now(), true)
+		}
+		return m, nil
 	case groupsMsg:
-		if !msg.requestedAt.IsZero() && msg.requestedAt.Before(m.groupSnapshotFloor) {
+		if !acceptResponse(&m.groupRequest, msg.generation) {
+			return m, nil
+		}
+		queued := takeQueued(&m.groupRequest)
+		if msg.err != nil {
+			m.setSourceError(errorGroups, msg.err)
+		} else {
+			groupName, proxyName := m.selectedProxyKeys()
+			m.groups = msg.groups
+			m.restoreProxySelection(groupName, proxyName)
+			m.pruneProxyTestStates()
+			m.clearSourceError(errorGroups)
+		}
+		if queued && m.page == pageProxies {
+			return m, m.beginGroupsRefresh(time.Now(), true)
+		}
+		return m, nil
+	case profilesMsg:
+		if !acceptResponse(&m.profileRequest, msg.generation) {
+			return m, nil
+		}
+		queued := takeQueued(&m.profileRequest)
+		if msg.err != nil {
+			m.setSourceError(errorProfiles, msg.err)
+		} else {
+			selected := m.selectedProfileKey()
+			m.profiles = msg.profiles
+			m.restoreProfileSelection(selected)
+			m.clearSourceError(errorProfiles)
+		}
+		if queued && m.page == pageProfiles {
+			return m, m.beginProfilesRefresh(time.Now(), true)
+		}
+		return m, nil
+	case connectionsMsg:
+		if !acceptResponse(&m.connectionRequest, msg.generation) {
+			return m, nil
+		}
+		queued := takeQueued(&m.connectionRequest)
+		if msg.err != nil {
+			m.setSourceError(errorConnections, msg.err)
+		} else {
+			selected := m.selectedConnectionKey()
+			m.connections = msg.connections
+			m.restoreConnectionSelection(selected)
+			m.clearSourceError(errorConnections)
+		}
+		if queued && m.page == pageConnections {
+			return m, m.beginConnectionsRefresh(time.Now(), true)
+		}
+		return m, nil
+	case operationMsg:
+		if msg.generation != 0 && msg.generation != m.mutationGeneration {
 			return m, nil
 		}
 		m.loading = false
-		if msg.err != nil {
-			m.err = msg.err.Error()
-		} else {
-			m.groups = msg.groups
-			m.applyGroupDelayOverlays()
-			m.clampCursors()
-		}
-	case profilesMsg:
-		m.loading = false
-		if msg.err != nil {
-			m.err = msg.err.Error()
-		} else {
-			m.profiles = msg.profiles
-			m.clampCursors()
-		}
-	case connectionsMsg:
-		m.loading = false
-		if msg.err != nil {
-			m.err = msg.err.Error()
-		} else {
-			m.connections = msg.connections
-			m.clampCursors()
-		}
-	case operationMsg:
-		m.loading = false
 		m.confirm = confirmNone
+		m.confirmTarget = confirmTarget{}
 		if msg.err != nil {
-			m.err = msg.err.Error()
+			m.setSourceError(errorOperation, msg.err)
 		} else {
-			m.err = ""
-			m.toast = msg.message
-			m.toastWarning = false
+			m.clearSourceError(errorOperation)
+			m.showToast(msg.message, false, time.Now())
 		}
-		return m, tea.Batch(m.refreshStatus(), m.refreshPage())
+		now := time.Now()
+		return m, tea.Batch(m.beginStatusRefresh(now, true), m.beginPageRefresh(m.page, now, true))
 	case groupTestMsg:
+		if msg.generation != 0 && msg.generation != m.mutationGeneration {
+			return m, nil
+		}
 		m.loading = false
-		m.toast = ""
-		m.toastWarning = false
 		completedAt := msg.completedAt
 		if completedAt.IsZero() {
 			completedAt = time.Now()
 		}
-		if completedAt.After(m.groupSnapshotFloor) {
-			m.groupSnapshotFloor = completedAt
-		}
 		if msg.err != nil {
-			m.err = msg.err.Error()
-			return m, m.refreshGroups()
-		}
-
-		m.err = ""
-		stats := m.applyGroupDelays(msg.group, msg.delays)
-		if stats.succeeded == 0 {
-			if stats.total == 0 {
-				m.toast = "测速完成，未获得可用延迟"
-			} else {
-				m.toast = stats.notice()
+			m.setSourceError(errorGroupTest, msg.err)
+			if m.page == pageProxies {
+				return m, m.beginGroupsRefresh(time.Now(), true)
 			}
-			m.toastWarning = true
-			return m, m.refreshGroups()
+			return m, nil
 		}
-
-		m.toast = stats.notice()
-		m.toastWarning = stats.failed() > 0
-		m.rememberGroupDelays(msg.group, msg.delays)
-		return m, m.refreshGroups()
+		m.clearSourceError(errorGroupTest)
+		stats := m.applyGroupDelaysAt(msg.group, msg.delays, completedAt)
+		message := stats.notice()
+		if stats.total == 0 {
+			message = "测速完成，未找到策略组"
+		}
+		m.showToast(message, stats.timedOut > 0 || stats.total == 0, completedAt)
+		if m.page == pageProxies {
+			return m, m.beginGroupsRefresh(time.Now(), true)
+		}
+		return m, nil
 	case logChannelsMsg:
+		if msg.generation != m.logGeneration {
+			return m, nil
+		}
+		m.logConnecting = false
 		m.logCh, m.logErrCh = msg.entries, msg.errs
-		return m, tea.Batch(waitLog(m.logCh), waitLogError(m.logErrCh))
+		if m.logCh == nil && m.logErrCh == nil {
+			return m, m.disconnectLogs(msg.generation, fmt.Errorf("日志流未返回数据通道"))
+		}
+		var entryCmd, errorCmd tea.Cmd
+		if m.logCh != nil {
+			entryCmd = waitLog(m.logCh, msg.generation)
+		}
+		if m.logErrCh != nil {
+			errorCmd = waitLogError(m.logErrCh, msg.generation)
+		}
+		return m, tea.Batch(entryCmd, errorCmd)
 	case logMsg:
+		if msg.generation != m.logGeneration {
+			return m, nil
+		}
 		if msg.ok {
-			if !m.logPaused {
-				m.logs = append(m.logs, msg.entry)
-				if len(m.logs) > 1000 {
-					m.logs = append([]domain.LogEntry(nil), m.logs[len(m.logs)-1000:]...)
-				}
+			m.appendLog(msg.entry)
+			m.logRetry = 0
+			m.clearSourceError(errorLogs)
+			if m.logCh != nil {
+				return m, waitLog(m.logCh, msg.generation)
 			}
-			return m, waitLog(m.logCh)
+			return m, nil
 		}
 		m.logCh = nil
+		if m.logErrCh == nil {
+			return m, m.disconnectLogs(msg.generation, nil)
+		}
+		return m, nil
 	case logErrMsg:
-		if msg.err != nil && m.ctx.Err() == nil {
-			m.err = msg.err.Error()
+		if msg.generation != m.logGeneration {
+			return m, nil
+		}
+		if msg.err != nil {
+			return m, m.disconnectLogs(msg.generation, msg.err)
 		}
 		m.logErrCh = nil
+		if m.logCh == nil {
+			return m, m.disconnectLogs(msg.generation, nil)
+		}
+		return m, nil
+	case logReconnectMsg:
+		if msg.generation != m.logGeneration || !m.logReconnectPending || m.page != pageLogs {
+			return m, nil
+		}
+		m.logReconnectPending = false
+		return m, m.beginLogs(false)
+	case trafficChannelsMsg:
+		if msg.generation != m.trafficGeneration {
+			return m, nil
+		}
+		m.trafficConnecting = false
+		m.trafficCh, m.trafficErrCh = msg.traffic, msg.errs
+		if m.trafficCh == nil && m.trafficErrCh == nil {
+			return m, m.disconnectTraffic(msg.generation, fmt.Errorf("流量流未返回数据通道"))
+		}
+		var trafficCmd, errorCmd tea.Cmd
+		if m.trafficCh != nil {
+			trafficCmd = waitTraffic(m.trafficCh, msg.generation)
+		}
+		if m.trafficErrCh != nil {
+			errorCmd = waitTrafficError(m.trafficErrCh, msg.generation)
+		}
+		return m, tea.Batch(trafficCmd, errorCmd)
+	case trafficMsg:
+		if msg.generation != m.trafficGeneration {
+			return m, nil
+		}
+		if msg.ok {
+			m.status.Traffic.Up = msg.traffic.Up
+			m.status.Traffic.Down = msg.traffic.Down
+			m.status.Traffic.UpTotal = max64(m.status.Traffic.UpTotal, msg.traffic.UpTotal)
+			m.status.Traffic.DownTotal = max64(m.status.Traffic.DownTotal, msg.traffic.DownTotal)
+			m.recordTrafficAt(msg.traffic, msg.at)
+			m.trafficRetry = 0
+			m.clearSourceError(errorTraffic)
+			if m.trafficCh != nil {
+				return m, waitTraffic(m.trafficCh, msg.generation)
+			}
+			return m, nil
+		}
+		m.trafficCh = nil
+		if m.trafficErrCh == nil {
+			return m, m.disconnectTraffic(msg.generation, nil)
+		}
+		return m, nil
+	case trafficErrMsg:
+		if msg.generation != m.trafficGeneration {
+			return m, nil
+		}
+		if msg.err != nil {
+			return m, m.disconnectTraffic(msg.generation, msg.err)
+		}
+		m.trafficErrCh = nil
+		if m.trafficCh == nil {
+			return m, m.disconnectTraffic(msg.generation, nil)
+		}
+		return m, nil
+	case trafficReconnectMsg:
+		if msg.generation != m.trafficGeneration || !m.trafficReconnectPending {
+			return m, nil
+		}
+		m.trafficReconnectPending = false
+		return m, m.beginTraffic(false)
 	default:
 		if m.inMode != inputNone {
 			return m.updateInput(msg)
@@ -409,16 +992,36 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *Model) recordTraffic(traffic domain.Traffic) {
+func (m *Model) recordTrafficAt(traffic domain.Traffic, at time.Time) {
+	if at.IsZero() {
+		at = time.Now()
+	}
+	if count := len(m.trafficHistory); count > 0 && !at.After(m.trafficHistory[count-1].at) {
+		if at.Equal(m.trafficHistory[count-1].at) {
+			m.trafficHistory[count-1].up = nonNegativeTraffic(traffic.Up)
+			m.trafficHistory[count-1].down = nonNegativeTraffic(traffic.Down)
+		}
+		return
+	}
 	m.trafficHistory = append(m.trafficHistory, trafficSample{
+		at:   at,
 		up:   nonNegativeTraffic(traffic.Up),
 		down: nonNegativeTraffic(traffic.Down),
 	})
+	m.lastTrafficAt = at
 	if len(m.trafficHistory) <= trafficHistoryLimit {
 		return
 	}
 	copy(m.trafficHistory, m.trafficHistory[len(m.trafficHistory)-trafficHistoryLimit:])
 	m.trafficHistory = m.trafficHistory[:trafficHistoryLimit]
+}
+
+func (m Model) trafficStreamActive() bool {
+	return m.trafficConnecting || m.trafficCh != nil
+}
+
+func (m Model) trafficStreamPresent() bool {
+	return m.trafficConnecting || m.trafficCh != nil || m.trafficErrCh != nil || m.trafficReconnectPending || m.trafficCancel != nil
 }
 
 func nonNegativeTraffic(value int64) int64 {
@@ -436,6 +1039,7 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m.runConfirmed()
 		case "n", "esc", "q":
 			m.confirm = confirmNone
+			m.confirmTarget = confirmTarget{}
 		}
 		return m, nil
 	}
@@ -455,18 +1059,30 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "tab", "right", "l":
 		m.applyFilter("")
-		m.page = (m.page + 1) % page(len(pageNames))
-		m.loading = true
-		return m, m.refreshPage()
+		return m.switchPage((m.page + 1) % page(len(pageNames)))
 	case "shift+tab", "left", "h":
 		m.applyFilter("")
-		m.page = (m.page + page(len(pageNames)) - 1) % page(len(pageNames))
-		m.loading = true
-		return m, m.refreshPage()
+		return m.switchPage((m.page + page(len(pageNames)) - 1) % page(len(pageNames)))
 	case "up", "k":
-		m.moveCursor(-1)
+		if m.page == pageLogs {
+			m.scrollLogs(1)
+		} else {
+			m.moveCursor(-1)
+		}
 	case "down", "j":
-		m.moveCursor(1)
+		if m.page == pageLogs {
+			m.scrollLogs(-1)
+		} else {
+			m.moveCursor(1)
+		}
+	case "home":
+		m.moveToBoundary(false)
+	case "end":
+		m.moveToBoundary(true)
+	case "pgup":
+		m.moveByPage(-1)
+	case "pgdown":
+		m.moveByPage(1)
 	case "[":
 		if m.page == pageProxies {
 			m.moveGroup(-1)
@@ -476,8 +1092,8 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.moveGroup(1)
 		}
 	case "r":
-		m.loading = true
-		return m, tea.Batch(m.refreshStatus(), m.refreshPage())
+		now := time.Now()
+		return m, tea.Batch(m.beginStatusRefresh(now, true), m.beginPageRefresh(m.page, now, true))
 	case "/":
 		if m.page == pageProxies || m.page == pageConnections || m.page == pageLogs {
 			return m, m.focusInput(inputFilter, "筛选", m.filter)
@@ -488,8 +1104,7 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		groups := m.filteredGroups()
 		if m.page == pageProxies && len(groups) > 0 {
 			group := groups[clamp(m.groupCursor, 0, len(groups)-1)].Name
-			m.loading = true
-			return m, m.testGroup(group)
+			return m, m.beginGroupTest(group)
 		}
 	case "a":
 		if m.page == pageProfiles {
@@ -497,33 +1112,58 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	case "u":
 		if m.page == pageProfiles && len(m.profiles) > 0 {
-			name := m.profiles[m.profileCursor].Name
-			m.loading = true
-			return m, m.operation("配置已更新", func(ctx context.Context) error {
+			name := m.profiles[clamp(m.profileCursor, 0, len(m.profiles)-1)].Name
+			return m, m.beginOperation("配置已更新", func(ctx context.Context) error {
 				return m.backend.UpdateProfile(ctx, name)
 			})
 		}
 	case "d":
 		switch m.page {
 		case pageProfiles:
-			if len(m.profiles) > 0 && !m.profiles[m.profileCursor].Active {
+			if len(m.profiles) > 0 {
+				profile := m.profiles[clamp(m.profileCursor, 0, len(m.profiles)-1)]
+				if profile.Active {
+					break
+				}
 				m.confirm = confirmRemoveProfile
+				m.confirmTarget = confirmTarget{label: profile.Name, name: profile.Name, id: profile.ID}
 			}
 		case pageConnections:
-			if len(m.filteredConnections()) > 0 {
+			connections := m.filteredConnections()
+			if len(connections) > 0 {
+				connection := connections[clamp(m.connectionCursor, 0, len(connections)-1)]
 				m.confirm = confirmCloseConnection
+				m.confirmTarget = confirmTarget{label: connectionLabel(connection), id: connection.ID}
 			}
 		}
 	case "x":
 		if m.page == pageConnections && len(m.connections) > 0 {
 			m.confirm = confirmCloseAll
+			m.confirmTarget = confirmTarget{label: "全部活动连接"}
 		}
 	case "space":
 		if m.page == pageLogs {
-			m.logPaused = !m.logPaused
+			if m.logPaused {
+				m.logPaused = false
+				m.logOffset = 0
+				m.logUnread = 0
+			} else {
+				m.logPaused = true
+				m.logUnread = 0
+			}
 		}
 	}
 	return m, nil
+}
+
+func (m Model) switchPage(next page) (tea.Model, tea.Cmd) {
+	if next == m.page {
+		return m, nil
+	}
+	m.cancelPageWork(m.page)
+	m.page = next
+	m.syncViewports()
+	return m, m.beginPageRefresh(next, time.Now(), true)
 }
 
 func (m Model) updateInput(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -543,8 +1183,7 @@ func (m Model) updateInput(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if value == "" {
 				return m, nil
 			}
-			m.loading = true
-			return m, m.operation("配置已添加，请选中后按 Enter 激活", func(ctx context.Context) error {
+			return m, m.beginOperation("配置已添加，请选中后按 Enter 激活", func(ctx context.Context) error {
 				return m.backend.AddProfile(ctx, "", value, 24*time.Hour)
 			})
 		}
@@ -580,10 +1219,10 @@ func (m Model) activate() (tea.Model, tea.Cmd) {
 	case pageOverview:
 		if m.status.Service.Active {
 			m.confirm = confirmStopService
+			m.confirmTarget = confirmTarget{label: "Mihomo 服务"}
 			return m, nil
 		}
-		m.loading = true
-		return m, m.operation("Mihomo 已启动", func(ctx context.Context) error {
+		return m, m.beginOperation("Mihomo 已启动", func(ctx context.Context) error {
 			return m.backend.Service(ctx, "start")
 		})
 	case pageProxies:
@@ -597,24 +1236,26 @@ func (m Model) activate() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		node := nodes[min(m.proxyCursor, len(nodes)-1)].Name
-		m.loading = true
-		return m, m.operation("已切换到 "+node, func(ctx context.Context) error {
+		return m, m.beginOperation("已切换到 "+node, func(ctx context.Context) error {
 			return m.backend.SelectProxy(ctx, group.Name, node)
 		})
 	case pageProfiles:
 		if len(m.profiles) > 0 {
-			name := m.profiles[m.profileCursor].Name
-			if m.profiles[m.profileCursor].Active {
+			profile := m.profiles[clamp(m.profileCursor, 0, len(m.profiles)-1)]
+			name := profile.Name
+			if profile.Active {
 				return m, nil
 			}
-			m.loading = true
-			return m, m.operation("已启用 "+name, func(ctx context.Context) error {
+			return m, m.beginOperation("已启用 "+name, func(ctx context.Context) error {
 				return m.backend.UseProfile(ctx, name)
 			})
 		}
 	case pageConnections:
-		if len(m.filteredConnections()) > 0 {
+		connections := m.filteredConnections()
+		if len(connections) > 0 {
+			connection := connections[clamp(m.connectionCursor, 0, len(connections)-1)]
 			m.confirm = confirmCloseConnection
+			m.confirmTarget = confirmTarget{label: connectionLabel(connection), id: connection.ID}
 		}
 	case pageSettings:
 		return m.activateSetting()
@@ -623,23 +1264,22 @@ func (m Model) activate() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) activateSetting() (tea.Model, tea.Cmd) {
-	m.loading = true
 	switch m.settingCursor {
 	case 0:
 		action, message := "start", "Mihomo 已启动"
 		if m.status.Service.Active {
-			m.loading = false
 			m.confirm = confirmStopService
+			m.confirmTarget = confirmTarget{label: "Mihomo 服务"}
 			return m, nil
 		}
-		return m, m.operation(message, func(ctx context.Context) error { return m.backend.Service(ctx, action) })
+		return m, m.beginOperation(message, func(ctx context.Context) error { return m.backend.Service(ctx, action) })
 	case 1:
 		action := "enable"
 		message := "开机启动已启用"
 		if m.status.Service.Enabled {
 			action, message = "disable", "开机启动已关闭"
 		}
-		return m, m.operation(message, func(ctx context.Context) error { return m.backend.Service(ctx, action) })
+		return m, m.beginOperation(message, func(ctx context.Context) error { return m.backend.Service(ctx, action) })
 	case 2:
 		next := domain.ModeRule
 		if m.status.Mode == domain.ModeRule {
@@ -647,35 +1287,138 @@ func (m Model) activateSetting() (tea.Model, tea.Cmd) {
 		} else if m.status.Mode == domain.ModeGlobal {
 			next = domain.ModeDirect
 		}
-		return m, m.operation("运行模式已切换", func(ctx context.Context) error { return m.backend.SetMode(ctx, next) })
+		return m, m.beginOperation("运行模式已切换", func(ctx context.Context) error { return m.backend.SetMode(ctx, next) })
 	case 3:
-		return m, m.operation("TUN 设置已更新", func(ctx context.Context) error { return m.backend.SetTUN(ctx, !m.status.TUN) })
+		return m, m.beginOperation("TUN 设置已更新", func(ctx context.Context) error { return m.backend.SetTUN(ctx, !m.status.TUN) })
 	case 4:
 		enabled := true
 		if m.scheduleOK {
 			enabled = !m.schedule.Enabled
 		}
-		return m, m.operation("定时更新设置已更新", func(ctx context.Context) error { return m.backend.SetSchedule(ctx, enabled) })
+		return m, m.beginOperation("定时更新设置已更新", func(ctx context.Context) error { return m.backend.SetSchedule(ctx, enabled) })
 	}
 	return m, nil
 }
 
 func (m Model) runConfirmed() (tea.Model, tea.Cmd) {
-	m.loading = true
-	switch m.confirm {
+	mode, target := m.confirm, m.confirmTarget
+	m.confirm = confirmNone
+	m.confirmTarget = confirmTarget{}
+	switch mode {
 	case confirmRemoveProfile:
-		name := m.profiles[m.profileCursor].Name
-		return m, m.operation("配置已删除", func(ctx context.Context) error { return m.backend.RemoveProfile(ctx, name) })
+		if target.name == "" {
+			return m, nil
+		}
+		return m, m.beginOperation("配置已删除", func(ctx context.Context) error { return m.backend.RemoveProfile(ctx, target.name) })
 	case confirmCloseConnection:
-		connections := m.filteredConnections()
-		id := connections[min(m.connectionCursor, len(connections)-1)].ID
-		return m, m.operation("连接已关闭", func(ctx context.Context) error { return m.backend.CloseConnection(ctx, id) })
+		if target.id == "" {
+			return m, nil
+		}
+		return m, m.beginOperation("连接已关闭", func(ctx context.Context) error { return m.backend.CloseConnection(ctx, target.id) })
 	case confirmCloseAll:
-		return m, m.operation("全部连接已关闭", m.backend.CloseAllConnections)
+		return m, m.beginOperation("全部连接已关闭", m.backend.CloseAllConnections)
 	case confirmStopService:
-		return m, m.operation("Mihomo 已停止", func(ctx context.Context) error { return m.backend.Service(ctx, "stop") })
+		return m, m.beginOperation("Mihomo 已停止", func(ctx context.Context) error { return m.backend.Service(ctx, "stop") })
 	}
 	return m, nil
+}
+
+func connectionLabel(connection domain.Connection) string {
+	if connection.Host != "" {
+		return connection.Host
+	}
+	if connection.Destination != "" {
+		return connection.Destination
+	}
+	return connection.ID
+}
+
+func (m *Model) appendLog(entry domain.LogEntry) {
+	visible := m.logMatchesFilter(entry)
+	if m.logPaused {
+		m.logUnread++
+	}
+	if visible && (m.logPaused || m.logOffset > 0) {
+		m.logOffset++
+	}
+	m.logs = append(m.logs, entry)
+	if len(m.logs) > 1000 {
+		m.logs = append([]domain.LogEntry(nil), m.logs[len(m.logs)-1000:]...)
+	}
+	m.logOffset = clamp(m.logOffset, 0, max(0, len(m.filteredLogs())-m.logCapacity()))
+}
+
+func (m Model) logMatchesFilter(entry domain.LogEntry) bool {
+	if m.filter == "" {
+		return true
+	}
+	haystack := strings.ToLower(entry.Time + " " + entry.Level + " " + entry.Message)
+	return strings.Contains(haystack, strings.ToLower(m.filter))
+}
+
+func (m Model) logCapacity() int {
+	return max(1, max(8, m.height-5)-4)
+}
+
+func (m *Model) scrollLogs(delta int) {
+	maximum := max(0, len(m.filteredLogs())-m.logCapacity())
+	m.logOffset = clamp(m.logOffset+delta, 0, maximum)
+	if m.logOffset == 0 && !m.logPaused {
+		m.logUnread = 0
+	}
+}
+
+func (m *Model) moveToBoundary(end bool) {
+	if m.page == pageLogs {
+		if end {
+			m.logOffset, m.logUnread = 0, 0
+		} else {
+			m.logOffset = max(0, len(m.filteredLogs())-m.logCapacity())
+		}
+		return
+	}
+	m.moveCursorBoundary(end)
+}
+
+func (m *Model) moveByPage(direction int) {
+	if m.page == pageLogs {
+		m.scrollLogs(-direction * m.logCapacity())
+		return
+	}
+	m.moveCursor(direction * m.listCapacity())
+}
+
+func (m *Model) moveCursorBoundary(end bool) {
+	last := 0
+	switch m.page {
+	case pageProxies:
+		groups := m.filteredGroups()
+		if len(groups) > 0 {
+			last = max(0, len(filteredProxies(groups[clamp(m.groupCursor, 0, len(groups)-1)], m.filter))-1)
+		}
+		m.proxyCursor = 0
+		if end {
+			m.proxyCursor = last
+		}
+	case pageProfiles:
+		last = max(0, len(m.profiles)-1)
+		m.profileCursor = 0
+		if end {
+			m.profileCursor = last
+		}
+	case pageConnections:
+		last = max(0, len(m.filteredConnections())-1)
+		m.connectionCursor = 0
+		if end {
+			m.connectionCursor = last
+		}
+	case pageSettings:
+		m.settingCursor = 0
+		if end {
+			m.settingCursor = 4
+		}
+	}
+	m.syncViewports()
 }
 
 func (m *Model) moveCursor(delta int) {
@@ -722,6 +1465,100 @@ func (m *Model) clampCursors() {
 	m.syncViewports()
 }
 
+func (m Model) selectedProxyKeys() (string, string) {
+	groups := m.filteredGroups()
+	if len(groups) == 0 {
+		return "", ""
+	}
+	group := groups[clamp(m.groupCursor, 0, len(groups)-1)]
+	proxies := filteredProxies(group, m.filter)
+	if len(proxies) == 0 {
+		return group.Name, ""
+	}
+	return group.Name, proxies[clamp(m.proxyCursor, 0, len(proxies)-1)].Name
+}
+
+func (m *Model) restoreProxySelection(groupName, proxyName string) {
+	m.groupCursor, m.proxyCursor = 0, 0
+	groups := m.filteredGroups()
+	for groupIndex, group := range groups {
+		if group.Name != groupName {
+			continue
+		}
+		m.groupCursor = groupIndex
+		for proxyIndex, proxy := range filteredProxies(group, m.filter) {
+			if proxy.Name == proxyName {
+				m.proxyCursor = proxyIndex
+				break
+			}
+		}
+		break
+	}
+	m.clampCursors()
+}
+
+func profileKey(profile domain.Profile) string {
+	if profile.ID != "" {
+		return "id:" + profile.ID
+	}
+	return "name:" + profile.Name
+}
+
+func (m Model) selectedProfileKey() string {
+	if len(m.profiles) == 0 {
+		return ""
+	}
+	return profileKey(m.profiles[clamp(m.profileCursor, 0, len(m.profiles)-1)])
+}
+
+func (m *Model) restoreProfileSelection(selected string) {
+	if selected != "" {
+		for index, profile := range m.profiles {
+			if profileKey(profile) == selected {
+				m.profileCursor = index
+				m.clampCursors()
+				return
+			}
+		}
+	}
+	m.clampCursors()
+}
+
+func connectionKey(connection domain.Connection) string {
+	if connection.ID != "" {
+		return "id:" + connection.ID
+	}
+	return "fallback:" + strings.Join([]string{
+		connection.Host,
+		connection.Destination,
+		connection.Source,
+		connection.Process,
+		connection.Network,
+		connection.Start.UTC().Format(time.RFC3339Nano),
+	}, "\x00")
+}
+
+func (m Model) selectedConnectionKey() string {
+	connections := m.filteredConnections()
+	if len(connections) == 0 {
+		return ""
+	}
+	return connectionKey(connections[clamp(m.connectionCursor, 0, len(connections)-1)])
+}
+
+func (m *Model) restoreConnectionSelection(selected string) {
+	if selected != "" {
+		for index, connection := range m.filteredConnections() {
+			if connectionKey(connection) == selected {
+				m.connectionCursor = index
+				m.clampCursors()
+				return
+			}
+		}
+	}
+	m.clampCursors()
+}
+
 func (m *Model) applyFilter(value string) {
 	selectedGroup, selectedProxy := "", ""
 	selectedConnection := ""
@@ -738,11 +1575,15 @@ func (m *Model) applyFilter(value string) {
 	} else if m.page == pageConnections {
 		connections := m.filteredConnections()
 		if len(connections) > 0 {
-			selectedConnection = connections[clamp(m.connectionCursor, 0, len(connections)-1)].ID
+			selectedConnection = connectionKey(connections[clamp(m.connectionCursor, 0, len(connections)-1)])
 		}
 	}
 
 	m.filter = value
+	if m.page == pageLogs {
+		m.logOffset = 0
+		m.logUnread = 0
+	}
 	if m.page == pageProxies {
 		m.groupCursor, m.proxyCursor = 0, 0
 		groups := m.filteredGroups()
@@ -763,7 +1604,7 @@ func (m *Model) applyFilter(value string) {
 		m.connectionCursor = 0
 		if selectedConnection != "" {
 			for connectionIndex, connection := range m.filteredConnections() {
-				if connection.ID == selectedConnection {
+				if connectionKey(connection) == selectedConnection {
 					m.connectionCursor = connectionIndex
 					break
 				}
@@ -818,14 +1659,11 @@ func viewportBounds(total, cursor, offset, capacity int) (int, int) {
 type groupDelayStats struct {
 	total            int
 	succeeded        int
+	timedOut         int
 	leafSucceeded    int
 	groupSucceeded   int
 	builtinSucceeded int
 	unknownSucceeded int
-}
-
-func (s groupDelayStats) failed() int {
-	return max(0, s.total-s.succeeded)
 }
 
 func (s groupDelayStats) notice() string {
@@ -833,17 +1671,26 @@ func (s groupDelayStats) notice() string {
 	if s.unknownSucceeded > 0 {
 		kinds += fmt.Sprintf("/未知%d", s.unknownSucceeded)
 	}
-	return fmt.Sprintf("测速：成功%d（%s）失败%d", s.succeeded, kinds, s.failed())
+	return fmt.Sprintf("测速：成功%d（%s）超时%d", s.succeeded, kinds, s.timedOut)
 }
 
 func (m *Model) applyGroupDelays(group string, delays map[string]uint16) groupDelayStats {
+	return m.applyGroupDelaysAt(group, delays, time.Now())
+}
+
+func (m *Model) applyGroupDelaysAt(group string, delays map[string]uint16, testedAt time.Time) groupDelayStats {
 	for groupIndex := range m.groups {
 		if m.groups[groupIndex].Name != group {
 			continue
 		}
 		stats := groupDelayStats{total: len(m.groups[groupIndex].Proxies)}
+		results := make(map[string]proxyTestResult, stats.total)
 		for proxyIndex := range m.groups[groupIndex].Proxies {
-			if _, ok := groupMemberDelay(m.groups[groupIndex], proxyIndex, delays); ok {
+			delay, found := groupMemberDelay(m.groups[groupIndex], proxyIndex, delays)
+			key := groupMemberKey(m.groups[groupIndex], proxyIndex)
+			result := proxyTestResult{state: proxyTestTimeout, testedAt: testedAt}
+			if found && delay > 0 {
+				result.state, result.delay = proxyTestSuccess, delay
 				stats.succeeded++
 				switch proxyDelayKind(m.groups[groupIndex].Proxies[proxyIndex].Type) {
 				case "leaf":
@@ -855,22 +1702,15 @@ func (m *Model) applyGroupDelays(group string, delays map[string]uint16) groupDe
 				default:
 					stats.unknownSucceeded++
 				}
-			}
-		}
-		if stats.succeeded == 0 {
-			return stats
-		}
-		for proxyIndex := range m.groups[groupIndex].Proxies {
-			proxy := &m.groups[groupIndex].Proxies[proxyIndex]
-			delay, ok := groupMemberDelay(m.groups[groupIndex], proxyIndex, delays)
-			if ok {
-				proxy.Delay = delay
-				proxy.Alive = true
 			} else {
-				proxy.Delay = 0
-				proxy.Alive = false
+				stats.timedOut++
 			}
+			results[key] = result
 		}
+		if m.proxyTestStates == nil {
+			m.proxyTestStates = make(map[string]map[string]proxyTestResult)
+		}
+		m.proxyTestStates[group] = results
 		return stats
 	}
 	return groupDelayStats{}
@@ -893,10 +1733,7 @@ func proxyDelayKind(proxyType string) string {
 
 func groupMemberDelay(group domain.ProxyGroup, proxyIndex int, delays map[string]uint16) (uint16, bool) {
 	proxy := group.Proxies[proxyIndex]
-	member := proxy.Name
-	if proxyIndex < len(group.All) && group.All[proxyIndex] != "" {
-		member = group.All[proxyIndex]
-	}
+	member := groupMemberKey(group, proxyIndex)
 	delay, ok := delays[member]
 	if !ok && member != proxy.Name {
 		delay, ok = delays[proxy.Name]
@@ -904,21 +1741,65 @@ func groupMemberDelay(group domain.ProxyGroup, proxyIndex int, delays map[string
 	return delay, ok
 }
 
-func (m *Model) rememberGroupDelays(group string, delays map[string]uint16) {
-	if m.pendingGroupDelays == nil {
-		m.pendingGroupDelays = make(map[string]map[string]uint16)
+func groupMemberKey(group domain.ProxyGroup, proxyIndex int) string {
+	if proxyIndex >= 0 && proxyIndex < len(group.All) && group.All[proxyIndex] != "" {
+		return group.All[proxyIndex]
 	}
-	copyOfDelays := make(map[string]uint16, len(delays))
-	for name, delay := range delays {
-		copyOfDelays[name] = delay
+	if proxyIndex >= 0 && proxyIndex < len(group.Proxies) {
+		return group.Proxies[proxyIndex].Name
 	}
-	m.pendingGroupDelays[group] = copyOfDelays
+	return ""
 }
 
-func (m *Model) applyGroupDelayOverlays() {
-	for group, delays := range m.pendingGroupDelays {
-		_ = m.applyGroupDelays(group, delays)
-		delete(m.pendingGroupDelays, group)
+func (m Model) proxyTestResultFor(groupName string, group domain.ProxyGroup, proxyIndex int) (proxyTestResult, bool) {
+	results := m.proxyTestStates[groupName]
+	if len(results) == 0 {
+		return proxyTestResult{}, false
+	}
+	key := groupMemberKey(group, proxyIndex)
+	result, ok := results[key]
+	if !ok && proxyIndex >= 0 && proxyIndex < len(group.Proxies) && key != group.Proxies[proxyIndex].Name {
+		result, ok = results[group.Proxies[proxyIndex].Name]
+	}
+	return result, ok
+}
+
+func (m Model) proxyDisplayState(groupName string, group domain.ProxyGroup, proxyIndex int) (proxyTestState, uint16) {
+	if result, ok := m.proxyTestResultFor(groupName, group, proxyIndex); ok {
+		return result.state, result.delay
+	}
+	if proxyIndex >= 0 && proxyIndex < len(group.Proxies) {
+		return proxyTestUnknown, group.Proxies[proxyIndex].Delay
+	}
+	return proxyTestUnknown, 0
+}
+
+func (m *Model) pruneProxyTestStates() {
+	for groupName, results := range m.proxyTestStates {
+		var group *domain.ProxyGroup
+		for index := range m.groups {
+			if m.groups[index].Name == groupName {
+				group = &m.groups[index]
+				break
+			}
+		}
+		if group == nil {
+			delete(m.proxyTestStates, groupName)
+			continue
+		}
+		valid := make(map[string]struct{}, len(group.Proxies)*2)
+		for index, proxy := range group.Proxies {
+			valid[groupMemberKey(*group, index)] = struct{}{}
+			valid[proxy.Name] = struct{}{}
+		}
+		for member := range results {
+			if _, ok := valid[member]; !ok {
+				delete(results, member)
+			}
+		}
+		if len(results) == 0 {
+			delete(m.proxyTestStates, groupName)
+		}
 	}
 }
 

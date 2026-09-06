@@ -32,6 +32,11 @@ func (f *fakeBackend) Status(context.Context) (domain.RuntimeStatus, error)     
 func (f *fakeBackend) Groups(context.Context) ([]domain.ProxyGroup, error)      { return f.groups, nil }
 func (f *fakeBackend) Profiles(context.Context) ([]domain.Profile, error)       { return f.profiles, nil }
 func (f *fakeBackend) Connections(context.Context) ([]domain.Connection, error) { return f.conns, nil }
+func (f *fakeBackend) WatchTraffic(context.Context) (<-chan domain.Traffic, <-chan error) {
+	traffic := make(chan domain.Traffic)
+	errs := make(chan error)
+	return traffic, errs
+}
 func (f *fakeBackend) WatchLogs(context.Context, string) (<-chan domain.LogEntry, <-chan error) {
 	entries := make(chan domain.LogEntry)
 	errs := make(chan error)
@@ -768,16 +773,22 @@ func TestGroupTestAppliesReturnedDelays(t *testing.T) {
 		t.Fatalf("tested wrong filtered group: %q", backend.tested)
 	}
 	proxies := m.groups[1].Proxies
-	if proxies[0].Delay != 123 || !proxies[0].Alive {
-		t.Fatalf("returned delay was not applied: %#v", proxies[0])
+	if proxies[0].Delay != 0 || proxies[0].Alive || proxies[1].Delay != 44 || proxies[1].Alive || proxies[2].Delay != 88 || !proxies[2].Alive {
+		t.Fatalf("delay test overwrote core health: %#v", proxies)
 	}
-	if proxies[1].Delay != 0 || !proxies[1].Alive {
-		t.Fatalf("present zero delay was not treated as successful: %#v", proxies[1])
+	state, delay := m.proxyDisplayState("SECOND", m.groups[1], 0)
+	if state != proxyTestSuccess || delay != 123 {
+		t.Fatalf("positive delay state = %v/%d, want success/123", state, delay)
 	}
-	if proxies[2].Delay != 0 || proxies[2].Alive {
-		t.Fatalf("omitted node retained stale health: %#v", proxies[2])
+	state, delay = m.proxyDisplayState("SECOND", m.groups[1], 1)
+	if state != proxyTestTimeout || delay != 0 {
+		t.Fatalf("zero delay state = %v/%d, want timeout/0", state, delay)
 	}
-	if m.toast != "测速：成功2（叶2/组0/内置0）失败1" || !m.toastWarning {
+	state, delay = m.proxyDisplayState("SECOND", m.groups[1], 2)
+	if state != proxyTestTimeout || delay != 0 {
+		t.Fatalf("missing delay state = %v/%d, want timeout/0", state, delay)
+	}
+	if m.toast != "测速：成功1（叶1/组0/内置0）超时2" || !m.toastWarning {
 		t.Fatalf("partial group test notice = %q, warning=%v", m.toast, m.toastWarning)
 	}
 	if view := ansi.Strip(m.render()); !strings.Contains(view, "123 ms") {
@@ -793,8 +804,11 @@ func TestGroupTestAppliesReturnedDelays(t *testing.T) {
 	updated, _ = m.Update(groupsMsg{groups: []domain.ProxyGroup{refreshed}})
 	m = updated.(Model)
 	proxies = m.groups[0].Proxies
-	if proxies[0].Delay != 123 || !proxies[0].Alive || proxies[1].Delay != 0 || !proxies[1].Alive || proxies[2].Delay != 0 || proxies[2].Alive {
-		t.Fatalf("group refresh overwrote delay overlay: %#v", proxies)
+	if proxies[0].Delay != 0 || proxies[0].Alive || proxies[1].Delay != 55 || proxies[1].Alive || proxies[2].Delay != 99 || !proxies[2].Alive {
+		t.Fatalf("group refresh did not preserve core health: %#v", proxies)
+	}
+	if state, delay := m.proxyDisplayState("SECOND", m.groups[0], 0); state != proxyTestSuccess || delay != 123 {
+		t.Fatalf("group refresh lost test result: %v/%d", state, delay)
 	}
 
 	coreState := refreshed
@@ -807,7 +821,10 @@ func TestGroupTestAppliesReturnedDelays(t *testing.T) {
 	m = updated.(Model)
 	proxies = m.groups[0].Proxies
 	if proxies[0].Delay != 7 || proxies[0].Alive || proxies[1].Delay != 8 || proxies[1].Alive || proxies[2].Delay != 99 || !proxies[2].Alive {
-		t.Fatalf("second group refresh did not trust core state: %#v", proxies)
+		t.Fatalf("group refresh did not trust core state: %#v", proxies)
+	}
+	if state, delay := m.proxyDisplayState("SECOND", m.groups[0], 1); state != proxyTestTimeout || delay != 0 {
+		t.Fatalf("group refresh lost timeout result: %v/%d", state, delay)
 	}
 }
 
@@ -844,7 +861,7 @@ func TestGroupTestWithoutUsableDelayIsExplicit(t *testing.T) {
 	m = updated.(Model)
 	updated, refresh := m.Update(cmd())
 	m = updated.(Model)
-	if m.toast != "测速：成功0（叶0/组0/内置0）失败1" || !m.toastWarning {
+	if m.toast != "测速：成功0（叶0/组0/内置0）超时1" || !m.toastWarning {
 		t.Fatalf("empty group test result toast = %q", m.toast)
 	}
 	if got := m.groups[0].Proxies[0]; got.Name != original.Name || got.Alive != original.Alive || got.Delay != original.Delay {
@@ -872,10 +889,16 @@ func TestNestedGroupDelayUsesDirectMemberKeys(t *testing.T) {
 		completedAt: time.Unix(100, 0),
 	})
 	m = updated.(Model)
-	if got := m.groups[0].Proxies; !got[0].Alive || got[0].Delay != 31 || !got[1].Alive || got[1].Delay != 0 {
-		t.Fatalf("direct nested members were not updated: %#v", got)
+	if got := m.groups[0].Proxies; got[0].Alive || got[0].Delay != 0 || got[1].Alive || got[1].Delay != 0 {
+		t.Fatalf("delay test overwrote nested member health: %#v", got)
 	}
-	if m.toast != "测速：成功2（叶0/组1/内置1）失败0" || m.toastWarning {
+	if state, delay := m.proxyDisplayState("OUTER", m.groups[0], 0); state != proxyTestSuccess || delay != 31 {
+		t.Fatalf("nested group result = %v/%d, want success/31", state, delay)
+	}
+	if state, delay := m.proxyDisplayState("OUTER", m.groups[0], 1); state != proxyTestTimeout || delay != 0 {
+		t.Fatalf("built-in zero result = %v/%d, want timeout/0", state, delay)
+	}
+	if m.toast != "测速：成功1（叶0/组1/内置0）超时1" || !m.toastWarning {
 		t.Fatalf("nested group test notice = %q, warning=%v", m.toast, m.toastWarning)
 	}
 }
@@ -897,10 +920,10 @@ func TestUnmatchedLeafDelayDoesNotOverwriteDirectMember(t *testing.T) {
 	if got := m.groups[0].Proxies[0]; !got.Alive || got.Delay != 52 {
 		t.Fatalf("unmatched leaf key overwrote direct member health: %#v", got)
 	}
-	if len(m.pendingGroupDelays) != 0 {
-		t.Fatalf("unmatched result was cached as authoritative: %#v", m.pendingGroupDelays)
+	if state, delay := m.proxyDisplayState("OUTER", m.groups[0], 0); state != proxyTestTimeout || delay != 0 {
+		t.Fatalf("unmatched result did not become an explicit timeout: %v/%d", state, delay)
 	}
-	if m.toast != "测速：成功0（叶0/组0/内置0）失败1" || !m.toastWarning {
+	if m.toast != "测速：成功0（叶0/组0/内置0）超时1" || !m.toastWarning {
 		t.Fatalf("unmatched group test notice = %q, warning=%v", m.toast, m.toastWarning)
 	}
 }
@@ -926,7 +949,7 @@ func TestGroupTestNoticeAnonymouslySeparatesMemberKinds(t *testing.T) {
 		completedAt: time.Unix(100, 0),
 	})
 	m = updated.(Model)
-	if m.toast != "测速：成功4（叶1/组2/内置1）失败0" || m.toastWarning {
+	if m.toast != "测速：成功3（叶1/组2/内置0）超时1" || !m.toastWarning {
 		t.Fatalf("anonymous group test notice = %q, warning=%v", m.toast, m.toastWarning)
 	}
 	if footer := ansi.Strip(m.renderFooter()); !strings.Contains(footer, m.toast) {
@@ -939,7 +962,7 @@ func TestGroupTestNoticeAnonymouslySeparatesMemberKinds(t *testing.T) {
 	}
 }
 
-func TestGroupTestIgnoresAllPreTestSnapshotsBeforeOneShotOverlay(t *testing.T) {
+func TestGroupTestStateSurvivesCoreSnapshotsWithoutOverwritingHealth(t *testing.T) {
 	testedAt := time.Unix(200, 0)
 	m := testModel()
 	m.groups = []domain.ProxyGroup{{
@@ -964,27 +987,27 @@ func TestGroupTestIgnoresAllPreTestSnapshotsBeforeOneShotOverlay(t *testing.T) {
 	for _, requestedAt := range []time.Time{testedAt.Add(-2 * time.Second), testedAt.Add(-time.Second)} {
 		updated, _ = m.Update(groupsMsg{groups: coreSnapshot(), requestedAt: requestedAt})
 		m = updated.(Model)
-		if got := m.groups[0].Proxies[0]; !got.Alive || got.Delay != 24 {
-			t.Fatalf("pre-test snapshot overwrote result: %#v", got)
+		if got := m.groups[0].Proxies[0]; got.Alive || got.Delay != 0 {
+			t.Fatalf("test result overwrote core snapshot: %#v", got)
 		}
-		if len(m.pendingGroupDelays) != 1 {
-			t.Fatal("pre-test snapshot consumed the pending overlay")
+		if state, delay := m.proxyDisplayState("OUTER", m.groups[0], 0); state != proxyTestSuccess || delay != 24 {
+			t.Fatalf("snapshot lost test result: %v/%d", state, delay)
 		}
 	}
 
 	updated, _ = m.Update(groupsMsg{groups: coreSnapshot(), requestedAt: testedAt.Add(time.Second)})
 	m = updated.(Model)
-	if got := m.groups[0].Proxies[0]; !got.Alive || got.Delay != 24 {
-		t.Fatalf("first fresh snapshot did not receive one-shot overlay: %#v", got)
-	}
-	if len(m.pendingGroupDelays) != 0 {
-		t.Fatal("fresh snapshot did not consume the pending overlay")
+	if got := m.groups[0].Proxies[0]; got.Alive || got.Delay != 0 {
+		t.Fatalf("fresh snapshot was overwritten by test state: %#v", got)
 	}
 
 	updated, _ = m.Update(groupsMsg{groups: coreSnapshot(), requestedAt: testedAt.Add(2 * time.Second)})
 	m = updated.(Model)
 	if got := m.groups[0].Proxies[0]; got.Alive || got.Delay != 0 {
-		t.Fatalf("second fresh snapshot did not trust core state: %#v", got)
+		t.Fatalf("second fresh snapshot was overwritten by test state: %#v", got)
+	}
+	if state, delay := m.proxyDisplayState("OUTER", m.groups[0], 0); state != proxyTestSuccess || delay != 24 {
+		t.Fatalf("fresh snapshots lost test result: %v/%d", state, delay)
 	}
 }
 

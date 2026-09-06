@@ -167,6 +167,37 @@ func (a *App) CloseAllConnections(ctx context.Context) error {
 	return controllerError(client.CloseAllConnections(ctx))
 }
 
+func (a *App) WatchTraffic(ctx context.Context) (<-chan domain.Traffic, <-chan error) {
+	traffic := make(chan domain.Traffic, 16)
+	errorsCh := make(chan error, 1)
+	client, err := a.checkAPI()
+	if err != nil {
+		close(traffic)
+		errorsCh <- err
+		close(errorsCh)
+		return traffic, errorsCh
+	}
+	go func() {
+		defer close(traffic)
+		defer close(errorsCh)
+		err := client.StreamTraffic(ctx, func(sample domain.Traffic) error {
+			select {
+			case traffic <- sample:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+		if err != nil && ctx.Err() == nil {
+			select {
+			case errorsCh <- controllerError(fmt.Errorf("流量流已断开: %w", err)):
+			default:
+			}
+		}
+	}()
+	return traffic, errorsCh
+}
+
 func (a *App) WatchLogs(ctx context.Context, level string) (<-chan domain.LogEntry, <-chan error) {
 	entries := make(chan domain.LogEntry, 128)
 	errorsCh := make(chan error, 1)
