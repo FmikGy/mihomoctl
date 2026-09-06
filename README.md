@@ -23,6 +23,22 @@
 
 ## 安装
 
+### 1. 先安装 Mihomo
+
+`mihomoctl` 只是 Mihomo 的管理前端，不包含也不会自动安装 Mihomo 内核。安装 `mihomoctl` 前，请先安装 Mihomo，并将其配置为可由 systemd 管理的服务（默认服务名为 `mihomo.service`）。
+
+- Mihomo 仓库：[MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo/tree/Meta)
+- Mihomo 预编译版本：[Releases](https://github.com/MetaCubeX/mihomo/releases/latest)
+
+安装完成后先确认命令和服务可用：
+
+```bash
+mihomo -v
+systemctl status mihomo.service
+```
+
+### 2. 安装 mihomoctl
+
 发布页提供 tar.gz、deb、rpm、SHA256 校验文件和 SBOM。安装软件包不会自动启用或启动订阅更新 timer。
 
 Debian/Ubuntu：
