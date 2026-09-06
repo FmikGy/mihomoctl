@@ -443,7 +443,9 @@ func (m Model) renderLogs(height int) string {
 	c := colors()
 	logs := m.filteredLogs()
 	state := strings.ToUpper(empty(m.logLevel, "info"))
-	if m.logConnecting {
+	if !m.status.Service.Active {
+		state += "  服务已停止"
+	} else if m.logConnecting {
 		state += "  连接中"
 	}
 	if m.logPaused {
@@ -480,7 +482,9 @@ func (m Model) renderLogs(height int) string {
 	}
 	if len(logs) == 0 {
 		message := "等待日志..."
-		if m.filter != "" && len(m.logs) > 0 {
+		if !m.status.Service.Active {
+			message = "Mihomo 服务未运行"
+		} else if m.filter != "" && len(m.logs) > 0 {
 			message = "没有匹配日志"
 		}
 		lines = append(lines, lipgloss.NewStyle().Foreground(c.muted).Render(message))

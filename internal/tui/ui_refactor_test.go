@@ -22,6 +22,16 @@ type uiRecordingBackend struct {
 	closedConnection string
 }
 
+type uiLogRecordingBackend struct {
+	*fakeBackend
+	watchLogsCalls int
+}
+
+func (b *uiLogRecordingBackend) WatchLogs(context.Context, string) (<-chan domain.LogEntry, <-chan error) {
+	b.watchLogsCalls++
+	return make(chan domain.LogEntry), make(chan error)
+}
+
 func (b *uiRecordingBackend) RemoveProfile(_ context.Context, name string) error {
 	b.removedProfile = name
 	return nil
@@ -638,5 +648,70 @@ func TestUIRefactorTrafficClosureReconnectsAfterBothChannelsClose(t *testing.T) 
 	m, duplicate := updateUIModel(t, m, trafficErrMsg{generation: 8, ok: false})
 	if duplicate != nil || m.trafficGeneration != 9 {
 		t.Fatalf("stale channel close scheduled duplicate reconnect: cmd=%v generation=%d", duplicate != nil, m.trafficGeneration)
+	}
+}
+
+func TestUIRefactorLogsWaitForRunningService(t *testing.T) {
+	m := testModel()
+	backend := &uiLogRecordingBackend{fakeBackend: m.backend.(*fakeBackend)}
+	m.backend = backend
+	m.page = pageLogs
+	m.status.Service.Active = false
+	m.setSourceError(errorLogs, errors.New("日志流已断开"))
+
+	if cmd := m.beginLogs(true); cmd != nil {
+		t.Fatal("stopped service started a log stream")
+	}
+	if backend.watchLogsCalls != 0 || m.logStreamPresent() {
+		t.Fatalf("stopped service touched log backend: calls=%d stream=%v", backend.watchLogsCalls, m.logStreamPresent())
+	}
+	if _, ok := m.errors[errorLogs]; ok {
+		t.Fatal("stale log error was not cleared while service is stopped")
+	}
+	view := ansi.Strip(m.renderLogs(12))
+	for _, text := range []string{"服务已停止", "Mihomo 服务未运行"} {
+		if !strings.Contains(view, text) {
+			t.Fatalf("stopped log view missing %q:\n%s", text, view)
+		}
+	}
+
+	m.statusRequest = requestState{inFlight: true, generation: 7}
+	m, cmd := updateUIModel(t, m, statusMsg{
+		status:      domain.RuntimeStatus{Service: domain.ServiceStatus{Active: true}},
+		requestedAt: time.Now(),
+		generation:  7,
+	})
+	if cmd == nil || !m.logConnecting {
+		t.Fatalf("running service did not start the log stream: cmd=%v connecting=%v", cmd != nil, m.logConnecting)
+	}
+}
+
+func TestUIRefactorStoppingServiceClosesLogsAndClearsError(t *testing.T) {
+	m := testModel()
+	m.page = pageLogs
+	m.logGeneration = 4
+	m.logCh = make(chan domain.LogEntry)
+	m.logErrCh = make(chan error)
+	streamCtx, cancel := context.WithCancel(context.Background())
+	m.logCancel = cancel
+	m.logReconnectPending = true
+	m.setSourceError(errorLogs, errors.New("controller disconnected"))
+	m.statusRequest = requestState{inFlight: true, generation: 9}
+
+	m, _ = updateUIModel(t, m, statusMsg{
+		status:      domain.RuntimeStatus{Service: domain.ServiceStatus{Active: false}},
+		requestedAt: time.Now(),
+		generation:  9,
+	})
+	if m.logStreamPresent() || m.logRetry != 0 {
+		t.Fatalf("stopped service retained log stream state: present=%v retry=%d", m.logStreamPresent(), m.logRetry)
+	}
+	if _, ok := m.errors[errorLogs]; ok {
+		t.Fatal("stopped service retained its log error")
+	}
+	select {
+	case <-streamCtx.Done():
+	default:
+		t.Fatal("stopped service did not cancel the log context")
 	}
 }

@@ -455,6 +455,7 @@ func (m *Model) cancelPageWork(target page) {
 		cancelRequest(&m.connectionRequest)
 	case pageLogs:
 		m.stopLogs()
+		m.clearSourceError(errorLogs)
 	case pageSettings:
 		cancelRequest(&m.scheduleRequest)
 	}
@@ -506,8 +507,9 @@ func minDuration(a, b time.Duration) time.Duration {
 func (m *Model) beginLogs(force bool) tea.Cmd {
 	if force {
 		m.stopLogs()
+		m.clearSourceError(errorLogs)
 	}
-	if m.page != pageLogs || m.logConnecting || m.logCh != nil || m.logErrCh != nil || m.logReconnectPending || m.ctx.Err() != nil {
+	if m.page != pageLogs || !m.status.Service.Active || m.logConnecting || m.logCh != nil || m.logErrCh != nil || m.logReconnectPending || m.ctx.Err() != nil {
 		return nil
 	}
 	m.logGeneration++
@@ -540,7 +542,7 @@ func (m *Model) beginTraffic(force bool) tea.Cmd {
 }
 
 func (m *Model) scheduleLogReconnect() tea.Cmd {
-	if m.page != pageLogs || m.logReconnectPending || m.ctx.Err() != nil {
+	if m.page != pageLogs || !m.status.Service.Active || m.logReconnectPending || m.ctx.Err() != nil {
 		return nil
 	}
 	m.logReconnectPending = true
@@ -572,7 +574,7 @@ func (m *Model) disconnectLogs(generation uint64, err error) tea.Cmd {
 	m.logCh, m.logErrCh = nil, nil
 	m.logConnecting = false
 	m.logGeneration++
-	if err != nil && m.ctx.Err() == nil {
+	if err != nil && m.ctx.Err() == nil && m.status.Service.Active {
 		m.setSourceError(errorLogs, err)
 	}
 	return m.scheduleLogReconnect()
@@ -752,17 +754,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status.Traffic = msg.status.Traffic
 				m.status.Traffic.Up, m.status.Traffic.Down = 0, 0
 				m.clearSourceError(errorTraffic)
+				m.clearSourceError(errorLogs)
 				if m.trafficStreamPresent() {
 					m.stopTraffic()
+				}
+				if m.logStreamPresent() {
+					m.stopLogs()
 				}
 			}
 			m.clearSourceError(errorStatus)
 		}
-		var trafficCmd tea.Cmd
+		var trafficCmd, logCmd tea.Cmd
 		if msg.generation != 0 && msg.err == nil && msg.status.Service.Active {
 			trafficCmd = m.beginTraffic(false)
+			if m.page == pageLogs {
+				logCmd = m.beginLogs(false)
+			}
 		}
-		return m, tea.Batch(next(), trafficCmd)
+		return m, tea.Batch(next(), trafficCmd, logCmd)
 	case scheduleMsg:
 		if !acceptResponse(&m.scheduleRequest, msg.generation) {
 			return m, nil
@@ -922,7 +931,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case logReconnectMsg:
-		if msg.generation != m.logGeneration || !m.logReconnectPending || m.page != pageLogs {
+		if msg.generation != m.logGeneration || !m.logReconnectPending || m.page != pageLogs || !m.status.Service.Active {
 			return m, nil
 		}
 		m.logReconnectPending = false
@@ -1022,6 +1031,10 @@ func (m Model) trafficStreamActive() bool {
 
 func (m Model) trafficStreamPresent() bool {
 	return m.trafficConnecting || m.trafficCh != nil || m.trafficErrCh != nil || m.trafficReconnectPending || m.trafficCancel != nil
+}
+
+func (m Model) logStreamPresent() bool {
+	return m.logConnecting || m.logCh != nil || m.logErrCh != nil || m.logReconnectPending || m.logCancel != nil
 }
 
 func nonNegativeTraffic(value int64) int64 {
