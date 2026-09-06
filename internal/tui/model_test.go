@@ -139,7 +139,7 @@ func TestContextualFooterHints(t *testing.T) {
 		hints []string
 	}{
 		{pageOverview, []string{"Enter启停", "r刷新", "Tab切页", "?帮助", "q退出"}},
-		{pageProxies, []string{"↑↓选", "[]组", "Enter切换", "t测速", "/筛选", "?帮助", "q退出"}},
+		{pageProxies, []string{"↑↓选", "←→组", "Enter切换", "t测速", "/筛选", "?帮助", "q退出"}},
 		{pageProfiles, []string{"↑↓选", "a添加", "u更新", "d删除", "Enter激活", "?帮助", "q退出"}},
 		{pageConnections, []string{"↑↓选", "Enter关闭", "x全部", "/筛选", "?帮助", "q退出"}},
 		{pageLogs, []string{"Space暂停", "/筛选", "r刷新", "?帮助", "q退出"}},
@@ -511,6 +511,142 @@ func TestCompactProxyPageShowsSelectableNodes(t *testing.T) {
 	view := m.render()
 	if !strings.Contains(view, "香港 01") || !strings.Contains(view, "VLESS") {
 		t.Fatalf("compact proxy page hid node details:\n%s", view)
+	}
+}
+
+func TestProxyPageShowsGroupSelectorAboveNodeTable(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	m := testModel()
+	m.width, m.height, m.page = 80, 24, pageProxies
+	m.groups = []domain.ProxyGroup{
+		{Name: "AI", Proxies: []domain.Proxy{{Name: "AI-node"}}},
+		{Name: "Netflix", Proxies: []domain.Proxy{{Name: "Netflix-node"}}},
+		{Name: "✈️Final", Proxies: []domain.Proxy{{Name: "Final-node"}}},
+	}
+	m.groupCursor = 1
+	m.syncViewports()
+
+	lines := strings.Split(ansi.Strip(m.render()), "\n")
+	titleIndex, selectorIndex, headerIndex := -1, -1, -1
+	for index, line := range lines {
+		switch {
+		case strings.Contains(line, "策略组 · Netflix"):
+			titleIndex = index
+		case strings.Contains(line, "> Netflix"):
+			selectorIndex = index
+		case strings.Contains(line, "在线") && strings.Contains(line, "测速") && strings.Contains(line, "节点"):
+			headerIndex = index
+		}
+	}
+	if titleIndex < 0 || selectorIndex != titleIndex+1 || headerIndex != selectorIndex+1 {
+		t.Fatalf("group selector is not directly above the node table: title=%d selector=%d header=%d\n%s",
+			titleIndex, selectorIndex, headerIndex, strings.Join(lines, "\n"))
+	}
+}
+
+func TestProxyGroupSelectorKeepsCurrentGroupVisible(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	for _, size := range [][2]int{{60, 16}, {80, 24}, {120, 30}, {180, 40}} {
+		t.Run(fmt.Sprintf("%dx%d", size[0], size[1]), func(t *testing.T) {
+			m := testModel()
+			m.width, m.height, m.page = size[0], size[1], pageProxies
+			m.groups = make([]domain.ProxyGroup, 30)
+			for index := range m.groups {
+				m.groups[index] = domain.ProxyGroup{
+					Name:    fmt.Sprintf("group-%02d", index),
+					Proxies: []domain.Proxy{{Name: fmt.Sprintf("node-%02d", index)}},
+				}
+			}
+			m.syncViewports()
+			rowWidth := m.width - 4
+			for index := range m.groups {
+				selector := m.proxyGroupSelector(m.groups, m.groupCursor, rowWidth)
+				if want := fmt.Sprintf("> group-%02d", index); !strings.Contains(ansi.Strip(selector), want) {
+					t.Fatalf("current group %q is outside selector:\n%s", want, ansi.Strip(selector))
+				}
+				if width := ansi.StringWidth(selector); width != rowWidth {
+					t.Fatalf("selector width = %d, want %d", width, rowWidth)
+				}
+				if width := ansi.StringWidthWc(selector); width > rowWidth {
+					t.Fatalf("legacy selector width = %d, maximum %d", width, rowWidth)
+				}
+				m.moveGroup(1)
+			}
+			if m.groupCursor != 0 || m.groupOffset != 0 {
+				t.Fatalf("group selector did not wrap to the beginning: cursor=%d offset=%d", m.groupCursor, m.groupOffset)
+			}
+		})
+	}
+}
+
+func TestProxyGroupSelectorContainsEmojiWithoutWrapping(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	m := testModel()
+	m.width, m.height, m.page = 60, 16, pageProxies
+	m.groups = []domain.ProxyGroup{
+		{Name: "✈️Final"},
+		{Name: "🎯Direct"},
+		{Name: "👨‍👩‍👧家庭节点"},
+		{Name: strings.Repeat("👨‍👩‍👧", 8)},
+		{Name: strings.Repeat("超长策略组", 8)},
+	}
+	for index := range m.groups {
+		m.groupCursor = index
+		m.syncViewports()
+		selector := m.proxyGroupSelector(m.groups, index, m.width-4)
+		if width := ansi.StringWidth(selector); width > m.width-4 {
+			t.Fatalf("grapheme selector width = %d: %q", width, ansi.Strip(selector))
+		}
+		if width := ansi.StringWidthWc(selector); width > m.width-4 {
+			t.Fatalf("legacy selector width = %d: %q", width, ansi.Strip(selector))
+		}
+		if !strings.Contains(ansi.Strip(selector), "> ") {
+			t.Fatalf("selected emoji group has no visible marker: %q", ansi.Strip(selector))
+		}
+	}
+}
+
+func TestHelpExplainsPageScopedArrowKeys(t *testing.T) {
+	for _, width := range []int{60, 120} {
+		t.Run(fmt.Sprintf("width-%d", width), func(t *testing.T) {
+			m := testModel()
+			m.width = width
+			help := m.helpText()
+			normalized := strings.ReplaceAll(help, " ", "")
+			for _, want := range []string{"Shift", "节点页←→/[]", "其他页←→"} {
+				if !strings.Contains(normalized, want) {
+					t.Fatalf("help at width %d does not contain %q:\n%s", width, want, help)
+				}
+			}
+		})
+	}
+}
+
+func TestProxyArrowKeysSwitchGroupsWithoutChangingPage(t *testing.T) {
+	m := testModel()
+	m.page = pageProxies
+	m.groups = []domain.ProxyGroup{
+		{Name: "first", Proxies: []domain.Proxy{{Name: "first-node"}}},
+		{Name: "second", Proxies: []domain.Proxy{{Name: "second-node"}}},
+	}
+
+	m, _ = updateUIModel(t, m, keyPress(tea.KeyRight, ""))
+	if m.page != pageProxies || m.groupCursor != 1 {
+		t.Fatalf("right arrow changed page or wrong group: page=%d group=%d", m.page, m.groupCursor)
+	}
+	m, _ = updateUIModel(t, m, keyPress(tea.KeyLeft, ""))
+	if m.page != pageProxies || m.groupCursor != 0 {
+		t.Fatalf("left arrow changed page or wrong group: page=%d group=%d", m.page, m.groupCursor)
+	}
+	m, _ = updateUIModel(t, m, keyPress(tea.KeyTab, ""))
+	if m.page != pageProfiles {
+		t.Fatalf("Tab from proxy page = page %d, want profiles", m.page)
+	}
+
+	m.page = pageOverview
+	m, _ = updateUIModel(t, m, keyPress(tea.KeyRight, ""))
+	if m.page != pageProxies {
+		t.Fatalf("right arrow outside proxy page = page %d, want proxies", m.page)
 	}
 }
 

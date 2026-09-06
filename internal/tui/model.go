@@ -1152,10 +1152,24 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "?":
 		m.help = true
 		return m, nil
-	case "tab", "right", "l":
+	case "tab", "l":
 		m.applyFilter("")
 		return m.switchPage((m.page + 1) % page(len(pageNames)))
-	case "shift+tab", "left", "h":
+	case "shift+tab", "h":
+		m.applyFilter("")
+		return m.switchPage((m.page + page(len(pageNames)) - 1) % page(len(pageNames)))
+	case "right":
+		if m.page == pageProxies {
+			m.moveGroup(1)
+			return m, nil
+		}
+		m.applyFilter("")
+		return m.switchPage((m.page + 1) % page(len(pageNames)))
+	case "left":
+		if m.page == pageProxies {
+			m.moveGroup(-1)
+			return m, nil
+		}
 		m.applyFilter("")
 		return m.switchPage((m.page + page(len(pageNames)) - 1) % page(len(pageNames)))
 	case "up", "k":
@@ -1647,7 +1661,9 @@ func (m *Model) moveByPage(direction int) {
 		return
 	}
 	capacity := m.listCapacity()
-	if m.page == pageSettings {
+	if m.page == pageProxies {
+		capacity = m.proxyListCapacity()
+	} else if m.page == pageSettings {
 		capacity = m.settingsCapacity()
 	}
 	m.moveCursor(direction * capacity)
@@ -1883,19 +1899,24 @@ func (m Model) listCapacity() int {
 	return max(1, max(8, m.height-6)-3)
 }
 
+func (m Model) proxyListCapacity() int {
+	return max(1, m.listCapacity()-1)
+}
+
 func (m Model) settingsCapacity() int {
 	return max(1, max(8, m.height-6)-5)
 }
 
 func (m *Model) syncViewports() {
 	groups := m.filteredGroups()
-	m.groupOffset = viewportOffset(len(groups), m.groupCursor, m.groupOffset, m.listCapacity())
+	groupCapacity := proxyGroupSelectorLayout(max(1, m.width-4), len(groups)).capacity
+	m.groupOffset = viewportOffset(len(groups), m.groupCursor, m.groupOffset, groupCapacity)
 	nodeCount := 0
 	if len(groups) > 0 {
 		groupIndex := clamp(m.groupCursor, 0, len(groups)-1)
 		nodeCount = len(filteredProxies(groups[groupIndex], m.filter))
 	}
-	m.proxyOffset = viewportOffset(nodeCount, m.proxyCursor, m.proxyOffset, m.listCapacity())
+	m.proxyOffset = viewportOffset(nodeCount, m.proxyCursor, m.proxyOffset, m.proxyListCapacity())
 	m.profileOffset = viewportOffset(len(m.profiles), m.profileCursor, m.profileOffset, m.listCapacity())
 	m.connectionOffset = viewportOffset(len(m.filteredConnections()), m.connectionCursor, m.connectionOffset, m.listCapacity())
 	m.settingOffset = viewportOffset(len(settingOrder), m.settingCursor, m.settingOffset, m.settingsCapacity())

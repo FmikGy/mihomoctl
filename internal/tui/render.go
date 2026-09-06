@@ -322,11 +322,12 @@ func (m Model) renderProxies(height int) string {
 	groupIndex := clamp(m.groupCursor, 0, len(groups)-1)
 	group := groups[groupIndex]
 	nodes := filteredProxies(group, m.filter)
-	nodeStart, nodeEnd := viewportBounds(len(nodes), m.proxyCursor, m.proxyOffset, m.listCapacity())
+	nodeStart, nodeEnd := viewportBounds(len(nodes), m.proxyCursor, m.proxyOffset, m.proxyListCapacity())
 	rowWidth := max(1, m.width-4)
 	position := fmt.Sprintf("组 %s  节点 %s", listPosition(groupIndex, len(groups)), listPosition(m.proxyCursor, len(nodes)))
 	lines := []string{
-		titleLine("节点 · "+group.Name, position, rowWidth),
+		titleLine("策略组 · "+group.Name, position, rowWidth),
+		m.proxyGroupSelector(groups, groupIndex, rowWidth),
 		proxyTableHeader(rowWidth),
 	}
 	if len(nodes) == 0 {
@@ -336,6 +337,102 @@ func (m Model) renderProxies(height int) string {
 		lines = append(lines, m.proxyTableRow(group, nodes[i], i == m.proxyCursor, rowWidth))
 	}
 	return renderPage(lines, m.width, height)
+}
+
+type groupSelectorLayout struct {
+	capacity  int
+	cellWidth int
+}
+
+func proxyGroupSelectorLayout(rowWidth, total int) groupSelectorLayout {
+	const (
+		navigationWidth = 4
+		preferredWidth  = 14
+		maximumWidth    = 18
+		gapWidth        = 1
+	)
+	available := max(1, rowWidth-navigationWidth)
+	capacity := min(max(1, total), max(1, (available+gapWidth)/(preferredWidth+gapWidth)))
+	cellWidth := max(1, (available-gapWidth*(capacity-1))/capacity)
+	cellWidth = min(cellWidth, maximumWidth)
+	return groupSelectorLayout{capacity: capacity, cellWidth: cellWidth}
+}
+
+func (m Model) proxyGroupSelector(groups []domain.ProxyGroup, selected, rowWidth int) string {
+	rowWidth = max(0, rowWidth)
+	if rowWidth == 0 || len(groups) == 0 {
+		return ""
+	}
+	layout := proxyGroupSelectorLayout(rowWidth, len(groups))
+	start, end := viewportBounds(len(groups), selected, m.groupOffset, layout.capacity)
+	parts := make([]string, 0, end-start)
+	for index := start; index < end; index++ {
+		current := index == selected
+		marker := "  "
+		if current {
+			marker = "> "
+		}
+		nameWidth := max(1, layout.cellWidth-lipgloss.Width(marker))
+		label := marker + stableTerminalCell(empty(groups[index].Name, "--"), nameWidth)
+		style := lipgloss.NewStyle().Foreground(colors().muted)
+		if current {
+			style = lipgloss.NewStyle().Bold(true).Foreground(colors().onAccent).Background(colors().accent)
+			if colorsDisabled() {
+				style = style.Reverse(true)
+			}
+		}
+		parts = append(parts, style.Render(label))
+	}
+
+	left, right := "[ ", " ]"
+	if start > 0 {
+		left = "< "
+	}
+	if end < len(groups) {
+		right = " >"
+	}
+	contentWidth := max(0, rowWidth-lipgloss.Width(left)-lipgloss.Width(right))
+	content := padDualWidth(strings.Join(parts, " "), contentWidth)
+	return padDualWidth(lipgloss.NewStyle().Foreground(colors().muted).Render(left)+
+		content+lipgloss.NewStyle().Foreground(colors().muted).Render(right), rowWidth)
+}
+
+// Bubble Tea supports both grapheme and legacy wcwidth renderers. Reserving
+// the larger width keeps an emoji-bearing group label on one physical line.
+func stableTerminalCell(value string, width int) string {
+	width = max(0, width)
+	value = safeText(value)
+	if dualWidth(value) <= width {
+		return padDualWidth(value, width)
+	}
+
+	const tail = "~"
+	available := max(0, width-dualWidth(tail))
+	var result strings.Builder
+	graphemeWidth, wcWidth := 0, 0
+	for len(value) > 0 {
+		cluster, clusterGraphemeWidth := ansi.FirstGraphemeCluster(value, ansi.GraphemeWidth)
+		_, clusterWCWidth := ansi.FirstGraphemeCluster(cluster, ansi.WcWidth)
+		if graphemeWidth+clusterGraphemeWidth > available || wcWidth+clusterWCWidth > available {
+			break
+		}
+		result.WriteString(cluster)
+		graphemeWidth += clusterGraphemeWidth
+		wcWidth += clusterWCWidth
+		value = value[len(cluster):]
+	}
+	if width > 0 {
+		result.WriteString(tail)
+	}
+	return padDualWidth(result.String(), width)
+}
+
+func dualWidth(value string) int {
+	return max(ansi.StringWidth(value), ansi.StringWidthWc(value))
+}
+
+func padDualWidth(value string, width int) string {
+	return value + strings.Repeat(" ", max(0, width-dualWidth(value)))
 }
 
 func (m Model) renderProfiles(height int) string {
@@ -560,7 +657,7 @@ func (m Model) pageHints() []string {
 	case pageOverview:
 		return []string{"Enter启停", "r刷新", "Tab切页"}
 	case pageProxies:
-		return []string{"↑↓选", "[]组", "Enter切换", "t测速", "/筛选"}
+		return []string{"↑↓选", "←→组", "Enter切换", "t测速", "/筛选"}
 	case pageProfiles:
 		return []string{"↑↓选", "a添加", "u更新", "d删除", "Enter激活"}
 	case pageConnections:
@@ -698,22 +795,24 @@ func (m Model) helpText() string {
 	lines := []string{sectionTitle("快捷键"), ""}
 	if m.width < 90 {
 		lines = append(lines,
-			"Tab / ←→  切页     ↑↓ / jk  选择",
+			"Tab / Shift+Tab / h l 切页  ↑↓ / jk 选择",
 			"Home / End 首尾    PgUp / PgDn 翻页",
 			"Enter 执行 / 修改  r 刷新",
 			"/ 筛选             t 测速",
-			"[ ] 策略组         a / u / d 配置",
+			"节点页 ←→ / [ ] 切组  其他页 ←→ 切页",
+			"a / u / d 配置",
 			"Space 暂停日志     x 关闭全部连接",
 			"? / Esc 关闭帮助   q 退出",
 		)
 		return strings.Join(lines, "\n")
 	}
 	lines = append(lines,
-		"Tab / ← →     切换页面          Home / End     移到首尾",
+		"Tab / Shift+Tab / h l  切换页面          Home / End     移到首尾",
 		"j k / ↑ ↓     移动选择          PgUp / PgDn     翻页浏览",
 		"Enter          执行或修改当前项  r               刷新",
 		"/              筛选              t               测试策略组延迟",
-		"[ ]            切换策略组        a / u / d       添加、更新、删除配置",
+		"节点页 ← → / [ ]  切换策略组        其他页 ← →      切换页面",
+		"a / u / d       添加、更新、删除配置",
 		"Space          暂停或继续日志    x               关闭全部连接",
 		"? / Esc        关闭帮助          q               退出",
 	)
