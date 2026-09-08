@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,11 +22,12 @@ import (
 )
 
 type fakeRunner struct {
-	mu        sync.Mutex
-	binary    string
-	configDir string
-	active    bool
-	calls     []string
+	mu              sync.Mutex
+	binary          string
+	configDir       string
+	active          bool
+	restartFailures int
+	calls           []string
 }
 
 func (r *fakeRunner) Run(_ context.Context, name string, args ...string) (platform.CommandResult, error) {
@@ -46,6 +48,10 @@ func (r *fakeRunner) Run(_ context.Context, name string, args ...string) (platfo
 			return platform.CommandResult{Stdout: []byte("LoadState=loaded\nActiveState=active\nSubState=running\nUnitFileState=enabled\nMainPID=123\n")}, nil
 		}
 		return platform.CommandResult{Stdout: []byte("LoadState=loaded\nActiveState=inactive\nSubState=dead\nUnitFileState=disabled\nMainPID=0\n")}, nil
+	}
+	if name == "systemctl" && len(args) > 0 && args[0] == "restart" && r.restartFailures > 0 {
+		r.restartFailures--
+		return platform.CommandResult{}, errors.New("restart failed")
 	}
 	if name == r.binary {
 		if containsArg(args, "-v") {
@@ -82,6 +88,89 @@ func testPaths(root string) Paths {
 		ClientFile:     filepath.Join(root, "client.yaml"),
 		DefaultService: "mihomo.service",
 		TimerUnit:      "mihomoctl-update.timer",
+	}
+}
+
+func TestNewRejectsEveryMissingRequiredPath(t *testing.T) {
+	base := testPaths(t.TempDir())
+	tests := []struct {
+		name   string
+		mutate func(*Paths)
+	}{
+		{name: "config", mutate: func(paths *Paths) { paths.ConfigFile = "" }},
+		{name: "data", mutate: func(paths *Paths) { paths.DataDir = "" }},
+		{name: "profiles", mutate: func(paths *Paths) { paths.ProfileRoot = "" }},
+		{name: "backups", mutate: func(paths *Paths) { paths.BackupDir = "" }},
+		{name: "public state", mutate: func(paths *Paths) { paths.PublicFile = "" }},
+		{name: "client state", mutate: func(paths *Paths) { paths.ClientFile = "" }},
+		{name: "service", mutate: func(paths *Paths) { paths.DefaultService = "" }},
+		{name: "timer", mutate: func(paths *Paths) { paths.TimerUnit = "" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			paths := base
+			test.mutate(&paths)
+			if _, err := New(WithPaths(paths)); err == nil || !strings.Contains(err.Error(), "路径配置不完整") {
+				t.Fatalf("New() error = %v, want incomplete paths", err)
+			}
+		})
+	}
+}
+
+func TestNewDerivesMissingOperationLockFromDataDirectory(t *testing.T) {
+	paths := testPaths(t.TempDir())
+	paths.OperationLock = ""
+	application, err := New(WithPaths(paths))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(paths.DataDir, ".operation.lock")
+	if application.paths.OperationLock != want {
+		t.Fatalf("derived operation lock = %q, want %q", application.paths.OperationLock, want)
+	}
+}
+
+func TestClientConfigPathIgnoresSudoUIDOutsideElevatedProcess(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("requires a non-root process identity")
+	}
+	t.Setenv(clientConfigEnvironment, "")
+	t.Setenv("SUDO_UID", "0")
+	path := clientConfigPathForEUID(1000)
+	if path == "/root/.config/mihomoctl/client.yaml" || strings.HasPrefix(path, "/root/") {
+		t.Fatalf("ordinary user trusted spoofed SUDO_UID: %q", path)
+	}
+}
+
+func TestApplicationStateReadersRejectSymlinks(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	if err := os.WriteFile(target, []byte("version: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name string
+		read func(string) error
+	}{
+		{name: "private YAML", read: func(path string) error {
+			_, err := loadYAML[persistedState](path)
+			return err
+		}},
+		{name: "public JSON", read: func(path string) error {
+			application := &App{paths: Paths{PublicFile: path}}
+			_, err := application.readPublicState()
+			return err
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			link := filepath.Join(root, strings.ReplaceAll(test.name, " ", "-")+".yaml")
+			if err := os.Symlink(target, link); err != nil {
+				t.Fatal(err)
+			}
+			if err := test.read(link); err == nil {
+				t.Fatal("symlinked state was accepted")
+			}
+		})
 	}
 }
 
@@ -269,6 +358,176 @@ func TestSystemConfigSnapshotSurvivesRemoteSwitchAndBulkUpdates(t *testing.T) {
 	}
 }
 
+func TestBulkUpdateUsesBoundedBatchesWithActiveProfileFirst(t *testing.T) {
+	fixture := newTransactionFixture(t)
+	var updating atomic.Bool
+	started := make(chan string, 16)
+	activeGate := make(chan struct{})
+	firstBatchGate := make(chan struct{})
+	secondBatchGate := make(chan struct{})
+	var activeOnce, firstOnce, secondOnce sync.Once
+	releaseActive := func() { activeOnce.Do(func() { close(activeGate) }) }
+	releaseFirst := func() { firstOnce.Do(func() { close(firstBatchGate) }) }
+	releaseSecond := func() { secondOnce.Do(func() { close(secondBatchGate) }) }
+	defer releaseActive()
+	defer releaseFirst()
+	defer releaseSecond()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		index := strings.TrimPrefix(request.URL.Path, "/")
+		if updating.Load() {
+			started <- index
+			switch index {
+			case "0":
+				<-activeGate
+			case "1", "2", "3", "4":
+				<-firstBatchGate
+			default:
+				<-secondBatchGate
+			}
+		}
+		_, _ = fmt.Fprintf(writer, "mode: rule\ncustom-field: remote-%s\nproxies: []\nproxy-groups: []\nrules:\n  - MATCH,DIRECT\n", index)
+	}))
+	defer server.Close()
+	for index := range 9 {
+		name := fmt.Sprintf("远程-%d", index)
+		if err := fixture.application.AddProfile(context.Background(), name, fmt.Sprintf("%s/%d", server.URL, index), time.Hour); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fixture.application.UseProfile(context.Background(), "远程-0"); err != nil {
+		t.Fatal(err)
+	}
+
+	updating.Store(true)
+	done := make(chan error, 1)
+	go func() {
+		done <- fixture.application.UpdateProfiles(context.Background(), domain.ProfileUpdateOptions{All: true})
+	}()
+	waitStarted := func() string {
+		t.Helper()
+		select {
+		case value := <-started:
+			return value
+		case err := <-done:
+			t.Fatalf("bulk update ended early: %v", err)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for subscription update")
+		}
+		return ""
+	}
+	assertNoStart := func(stage string) {
+		t.Helper()
+		select {
+		case value := <-started:
+			t.Fatalf("%s started profile %s too early", stage, value)
+		case err := <-done:
+			t.Fatalf("bulk update ended early during %s: %v", stage, err)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	if first := waitStarted(); first != "0" {
+		t.Fatalf("first updated profile = %s, want active profile 0", first)
+	}
+	assertNoStart("active batch")
+	releaseActive()
+	firstWave := map[string]bool{}
+	for range 4 {
+		firstWave[waitStarted()] = true
+	}
+	for _, expected := range []string{"1", "2", "3", "4"} {
+		if !firstWave[expected] {
+			t.Fatalf("first inactive batch = %#v", firstWave)
+		}
+	}
+	assertNoStart("first inactive batch")
+	releaseFirst()
+	secondWave := map[string]bool{}
+	for range 4 {
+		secondWave[waitStarted()] = true
+	}
+	for _, expected := range []string{"5", "6", "7", "8"} {
+		if !secondWave[expected] {
+			t.Fatalf("second inactive batch = %#v", secondWave)
+		}
+	}
+	releaseSecond()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("bulk update did not finish")
+	}
+}
+
+func TestBulkUpdateStopsWhenActiveConfigRollbackFails(t *testing.T) {
+	fixture := newTransactionFixture(t)
+	var updating atomic.Bool
+	var updateRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if updating.Load() {
+			updateRequests.Add(1)
+		}
+		marker := "initial"
+		if updating.Load() {
+			marker = "updated"
+		}
+		_, _ = fmt.Fprintf(writer, "mode: rule\ncustom-field: %s-%s\nproxies: []\nproxy-groups: []\nrules:\n  - MATCH,DIRECT\n", marker, request.URL.Path)
+	}))
+	defer server.Close()
+	for index := range 2 {
+		if err := fixture.application.AddProfile(context.Background(), fmt.Sprintf("远程-%d", index), fmt.Sprintf("%s/%d", server.URL, index), time.Hour); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fixture.application.UseProfile(context.Background(), "远程-0"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(fixture.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.runner.mu.Lock()
+	fixture.runner.active = true
+	fixture.runner.restartFailures = 2
+	fixture.runner.mu.Unlock()
+	updating.Store(true)
+
+	err = fixture.application.UpdateProfiles(context.Background(), domain.ProfileUpdateOptions{All: true})
+	if err == nil || !strings.Contains(err.Error(), "回滚失败") {
+		t.Fatalf("bulk update error = %v, want rollback failure", err)
+	}
+	if got := updateRequests.Load(); got != 1 {
+		t.Fatalf("update requests = %d, want only the active profile", got)
+	}
+	after, readErr := os.ReadFile(fixture.configPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatalf("active config content was not restored\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+func TestProfileBatchTreatsUnknownCommitFailureAsFatal(t *testing.T) {
+	fixture := newTransactionFixture(t)
+	state, store, err := fixture.application.rootStateSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profiles, err := store.List()
+	if err != nil || len(profiles) == 0 {
+		t.Fatalf("profiles = %#v, %v", profiles, err)
+	}
+	batchErrors, fatalErr := fixture.application.commitProfileUpdateBatch(context.Background(), state, store, []preparedProfileUpdate{{target: profiles[0]}})
+	if len(batchErrors) != 1 || fatalErr == nil || !strings.Contains(fatalErr.Error(), "invalid prepared profile update") {
+		t.Fatalf("batch errors = %#v, fatal = %v", batchErrors, fatalErr)
+	}
+}
+
 func TestPublicProfilesNeverContainSourcesOrValidators(t *testing.T) {
 	root := t.TempDir()
 	paths := testPaths(root)
@@ -414,6 +673,32 @@ func TestStatusUsesSnapshotWhileServiceIsStopped(t *testing.T) {
 	}
 }
 
+func TestStatusCancelsSpeculativeTelemetryWhenServiceIsStopped(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+	api, err := mihomo.New(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	application := &App{
+		paths: testPaths(t.TempDir()), runner: &fakeRunner{}, euid: func() int { return 1000 },
+		client: &clientState{Service: "mihomo.service"}, api: api,
+	}
+	started := time.Now()
+	status, err := application.Status(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Service.Active {
+		t.Fatalf("stopped service reported active: %#v", status.Service)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("stopped status waited for speculative telemetry: %s", elapsed)
+	}
+}
+
 func TestStatusLiveAPIOverridesPublicSnapshot(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
@@ -460,6 +745,193 @@ func TestStatusLiveAPIOverridesPublicSnapshot(t *testing.T) {
 	}
 	if !status.ConfigAvailable || status.Mode != domain.ModeGlobal || status.MixedPort != 9999 || !status.TUN || !status.AllowLAN || !status.IPv6 || status.LogLevel != "debug" {
 		t.Fatalf("live config did not override snapshot: %#v", status)
+	}
+}
+
+func TestStatusFetchesCoreAndTelemetryConcurrently(t *testing.T) {
+	memoryStarted := make(chan struct{})
+	var memoryOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/version":
+			_, _ = writer.Write([]byte(`{"version":"1.20.0"}`))
+		case "/configs":
+			select {
+			case <-memoryStarted:
+				_, _ = writer.Write([]byte(`{"mode":"rule","mixed-port":7890,"log-level":"info","tun":{"enable":false}}`))
+			case <-request.Context().Done():
+			}
+		case "/memory":
+			memoryOnce.Do(func() { close(memoryStarted) })
+			_, _ = writer.Write([]byte(`{"inuse":9}`))
+		case "/connections":
+			_, _ = writer.Write([]byte(`{"downloadTotal":12,"uploadTotal":11,"connections":[]}`))
+		case "/traffic":
+			_, _ = writer.Write([]byte(`{"up":3,"down":4}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	api, err := mihomo.New(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	application := &App{
+		paths: testPaths(t.TempDir()), runner: &fakeRunner{active: true}, euid: func() int { return 1000 },
+		client: &clientState{Service: "mihomo.service"}, api: api,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	status, err := application.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Memory != 9 || status.Traffic.Up != 3 || status.Traffic.Down != 4 || status.Traffic.UpTotal != 11 || status.Traffic.DownTotal != 12 {
+		t.Fatalf("concurrent status = %#v", status)
+	}
+}
+
+func TestCoreStatusAndOverviewFetchOnlyTheirOwnEndpoints(t *testing.T) {
+	var requestMu sync.Mutex
+	requests := make(map[string]int)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requestMu.Lock()
+		requests[request.URL.Path]++
+		requestMu.Unlock()
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/version":
+			_, _ = writer.Write([]byte(`{"version":"1.20.0"}`))
+		case "/configs":
+			_, _ = writer.Write([]byte(`{"mode":"rule","mixed-port":7890,"log-level":"info","tun":{"enable":false}}`))
+		case "/traffic":
+			_, _ = writer.Write([]byte(`{"up":1,"down":2}`))
+		case "/memory":
+			_, _ = writer.Write([]byte(`{"inuse":3}`))
+		case "/connections":
+			_, _ = writer.Write([]byte(`{"downloadTotal":4,"uploadTotal":5,"connections":[]}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	api, err := mihomo.New(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := testPaths(t.TempDir())
+	application := &App{
+		paths: paths, runner: &fakeRunner{active: true}, euid: func() int { return 1000 },
+		client: &clientState{Service: "mihomo.service"}, api: api,
+	}
+	for range 2 {
+		if _, err := application.CoreStatus(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	requestMu.Lock()
+	if requests["/version"] != 1 || requests["/configs"] != 2 || requests["/traffic"] != 0 || requests["/memory"] != 0 || requests["/connections"] != 0 {
+		t.Fatalf("core status requests = %#v", requests)
+	}
+	requestMu.Unlock()
+	telemetry, err := application.OverviewTelemetry(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if telemetry.Memory != 3 || telemetry.Traffic.UpTotal != 5 || telemetry.Traffic.DownTotal != 4 ||
+		!telemetry.MemoryValid || !telemetry.ConnectionCountValid || !telemetry.TrafficTotalsValid {
+		t.Fatalf("telemetry = %#v", telemetry)
+	}
+	requestMu.Lock()
+	if requests["/traffic"] != 0 || requests["/memory"] != 1 || requests["/connections"] != 1 {
+		t.Fatalf("overview telemetry requests = %#v", requests)
+	}
+	requestMu.Unlock()
+}
+
+func TestOverviewTelemetryReportsPartialFieldValidity(t *testing.T) {
+	tests := []struct {
+		name             string
+		memoryFails      bool
+		connectionsFails bool
+		wantMemory       int64
+		wantMemoryValid  bool
+		wantConnections  bool
+	}{
+		{name: "connection snapshot supplies zero memory", memoryFails: true, wantMemoryValid: true, wantConnections: true},
+		{name: "memory survives connection failure", connectionsFails: true, wantMemory: 7, wantMemoryValid: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				switch request.URL.Path {
+				case "/memory":
+					if test.memoryFails {
+						http.Error(writer, "memory unavailable", http.StatusServiceUnavailable)
+						return
+					}
+					_, _ = writer.Write([]byte(`{"inuse":7}`))
+				case "/connections":
+					if test.connectionsFails {
+						http.Error(writer, "connections unavailable", http.StatusServiceUnavailable)
+						return
+					}
+					_, _ = writer.Write([]byte(`{"memory":0,"downloadTotal":4,"uploadTotal":5,"connections":[]}`))
+				default:
+					http.NotFound(writer, request)
+				}
+			}))
+			defer server.Close()
+			api, err := mihomo.New(server.URL, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			application := &App{api: api, euid: func() int { return 1000 }}
+			telemetry, err := application.OverviewTelemetry(context.Background())
+			if err == nil {
+				t.Fatal("partial telemetry failure returned nil error")
+			}
+			if telemetry.Memory != test.wantMemory || telemetry.MemoryValid != test.wantMemoryValid ||
+				telemetry.ConnectionCountValid != test.wantConnections || telemetry.TrafficTotalsValid != test.wantConnections {
+				t.Fatalf("telemetry = %#v", telemetry)
+			}
+		})
+	}
+}
+
+func TestGroupDelayAtURLAvoidsProxySnapshot(t *testing.T) {
+	const testURL = "https://probe.example/generate_204"
+	proxyRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/proxies":
+			proxyRequests++
+			http.Error(writer, "unexpected", http.StatusInternalServerError)
+		case "/group/AUTO/delay":
+			if got := request.URL.Query().Get("url"); got != testURL {
+				t.Errorf("test URL = %q", got)
+			}
+			_, _ = writer.Write([]byte(`{"Node":88}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	api, err := mihomo.New(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	application := &App{api: api, euid: func() int { return 1000 }}
+	delays, err := application.TestGroupAtURL(context.Background(), "AUTO", testURL)
+	if err != nil || delays["Node"] != 88 {
+		t.Fatalf("TestGroupAtURL() = %#v, %v", delays, err)
+	}
+	if proxyRequests != 0 {
+		t.Fatalf("TestGroupAtURL requested /proxies %d times", proxyRequests)
 	}
 }
 
@@ -538,6 +1010,21 @@ func TestSetConfigRejectsInvalidValueBeforeMutation(t *testing.T) {
 	}
 	if calls := runner.snapshotCalls(); len(calls) != 0 {
 		t.Fatalf("invalid setting executed host commands: %v", calls)
+	}
+}
+
+func TestRebuildAPIClearsClientForInvalidController(t *testing.T) {
+	valid, err := mihomo.New("127.0.0.1:9090", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	application := &App{
+		state: &persistedState{Controller: "not a controller"},
+		api:   valid,
+	}
+	application.rebuildAPI()
+	if application.api != nil {
+		t.Fatal("invalid controller retained the previous API client")
 	}
 }
 

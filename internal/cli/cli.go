@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -17,16 +18,18 @@ import (
 	"github.com/spf13/cobra"
 
 	"mihomoctl/internal/domain"
+	"mihomoctl/internal/profile"
 	"mihomoctl/internal/tui"
 )
 
 const (
-	ExitOK          = 0
-	ExitFailure     = 1
-	ExitInvalid     = 2
-	ExitPermission  = 3
-	ExitUnavailable = 4
-	maxProfileInput = 10 << 20
+	ExitOK                = 0
+	ExitFailure           = 1
+	ExitInvalid           = 2
+	ExitPermission        = 3
+	ExitUnavailable       = 4
+	maxProfileSourceInput = int(profile.DefaultMaxSourceBytes)
+	maxProfileInput       = maxProfileSourceInput + len(profile.InlineSnapshotPrefix)
 )
 
 var logSampleTimeout = 2 * time.Second
@@ -44,6 +47,7 @@ type Backend interface {
 	UpdateProfiles(context.Context, domain.ProfileUpdateOptions) error
 	SetConfig(context.Context, string, string) error
 	SyncPublicState(context.Context) error
+	SyncClientState(context.Context) error
 	ScheduleStatus(context.Context) (domain.ScheduleStatus, error)
 	Doctor(context.Context, bool) ([]domain.DoctorCheck, error)
 }
@@ -271,13 +275,12 @@ func (a *application) serviceCommand() *cobra.Command {
 		Short: "启用开机启动",
 		Args:  noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if err := a.backend.Service(cmd.Context(), "enable"); err != nil {
-				return err
-			}
+			action := "enable"
 			if now {
-				if err := a.backend.Service(cmd.Context(), "start"); err != nil {
-					return err
-				}
+				action = "enable-now"
+			}
+			if err := a.backend.Service(cmd.Context(), action); err != nil {
+				return err
 			}
 			return a.writeResult(map[string]any{"action": "enable", "started": now}, "开机启动已启用")
 		},
@@ -360,6 +363,17 @@ func (a *application) configCommand() *cobra.Command {
 				return err
 			}
 			return a.writeResult(map[string]any{"key": key, "value": value}, key+" 已更新")
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "sync-client",
+		Short: "为当前 sudo 用户同步本地控制器凭据",
+		Args:  noArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := a.backend.SyncClientState(cmd.Context()); err != nil {
+				return err
+			}
+			return a.writeResult(map[string]any{"synced": true}, "客户端状态已同步")
 		},
 	})
 	cmd.AddCommand(&cobra.Command{
@@ -520,10 +534,27 @@ func (a *application) profileCommand() *cobra.Command {
 			if err := requireNonBlank("配置来源", source); err != nil {
 				return err
 			}
+			immutable := bytes.HasPrefix([]byte(source), []byte(profile.InlineSnapshotPrefix))
+			if elevation, ok := a.backend.(interface{ NeedsElevation() bool }); ok && elevation.NeedsElevation() {
+				if info, statErr := os.Stat(source); statErr == nil && !info.IsDir() {
+					immutable = true
+				}
+			}
 			if err := a.backend.AddProfile(cmd.Context(), name, source, interval); err != nil {
 				return err
 			}
-			return a.writeResult(map[string]any{"name": name, "source_added": true, "update_interval": interval.String()}, "配置已添加")
+			result := map[string]any{
+				"name":            name,
+				"source_added":    true,
+				"update_interval": interval.String(),
+				"immutable":       immutable,
+			}
+			message := "配置已添加"
+			if immutable {
+				result["update_interval"] = (time.Duration(0)).String()
+				message = "本地配置快照已添加"
+			}
+			return a.writeResult(result, message)
 		},
 	}
 	add.Flags().StringVar(&name, "name", "", "配置名称（默认从来源推导）")
@@ -801,11 +832,11 @@ func sortedKeys[V any](values map[string]V) []string {
 }
 
 func readProfileInput(reader io.Reader) (string, error) {
-	content, err := io.ReadAll(io.LimitReader(reader, maxProfileInput+1))
+	content, err := io.ReadAll(io.LimitReader(reader, int64(maxProfileInput+1)))
 	if err != nil {
 		return "", fmt.Errorf("读取标准输入失败: %w", err)
 	}
-	if len(content) > maxProfileInput {
+	if len(content) > maxProfileInput || (len(content) > maxProfileSourceInput && !bytes.HasPrefix(content, []byte(profile.InlineSnapshotPrefix))) {
 		return "", invalidf("标准输入不能超过 10 MiB")
 	}
 	if len(content) == 0 {

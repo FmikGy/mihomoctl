@@ -13,7 +13,7 @@ import (
 var unitNamePattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.@:-]*\.(service|timer)$`)
 
 // Systemd controls one fixed service unit. It never elevates privileges on its
-// own; callers can use SudoReexecutor at the CLI boundary when required.
+// own; callers are responsible for enforcing privilege at the application boundary.
 type Systemd struct {
 	Runner CommandRunner
 	Unit   string
@@ -62,6 +62,12 @@ func (s *Systemd) Start(ctx context.Context) error   { return s.action(ctx, "sta
 func (s *Systemd) Stop(ctx context.Context) error    { return s.action(ctx, "stop") }
 func (s *Systemd) Enable(ctx context.Context) error  { return s.action(ctx, "enable") }
 func (s *Systemd) Disable(ctx context.Context) error { return s.action(ctx, "disable") }
+func (s *Systemd) EnableNow(ctx context.Context) error {
+	return s.actionWithOptions(ctx, "enable", "--now")
+}
+func (s *Systemd) DisableNow(ctx context.Context) error {
+	return s.actionWithOptions(ctx, "disable", "--now")
+}
 
 func (s *Systemd) Restart(ctx context.Context) error {
 	if err := s.validate(); err != nil {
@@ -74,6 +80,10 @@ func (s *Systemd) Restart(ctx context.Context) error {
 }
 
 func (s *Systemd) action(ctx context.Context, action string) error {
+	return s.actionWithOptions(ctx, action)
+}
+
+func (s *Systemd) actionWithOptions(ctx context.Context, action string, options ...string) error {
 	if err := s.validate(); err != nil {
 		return err
 	}
@@ -82,7 +92,9 @@ func (s *Systemd) action(ctx context.Context, action string) error {
 	default:
 		return fmt.Errorf("unsupported systemd action %q", action)
 	}
-	if _, err := s.Runner.Run(ctx, "systemctl", action, "--", s.Unit); err != nil {
+	args := append([]string{action}, options...)
+	args = append(args, "--", s.Unit)
+	if _, err := s.Runner.Run(ctx, "systemctl", args...); err != nil {
 		return fmt.Errorf("systemctl %s %s: %w", action, s.Unit, err)
 	}
 	return nil

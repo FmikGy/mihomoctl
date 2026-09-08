@@ -7,13 +7,26 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	appbackend "mihomoctl/internal/app"
 	"mihomoctl/internal/domain"
 )
+
+type cliPrivilegeExecutor struct {
+	command appbackend.PrivilegeCommand
+}
+
+func (e *cliPrivilegeExecutor) Run(_ context.Context, command appbackend.PrivilegeCommand) (int, error) {
+	command.Args = append([]string(nil), command.Args...)
+	e.command = command
+	_, _ = io.WriteString(command.Stderr, "sudo: a password is required\n")
+	return 1, errors.New("sudo failed")
+}
 
 type addCall struct {
 	name     string
@@ -39,25 +52,30 @@ type fakeBackend struct {
 	logContext    context.Context
 	err           error
 
-	initOptions    domain.InitOptions
-	initCalls      int
-	updateOptions  domain.ProfileUpdateOptions
-	serviceActions []string
-	mode           domain.Mode
-	tun            *bool
-	schedule       *bool
-	selection      [2]string
-	add            addCall
-	config         configCall
-	syncCalls      int
-	usedProfile    string
-	removedProfile string
-	closedID       string
-	closedAll      bool
-	doctorFix      bool
-	tuiRuns        int
-	tuiNoColor     bool
+	initOptions     domain.InitOptions
+	initCalls       int
+	updateOptions   domain.ProfileUpdateOptions
+	serviceActions  []string
+	mode            domain.Mode
+	tun             *bool
+	schedule        *bool
+	selection       [2]string
+	add             addCall
+	config          configCall
+	syncCalls       int
+	clientSyncCalls int
+	usedProfile     string
+	removedProfile  string
+	closedID        string
+	closedAll       bool
+	doctorFix       bool
+	tuiRuns         int
+	tuiNoColor      bool
 }
+
+type elevatedFakeBackend struct{ *fakeBackend }
+
+func (elevatedFakeBackend) NeedsElevation() bool { return true }
 
 func (f *fakeBackend) Status(context.Context) (domain.RuntimeStatus, error) {
 	return f.statusValue, f.err
@@ -163,6 +181,11 @@ func (f *fakeBackend) SyncPublicState(context.Context) error {
 	return f.err
 }
 
+func (f *fakeBackend) SyncClientState(context.Context) error {
+	f.clientSyncCalls++
+	return f.err
+}
+
 func (f *fakeBackend) ScheduleStatus(context.Context) (domain.ScheduleStatus, error) {
 	return f.scheduleValue, f.err
 }
@@ -215,7 +238,7 @@ func TestCommandRoutingAndFlags(t *testing.T) {
 		if _, _, err := runCommand(t, backend, "service", "enable", "--now"); err != nil {
 			t.Fatal(err)
 		}
-		if want := []string{"enable", "start"}; !reflect.DeepEqual(backend.serviceActions, want) {
+		if want := []string{"enable-now"}; !reflect.DeepEqual(backend.serviceActions, want) {
 			t.Fatalf("service actions = %v, want %v", backend.serviceActions, want)
 		}
 	})
@@ -257,6 +280,17 @@ func TestCommandRoutingAndFlags(t *testing.T) {
 		}
 	})
 
+	t.Run("client state sync", func(t *testing.T) {
+		backend := &fakeBackend{}
+		stdout, _, err := runCommand(t, backend, "config", "sync-client", "--output", "json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if backend.clientSyncCalls != 1 || !strings.Contains(stdout, `"synced":true`) {
+			t.Fatalf("client sync routing failed: calls=%d output=%q", backend.clientSyncCalls, stdout)
+		}
+	})
+
 	t.Run("proxy profile and connections", func(t *testing.T) {
 		backend := &fakeBackend{}
 		if _, _, err := runCommand(t, backend, "proxy", "select", "PROXY", "香港 01"); err != nil {
@@ -290,6 +324,28 @@ func TestCommandRoutingAndFlags(t *testing.T) {
 		}
 		if backend.add.name != "stdin" || backend.add.source != source {
 			t.Fatalf("add call = %#v", backend.add)
+		}
+	})
+
+	t.Run("local profile output reports immutable snapshot", func(t *testing.T) {
+		backend := &fakeBackend{}
+		path := filepath.Join(t.TempDir(), "local.yaml")
+		if err := os.WriteFile(path, []byte("proxies: []\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		stdout, _, err := runCommand(t, elevatedFakeBackend{backend}, "profile", "add", path, "--output", "json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(stdout, `"immutable":true`) || !strings.Contains(stdout, `"update_interval":"0s"`) {
+			t.Fatalf("local profile output = %q", stdout)
+		}
+		stdout, _, err = runCommand(t, backend, "profile", "add", path, "--output", "json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(stdout, `"immutable":false`) || !strings.Contains(stdout, "update_interval") {
+			t.Fatalf("root-style local profile output = %q", stdout)
 		}
 	})
 
@@ -660,4 +716,41 @@ func TestExecutePrintsErrorsAndReturnsStableCodes(t *testing.T) {
 			t.Fatalf("code=%d", code)
 		}
 	})
+}
+
+func TestCLIInitializationUsesInteractiveSudoAndReturnsPermissionCode(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := &cliPrivilegeExecutor{}
+	backend, err := appbackend.New(
+		appbackend.WithPaths(appbackend.Paths{
+			ConfigFile: "/etc/mihomoctl/config.yaml", DataDir: "/var/lib/mihomoctl",
+			ProfileRoot: "/var/lib/mihomoctl/store", BackupDir: "/var/lib/mihomoctl/backups",
+			OperationLock: "/var/lib/mihomoctl/.operation.lock", PublicFile: "/var/lib/mihomoctl/public.json",
+			ClientFile:     filepath.Join(home, ".config", "mihomoctl", "client.yaml"),
+			DefaultService: "mihomo.service", TimerUnit: "mihomoctl-update.timer",
+		}),
+		appbackend.WithPrivilegeExecutor(executor),
+		appbackend.WithEUID(func() int { return 1000 }),
+		appbackend.WithExecutable(func() (string, error) { return "/usr/bin/mihomoctl", nil }),
+		appbackend.WithExecutableValidator(func(path string) (string, error) { return path, nil }),
+		appbackend.WithSudoPathResolver(func() (string, error) { return "/usr/bin/sudo", nil }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	previous := os.Args
+	os.Args = []string{"mihomoctl", "init"}
+	t.Cleanup(func() { os.Args = previous })
+	var stderr bytes.Buffer
+	code := Execute(context.Background(), backend, io.Discard, &stderr)
+	if code != ExitPermission || !strings.Contains(stderr.String(), "sudo 身份验证未完成") {
+		t.Fatalf("code=%d stderr=%q", code, stderr.String())
+	}
+	if executor.command.Name != "/usr/bin/sudo" || len(executor.command.Args) == 0 || executor.command.Args[0] == "-n" {
+		t.Fatalf("CLI sudo command = %q %#v", executor.command.Name, executor.command.Args)
+	}
 }

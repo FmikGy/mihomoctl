@@ -9,11 +9,21 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"mihomoctl/internal/domain"
+	"mihomoctl/internal/platform"
 	"mihomoctl/internal/profile"
 )
+
+const profileUpdateBatchSize = 4
+
+type preparedProfileUpdate struct {
+	target   domain.Profile
+	prepared profile.PreparedUpdate
+	err      error
+}
 
 func (a *App) Profiles(context.Context) ([]domain.Profile, error) {
 	if a.isRoot() {
@@ -52,16 +62,31 @@ func (a *App) AddProfile(ctx context.Context, name, source string, interval time
 		if err := a.requireManagedInstallation(); err != nil {
 			return err
 		}
+		if detectProfileKind(source) == domain.ProfileLocal {
+			if name == "" {
+				name = defaultProfileName(source)
+			}
+			content, err := profile.ReadLocalSource(source)
+			if err != nil {
+				return err
+			}
+			source = profile.InlineSnapshotPrefix + string(content)
+		}
 		args := []string{"profile", "add", "-", "--interval", interval.String(), "--output", "json"}
 		if name != "" {
 			args = append(args, "--name", name)
 		}
 		return a.runElevated(ctx, args, source)
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	return a.withMutation(ctx, func() error {
+		return a.addProfileRoot(ctx, name, source, interval)
+	})
+}
 
-	_, store, err := a.requireRootState()
+func (a *App) addProfileRoot(ctx context.Context, name, source string, interval time.Duration) error {
+	a.mu.Lock()
+	state, store, err := a.requireRootState()
+	a.mu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -77,17 +102,65 @@ func (a *App) AddProfile(ctx context.Context, name, source string, interval time
 			return fmt.Errorf("配置名称 %q 已存在", name)
 		}
 	}
-
-	kind := detectProfileKind(source)
-	request := profile.AddRequest{Name: name, Kind: kind, Source: source, UpdateInterval: interval}
-	if _, err := store.Add(ctx, request); err != nil {
-		return err
-	}
-	profiles, err = store.List()
+	storeCheckpoint, err := store.Checkpoint()
 	if err != nil {
 		return err
 	}
-	return a.writePublicProfiles(profiles)
+	rollback, err := a.fileRollback(a.paths.PublicFile, a.paths.ClientFile)
+	if err != nil {
+		return err
+	}
+	rollback.add("配置存储", func(context.Context) error { return store.RestoreCheckpoint(storeCheckpoint) })
+
+	var created domain.Profile
+	if strings.HasPrefix(source, profile.InlineSnapshotPrefix) {
+		created, err = store.AddSnapshot(name, []byte(strings.TrimPrefix(source, profile.InlineSnapshotPrefix)))
+	} else {
+		kind := detectProfileKind(source)
+		if err := validateLocalProfilePrivilege(runningUnderSudo(), kind); err != nil {
+			return err
+		}
+		request := profile.AddRequest{Name: name, Kind: kind, Source: source, UpdateInterval: interval}
+		created, err = store.Add(ctx, request)
+	}
+	if err != nil {
+		return a.failAndReload(ctx, rollback, err)
+	}
+	if created.Active {
+		config, configErr := store.Config(created.ID)
+		var applied *appliedProfileConfig
+		if configErr == nil {
+			applied, configErr = a.applyProfileConfig(ctx, state, config)
+		}
+		if configErr != nil {
+			return a.failAndReload(ctx, rollback, configErr)
+		}
+		rollback.add("Mihomo 配置", applied.rollback)
+		a.mu.Lock()
+		err = a.saveClient(state, created.Name)
+		a.mu.Unlock()
+		if err != nil {
+			return a.failAndReload(ctx, rollback, err)
+		}
+	}
+	profiles, err = store.List()
+	if err != nil {
+		return a.failAndReload(ctx, rollback, err)
+	}
+	a.mu.Lock()
+	err = a.writePublicProfiles(profiles)
+	a.mu.Unlock()
+	if err != nil {
+		return a.failAndReload(ctx, rollback, err)
+	}
+	return nil
+}
+
+func validateLocalProfilePrivilege(sudoChild bool, kind domain.ProfileKind) error {
+	if sudoChild && kind == domain.ProfileLocal {
+		return &InvalidInputError{Cause: errors.New("sudo 子进程拒绝直接读取本地配置路径；请以普通用户运行 mihomoctl，由程序在提权前创建安全快照")}
+	}
+	return nil
 }
 
 func (a *App) UpdateProfile(ctx context.Context, name string) error {
@@ -111,9 +184,18 @@ func (a *App) UpdateProfiles(ctx context.Context, options domain.ProfileUpdateOp
 		}
 		return a.runElevated(ctx, args, "")
 	}
+	return a.withMutation(ctx, func() error {
+		return a.updateProfilesRoot(ctx, options)
+	})
+}
+
+func (a *App) updateProfilesRoot(ctx context.Context, options domain.ProfileUpdateOptions) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	state, store, err := a.requireRootState()
+	a.mu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -134,37 +216,126 @@ func (a *App) UpdateProfiles(ctx context.Context, options domain.ProfileUpdateOp
 		return err
 	}
 
+	// Keep the active profile in its own first batch. Other profiles are
+	// prepared concurrently in bounded batches so source, normalized config,
+	// and rollback data cannot grow with the total subscription count.
+	sort.SliceStable(targets, func(i, j int) bool { return targets[i].Active && !targets[j].Active })
 	var updateErrors []error
-	for _, target := range targets {
-		snapshot, snapshotErr := store.Snapshot(target.ID)
-		if snapshotErr != nil {
-			updateErrors = append(updateErrors, fmt.Errorf("%s: %w", target.Name, snapshotErr))
-			continue
+	for start := 0; start < len(targets); {
+		end := min(start+profileUpdateBatchSize, len(targets))
+		if targets[start].Active {
+			end = start + 1
 		}
-		result, updateErr := store.Update(ctx, target.ID)
-		if updateErr != nil {
-			updateErrors = append(updateErrors, fmt.Errorf("%s: %w", target.Name, updateErr))
-			continue
+		prepared := prepareProfileUpdateBatch(ctx, store, targets[start:end])
+		if err := ctx.Err(); err != nil {
+			return errors.Join(joinErrors("部分配置更新失败", updateErrors), err)
 		}
-		if target.Active && result.Changed {
-			config, configErr := store.Config(target.ID)
-			if configErr == nil {
-				configErr = a.applyProfileConfig(ctx, state, config)
-			}
-			if configErr != nil {
-				restoreErr := store.Restore(snapshot)
-				updateErrors = append(updateErrors, fmt.Errorf("%s 激活失败: %w", target.Name, errors.Join(configErr, restoreErr)))
-			}
+		batchErrors, fatalErr := a.commitProfileUpdateBatch(ctx, state, store, prepared)
+		updateErrors = append(updateErrors, batchErrors...)
+		if fatalErr != nil {
+			return errors.Join(joinErrors("部分配置更新失败", updateErrors), fatalErr)
 		}
-	}
-	profiles, listErr := store.List()
-	if listErr == nil {
-		listErr = a.writePublicProfiles(profiles)
-	}
-	if listErr != nil {
-		updateErrors = append(updateErrors, listErr)
+		start = end
 	}
 	return joinErrors("部分配置更新失败", updateErrors)
+}
+
+func prepareProfileUpdateBatch(ctx context.Context, store *profile.Store, targets []domain.Profile) []preparedProfileUpdate {
+	prepared := make([]preparedProfileUpdate, len(targets))
+	var wait sync.WaitGroup
+	for index, target := range targets {
+		index, target := index, target
+		prepared[index].target = target
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			prepared[index].prepared, prepared[index].err = store.PrepareUpdate(ctx, target.ID)
+		}()
+	}
+	wait.Wait()
+	return prepared
+}
+
+func (a *App) commitProfileUpdateBatch(
+	ctx context.Context,
+	state persistedState,
+	store *profile.Store,
+	prepared []preparedProfileUpdate,
+) ([]error, error) {
+	ids := make([]string, 0, len(prepared))
+	var updateErrors []error
+	for _, item := range prepared {
+		if item.err != nil {
+			updateErrors = append(updateErrors, fmt.Errorf("%s: %w", item.target.Name, item.err))
+			continue
+		}
+		ids = append(ids, item.target.ID)
+	}
+	if len(ids) == 0 {
+		return updateErrors, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return updateErrors, err
+	}
+	storeCheckpoint, err := store.Checkpoint(ids...)
+	if err != nil {
+		return updateErrors, err
+	}
+	rollback, err := a.fileRollback(a.paths.PublicFile)
+	if err != nil {
+		return updateErrors, err
+	}
+	rollback.add("配置存储", func(context.Context) error { return store.RestoreCheckpoint(storeCheckpoint) })
+
+	committed := false
+	for _, item := range prepared {
+		if item.err != nil {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return updateErrors, a.failAndReload(ctx, rollback, err)
+		}
+		result, updateErr := store.CommitUpdate(item.prepared)
+		if updateErr != nil {
+			updateErrors = append(updateErrors, fmt.Errorf("%s: %w", item.target.Name, updateErr))
+			if errors.Is(updateErr, profile.ErrStaleUpdate) {
+				continue
+			}
+			return updateErrors, a.failAndReload(ctx, rollback, updateErr)
+		}
+		committed = true
+		if item.target.Active && result.Changed {
+			config, configErr := store.Config(item.target.ID)
+			var applied *appliedProfileConfig
+			if configErr == nil {
+				applied, configErr = a.applyProfileConfig(ctx, state, config)
+			}
+			if configErr != nil {
+				var applyErr *platform.ApplyError
+				if errors.As(configErr, &applyErr) && applyErr.RollbackErr != nil {
+					return updateErrors, a.failAndReload(ctx, rollback, fmt.Errorf("%s 激活失败且 Mihomo 配置回滚失败: %w", item.target.Name, configErr))
+				}
+				restoreErr := store.RestoreCheckpoint(storeCheckpoint)
+				if restoreErr != nil {
+					return updateErrors, a.failAndReload(ctx, rollback, fmt.Errorf("%s 激活失败且配置存储回滚失败: %w", item.target.Name, errors.Join(configErr, restoreErr)))
+				}
+				updateErrors = append(updateErrors, fmt.Errorf("%s 激活失败: %w", item.target.Name, configErr))
+				return updateErrors, nil
+			}
+			rollback.add("Mihomo 配置", applied.rollback)
+		}
+	}
+	if !committed {
+		return updateErrors, nil
+	}
+	profiles, err := store.List()
+	if err == nil {
+		err = a.publishProfiles(profiles)
+	}
+	if err != nil {
+		return updateErrors, a.failAndReload(ctx, rollback, err)
+	}
+	return updateErrors, nil
 }
 
 func (a *App) UseProfile(ctx context.Context, name string) error {
@@ -174,9 +345,13 @@ func (a *App) UseProfile(ctx context.Context, name string) error {
 		}
 		return a.runElevated(ctx, []string{"--output", "json", "profile", "use", "--", name}, "")
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	state, store, err := a.requireRootState()
+	return a.withMutation(ctx, func() error {
+		return a.useProfileRoot(ctx, name)
+	})
+}
+
+func (a *App) useProfileRoot(ctx context.Context, name string) error {
+	state, store, err := a.rootStateSnapshot()
 	if err != nil {
 		return err
 	}
@@ -188,20 +363,37 @@ func (a *App) UseProfile(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	if err := a.applyProfileConfig(ctx, state, config); err != nil {
-		return err
-	}
-	if _, err := store.Use(target.ID); err != nil {
-		return err
-	}
-	profiles, err := store.List()
+	storeCheckpoint, err := store.Checkpoint()
 	if err != nil {
 		return err
 	}
-	if err := a.writePublicProfiles(profiles); err != nil {
+	rollback, err := a.fileRollback(a.paths.PublicFile, a.paths.ClientFile)
+	if err != nil {
 		return err
 	}
-	return a.saveClient(state, target.Name)
+	rollback.add("配置存储", func(context.Context) error { return store.RestoreCheckpoint(storeCheckpoint) })
+	applied, err := a.applyProfileConfig(ctx, state, config)
+	if err != nil {
+		return err
+	}
+	rollback.add("Mihomo 配置", applied.rollback)
+	if _, err := store.Use(target.ID); err != nil {
+		return a.failAndReload(ctx, rollback, err)
+	}
+	profiles, err := store.List()
+	if err != nil {
+		return a.failAndReload(ctx, rollback, err)
+	}
+	if err := a.publishProfiles(profiles); err != nil {
+		return a.failAndReload(ctx, rollback, err)
+	}
+	a.mu.Lock()
+	err = a.saveClient(state, target.Name)
+	a.mu.Unlock()
+	if err != nil {
+		return a.failAndReload(ctx, rollback, err)
+	}
+	return nil
 }
 
 func (a *App) RemoveProfile(ctx context.Context, name string) error {
@@ -211,6 +403,12 @@ func (a *App) RemoveProfile(ctx context.Context, name string) error {
 		}
 		return a.runElevated(ctx, []string{"--output", "json", "profile", "remove", "--", name}, "")
 	}
+	return a.withMutation(ctx, func() error {
+		return a.removeProfileRoot(ctx, name)
+	})
+}
+
+func (a *App) removeProfileRoot(ctx context.Context, name string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	_, store, err := a.requireRootState()
@@ -224,14 +422,26 @@ func (a *App) RemoveProfile(ctx context.Context, name string) error {
 	if target.Active {
 		return errors.New("不能删除当前活动配置，请先切换到其他配置")
 	}
-	if err := store.Remove(target.ID); err != nil {
-		return err
-	}
-	profiles, err := store.List()
+	storeCheckpoint, err := store.Checkpoint(target.ID)
 	if err != nil {
 		return err
 	}
-	return a.writePublicProfiles(profiles)
+	rollback, err := a.fileRollback(a.paths.PublicFile)
+	if err != nil {
+		return err
+	}
+	rollback.add("配置存储", func(context.Context) error { return store.RestoreCheckpoint(storeCheckpoint) })
+	if err := store.Remove(target.ID); err != nil {
+		return rollback.fail(ctx, err)
+	}
+	profiles, err := store.List()
+	if err != nil {
+		return rollback.fail(ctx, err)
+	}
+	if err := a.writePublicProfiles(profiles); err != nil {
+		return rollback.fail(ctx, err)
+	}
+	return nil
 }
 
 func resolveProfile(store *profile.Store, value string) (domain.Profile, error) {

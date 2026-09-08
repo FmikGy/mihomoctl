@@ -12,14 +12,36 @@ const (
 	DefaultUpdateInterval = 24 * time.Hour
 	DefaultHTTPTimeout    = 30 * time.Second
 	DefaultMaxSourceBytes = int64(10 << 20)
+	// InlineSnapshotPrefix marks content read by the unprivileged caller
+	// before it crosses the sudo boundary.
+	InlineSnapshotPrefix = "mihomoctl:immutable-snapshot:v1\n"
 )
 
 var (
 	ErrNotFound       = errors.New("profile not found")
 	ErrNoActive       = errors.New("no active profile")
 	ErrImmutable      = errors.New("profile is an immutable snapshot")
+	ErrStaleUpdate    = errors.New("profile changed while update was being prepared")
 	ErrSourceTooLarge = errors.New("profile source exceeds size limit")
 )
+
+// PreparedUpdate is an opaque, validated profile refresh. It may contain
+// subscription credentials and source content, so callers must not log it.
+type PreparedUpdate struct {
+	store       *Store
+	profile     domain.Profile
+	originHash  [32]byte
+	sourceHash  [32]byte
+	configHash  [32]byte
+	raw         []byte
+	config      []byte
+	fetched     fetchResult
+	preparedAt  time.Time
+	notModified bool
+}
+
+func (PreparedUpdate) String() string   { return "[redacted prepared profile update]" }
+func (PreparedUpdate) GoString() string { return "profile.PreparedUpdate{[redacted]}" }
 
 // AddRequest describes a remote URL, local YAML file, or URI subscription.
 type AddRequest struct {
@@ -60,7 +82,8 @@ type StoreOption func(*Store)
 func WithHTTPClient(client *http.Client) StoreOption {
 	return func(s *Store) {
 		if client != nil {
-			s.client = client
+			clone := *client
+			s.client = &clone
 		}
 	}
 }

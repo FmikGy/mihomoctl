@@ -82,7 +82,7 @@ func (m Model) renderHeader() string {
 	if m.status.Service.Active {
 		state, stateColor = "运行中", c.good
 	}
-	if _, unavailable := m.errors[errorStatus]; unavailable {
+	if _, unavailable := m.errors[errorStatus]; unavailable && !serviceStatusAvailable(m.status.Service) {
 		state, stateColor = "不可用", c.bad
 	}
 	status := lipgloss.NewStyle().Foreground(stateColor).Render("● " + state)
@@ -311,7 +311,7 @@ func overviewColumns(width int, cells ...string) string {
 }
 
 func (m Model) renderProxies(height int) string {
-	groups := m.filteredGroups()
+	groups := m.currentGroupViews()
 	if len(groups) == 0 {
 		detail := "启动 Mihomo 或添加有效配置"
 		if m.filter != "" && len(m.groups) > 0 {
@@ -320,21 +320,23 @@ func (m Model) renderProxies(height int) string {
 		return emptyState("没有可用策略组", detail, m.width, height)
 	}
 	groupIndex := clamp(m.groupCursor, 0, len(groups)-1)
-	group := groups[groupIndex]
-	nodes := filteredProxies(group, m.filter)
+	groupView := groups[groupIndex]
+	group := m.groups[groupView.groupIndex]
+	nodes := groupView.proxies
 	nodeStart, nodeEnd := viewportBounds(len(nodes), m.proxyCursor, m.proxyOffset, m.proxyListCapacity())
 	rowWidth := max(1, m.width-4)
 	position := fmt.Sprintf("组 %s  节点 %s", listPosition(groupIndex, len(groups)), listPosition(m.proxyCursor, len(nodes)))
 	lines := []string{
 		titleLine("策略组 · "+group.Name, position, rowWidth),
-		m.proxyGroupSelector(groups, groupIndex, rowWidth),
+		m.proxyGroupViewSelector(groups, groupIndex, rowWidth),
 		proxyTableHeader(rowWidth),
 	}
 	if len(nodes) == 0 {
 		lines = append(lines, mutedLine("没有匹配节点", rowWidth))
 	}
 	for i := nodeStart; i < nodeEnd; i++ {
-		lines = append(lines, m.proxyTableRow(group, nodes[i], i == m.proxyCursor, rowWidth))
+		proxyIndex := nodes[i].proxyIndex
+		lines = append(lines, m.proxyTableRowAt(group, group.Proxies[proxyIndex], proxyIndex, i == m.proxyCursor, rowWidth))
 	}
 	return renderPage(lines, m.width, height)
 }
@@ -359,12 +361,22 @@ func proxyGroupSelectorLayout(rowWidth, total int) groupSelectorLayout {
 }
 
 func (m Model) proxyGroupSelector(groups []domain.ProxyGroup, selected, rowWidth int) string {
+	return m.proxyGroupSelectorByName(len(groups), selected, rowWidth, func(index int) string { return groups[index].Name })
+}
+
+func (m Model) proxyGroupViewSelector(groups []proxyGroupView, selected, rowWidth int) string {
+	return m.proxyGroupSelectorByName(len(groups), selected, rowWidth, func(index int) string {
+		return m.groups[groups[index].groupIndex].Name
+	})
+}
+
+func (m Model) proxyGroupSelectorByName(total, selected, rowWidth int, nameAt func(int) string) string {
 	rowWidth = max(0, rowWidth)
-	if rowWidth == 0 || len(groups) == 0 {
+	if rowWidth == 0 || total == 0 {
 		return ""
 	}
-	layout := proxyGroupSelectorLayout(rowWidth, len(groups))
-	start, end := viewportBounds(len(groups), selected, m.groupOffset, layout.capacity)
+	layout := proxyGroupSelectorLayout(rowWidth, total)
+	start, end := viewportBounds(total, selected, m.groupOffset, layout.capacity)
 	parts := make([]string, 0, end-start)
 	for index := start; index < end; index++ {
 		current := index == selected
@@ -373,7 +385,7 @@ func (m Model) proxyGroupSelector(groups []domain.ProxyGroup, selected, rowWidth
 			marker = "> "
 		}
 		nameWidth := max(1, layout.cellWidth-lipgloss.Width(marker))
-		label := marker + stableTerminalCell(empty(groups[index].Name, "--"), nameWidth)
+		label := marker + stableTerminalCell(empty(nameAt(index), "--"), nameWidth)
 		style := lipgloss.NewStyle().Foreground(colors().muted)
 		if current {
 			style = lipgloss.NewStyle().Bold(true).Foreground(colors().onAccent).Background(colors().accent)
@@ -388,7 +400,7 @@ func (m Model) proxyGroupSelector(groups []domain.ProxyGroup, selected, rowWidth
 	if start > 0 {
 		left = "< "
 	}
-	if end < len(groups) {
+	if end < total {
 		right = " >"
 	}
 	contentWidth := max(0, rowWidth-lipgloss.Width(left)-lipgloss.Width(right))
@@ -476,7 +488,7 @@ func (m Model) renderProfiles(height int) string {
 }
 
 func (m Model) renderConnections(height int) string {
-	connections := m.filteredConnections()
+	connections := m.currentConnectionViews()
 	if len(connections) == 0 {
 		detail := "连接建立后会自动显示"
 		if m.filter != "" && len(m.connections) > 0 {
@@ -493,7 +505,7 @@ func (m Model) renderConnections(height int) string {
 	}
 	start, end := viewportBounds(len(connections), m.connectionCursor, m.connectionOffset, m.listCapacity())
 	for i := start; i < end; i++ {
-		connection := connections[i]
+		connection := m.connections[connections[i].connectionIndex]
 		target := connection.Host
 		if target == "" {
 			target = connection.Destination
@@ -512,7 +524,7 @@ func (m Model) renderConnections(height int) string {
 
 func (m Model) renderLogs(height int) string {
 	c := colors()
-	logs := m.filteredLogs()
+	logCount := m.logViewLen()
 	state := strings.ToUpper(empty(m.logLevel, "info"))
 	if !m.status.Service.Active {
 		state += "  服务已停止"
@@ -527,17 +539,18 @@ func (m Model) renderLogs(height int) string {
 	}
 	innerWidth := max(1, m.width-4)
 	visible := max(1, height-4)
-	end := clamp(len(logs)-m.logOffset, 0, len(logs))
+	end := clamp(logCount-m.logOffset, 0, logCount)
 	start := max(0, end-visible)
 	position := "等待数据"
-	if len(logs) > 0 {
-		position = fmt.Sprintf("%d-%d/%d", start+1, end, len(logs))
+	if logCount > 0 {
+		position = fmt.Sprintf("%d-%d/%d", start+1, end, logCount)
 	}
 	lines := []string{
 		titleLine("实时日志", state+"  "+position, innerWidth),
 		lipgloss.NewStyle().Foreground(c.muted).Render(padRight("  时间     级别   消息", innerWidth)),
 	}
-	for _, entry := range logs[start:end] {
+	for index := start; index < end; index++ {
+		entry := m.logViewEntry(index)
 		style := lipgloss.NewStyle().Foreground(c.text)
 		switch strings.ToLower(entry.Level) {
 		case "error":
@@ -551,7 +564,7 @@ func (m Model) renderLogs(height int) string {
 		messageWidth := max(1, innerWidth-16)
 		lines = append(lines, style.Render(prefix+"  "+padRight(entry.Message, messageWidth)))
 	}
-	if len(logs) == 0 {
+	if logCount == 0 {
 		message := "等待日志..."
 		if !m.status.Service.Active {
 			message = "Mihomo 服务未运行"
@@ -620,7 +633,13 @@ func (m Model) renderFooter() string {
 	c := colors()
 	message := ""
 	messageStyle := lipgloss.NewStyle().Foreground(c.muted)
-	if m.loading {
+	if m.quitPending {
+		message = "正在取消并完成恢复…"
+	} else if m.authorizing {
+		message = "等待 sudo 授权…"
+	} else if m.privilegedOperation {
+		message = "正在执行管理员操作…"
+	} else if m.loading {
 		message = "正在处理…"
 	} else if m.err != "" {
 		message = "错误  " + safeText(m.err)
@@ -731,16 +750,10 @@ func (m Model) renderInput() string {
 	} else if m.inMode == inputMixedPort {
 		title = "修改混合端口"
 	}
-	value := safeText(m.input.Value())
-	if m.inMode == inputProfile {
-		value = strings.Repeat(string(profileInputMask), len([]rune(m.input.Value())))
-	}
-	if value == "" {
-		value = lipgloss.NewStyle().Foreground(colors().muted).Render(safeText(m.input.Placeholder))
-	}
-	inputWidth := max(12, min(64, m.width-18))
+	inputWidth := m.inputFieldWidth()
+	inputView := m.input.View()
 	field := lipgloss.NewStyle().Foreground(colors().text).Background(colors().surfaceAlt).
-		Render(" " + padRight(value, max(1, inputWidth-2)) + " ")
+		Render(" " + fitLine(inputView, max(1, inputWidth-2)) + " ")
 	lines := []string{sectionTitle(title), "", field}
 	if m.inputError != "" {
 		lines = append(lines, "", lipgloss.NewStyle().Foreground(colors().bad).Render(safeText(m.inputError)))
@@ -1000,7 +1013,7 @@ func proxyTableHeader(rowWidth int) string {
 	}, rowWidth)
 }
 
-func (m Model) proxyTableRow(group domain.ProxyGroup, proxy domain.Proxy, selected bool, rowWidth int) string {
+func (m Model) proxyTableRowAt(group domain.ProxyGroup, proxy domain.Proxy, sourceIndex int, selected bool, rowWidth int) string {
 	c := colors()
 	active := ""
 	if group.Now == proxy.Name {
@@ -1010,7 +1023,6 @@ func (m Model) proxyTableRow(group domain.ProxyGroup, proxy domain.Proxy, select
 	if proxy.Alive {
 		alive, aliveColor = "是", c.good
 	}
-	sourceIndex := proxySourceIndex(group, proxy)
 	testState, delay := m.proxyDisplayState(group.Name, group, sourceIndex)
 	test, testColor := proxyTestLabel(testState, delay)
 	widths := proxyColumnWidths(max(0, rowWidth-2))
@@ -1022,20 +1034,6 @@ func (m Model) proxyTableRow(group domain.ProxyGroup, proxy domain.Proxy, select
 		{text: proxy.Name, width: widths[4]},
 	}
 	return tableDataRow(selected, cells, rowWidth)
-}
-
-func proxySourceIndex(group domain.ProxyGroup, proxy domain.Proxy) int {
-	for index, candidate := range group.Proxies {
-		if candidate.Name == proxy.Name && candidate.Type == proxy.Type {
-			return index
-		}
-	}
-	for index, candidate := range group.Proxies {
-		if candidate.Name == proxy.Name {
-			return index
-		}
-	}
-	return 0
 }
 
 func proxyTestLabel(state proxyTestState, delay uint16) (string, color.Color) {
@@ -1289,6 +1287,16 @@ func empty(value, fallback string) string {
 }
 
 func safeText(value string) string {
+	clean := true
+	for _, character := range value {
+		if character == '\x1b' || unicode.IsControl(character) {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return value
+	}
 	value = ansi.Strip(value)
 	return strings.Map(func(character rune) rune {
 		if unicode.IsControl(character) {

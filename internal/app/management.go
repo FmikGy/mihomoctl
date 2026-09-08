@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -22,20 +21,19 @@ import (
 )
 
 func (a *App) Initialize(ctx context.Context, options domain.InitOptions) error {
+	options.Service = strings.TrimSpace(options.Service)
+	options.ConfigPath = strings.TrimSpace(options.ConfigPath)
 	options.Controller = strings.TrimSpace(options.Controller)
 	if options.Controller != "" {
 		if err := validateLocalController(options.Controller); err != nil {
 			return &InvalidInputError{Cause: err}
 		}
 	}
+	if err := validateInitOverrides(a.isRoot(), runningUnderSudo(), options); err != nil {
+		return err
+	}
 	if !a.isRoot() {
 		args := []string{"init", "--output", "json"}
-		if options.Service != "" {
-			args = append(args, "--service", options.Service)
-		}
-		if options.ConfigPath != "" {
-			args = append(args, "--config", options.ConfigPath)
-		}
 		if options.Controller != "" {
 			args = append(args, "--controller", options.Controller)
 		}
@@ -44,13 +42,24 @@ func (a *App) Initialize(ctx context.Context, options domain.InitOptions) error 
 		}
 		return a.runElevated(ctx, args, "")
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	return a.withMutation(ctx, func() error {
+		return a.initializeRoot(ctx, options)
+	})
+}
 
-	if a.stateLoadErr != nil && !options.Force {
-		return a.stateLoadErr
+func (a *App) initializeRoot(ctx context.Context, options domain.InitOptions) error {
+	a.mu.RLock()
+	loadErr := a.stateLoadErr
+	var existing *persistedState
+	if a.state != nil {
+		copy := *a.state
+		existing = &copy
 	}
-	if a.state != nil && !options.Force {
+	a.mu.RUnlock()
+	if loadErr != nil && !options.Force {
+		return loadErr
+	}
+	if existing != nil && !options.Force {
 		return errors.New("mihomoctl 已初始化；如需修复请使用 doctor --fix")
 	}
 	discoverer := platform.NewDiscoverer(a.runner)
@@ -82,7 +91,7 @@ func (a *App) Initialize(ctx context.Context, options domain.InitOptions) error 
 	if controller == "" {
 		controller = "127.0.0.1:9090"
 	}
-	raw, err := os.ReadFile(installation.ConfigPath)
+	raw, err := platform.ReadManagedConfig(installation.ConfigPath, platform.MaxManagedConfigBytes)
 	if err != nil {
 		return fmt.Errorf("读取现有 Mihomo 配置失败: %w", err)
 	}
@@ -91,11 +100,11 @@ func (a *App) Initialize(ctx context.Context, options domain.InitOptions) error 
 	if err != nil {
 		return err
 	}
-	if a.state != nil && options.Force {
-		settings = a.state.Settings
-		secret = a.state.Secret
+	if existing != nil && options.Force {
+		settings = existing.Settings
+		secret = existing.Secret
 		if options.Controller == "" {
-			controller = a.state.Controller
+			controller = existing.Controller
 		}
 	}
 	state := persistedState{
@@ -105,38 +114,54 @@ func (a *App) Initialize(ctx context.Context, options domain.InitOptions) error 
 		Secret:       secret,
 		Settings:     settings,
 	}
+	rollback, err := a.fileRollback(a.paths.ConfigFile, a.paths.PublicFile, a.paths.ClientFile)
+	if err != nil {
+		return err
+	}
 
 	store, err := profile.NewStore(a.paths.ProfileRoot)
 	if err != nil {
 		return err
 	}
+	storeCheckpoint, err := store.Checkpoint()
+	if err != nil {
+		return err
+	}
+	rollback.add("配置存储", func(context.Context) error { return store.RestoreCheckpoint(storeCheckpoint) })
 	profiles, err := store.List()
 	if err != nil {
 		return err
 	}
 	if len(profiles) == 0 {
 		if _, err := store.AddSnapshot("系统原配置", raw); err != nil {
-			return fmt.Errorf("导入现有配置失败: %w", err)
+			return a.failAndReload(ctx, rollback, fmt.Errorf("导入现有配置失败: %w", err))
 		}
 	}
 	config, err := store.ActiveConfig()
 	if err != nil {
-		return err
+		return a.failAndReload(ctx, rollback, err)
 	}
-	if err := a.applyProfileConfig(ctx, state, config); err != nil {
-		return err
+	applied, err := a.applyProfileConfig(ctx, state, config)
+	if err != nil {
+		return a.failAndReload(ctx, rollback, err)
 	}
-	if err := a.saveState(state); err != nil {
-		return err
+	rollback.add("Mihomo 配置", applied.rollback)
+	a.mu.Lock()
+	err = a.saveState(state)
+	if err == nil {
+		a.store = store
+		a.rebuildAPI()
 	}
-	a.store = store
-	a.rebuildAPI()
+	a.mu.Unlock()
+	if err != nil {
+		return a.failAndReload(ctx, rollback, err)
+	}
 	profiles, err = store.List()
 	if err != nil {
-		return err
+		return a.failAndReload(ctx, rollback, err)
 	}
-	if err := a.writePublicProfiles(profiles); err != nil {
-		return err
+	if err := a.publishProfiles(profiles); err != nil {
+		return a.failAndReload(ctx, rollback, err)
 	}
 	activeName := ""
 	for _, item := range profiles {
@@ -144,31 +169,62 @@ func (a *App) Initialize(ctx context.Context, options domain.InitOptions) error 
 			activeName = item.Name
 		}
 	}
-	return a.saveClient(state, activeName)
+	a.mu.Lock()
+	err = a.saveClient(state, activeName)
+	a.mu.Unlock()
+	if err != nil {
+		return a.failAndReload(ctx, rollback, err)
+	}
+	return nil
 }
 
-func (a *App) applyProfileConfig(ctx context.Context, state persistedState, raw []byte) error {
+func validateInitOverrides(root, sudoChild bool, options domain.InitOptions) error {
+	if options.Service == "" && options.ConfigPath == "" {
+		return nil
+	}
+	if !root {
+		return &InvalidInputError{Cause: errors.New("普通用户自动提权初始化只支持自动探测；--service 和 --config 仅可由管理员在真正的 root 会话中使用")}
+	}
+	if sudoChild {
+		return &InvalidInputError{Cause: errors.New("sudo 子进程拒绝 --service 或 --config；自定义安装位置必须由管理员在真正的 root 会话中配置")}
+	}
+	return nil
+}
+
+type appliedProfileConfig struct {
+	applier platform.ConfigApplier
+	result  platform.ApplyResult
+}
+
+func (applied *appliedProfileConfig) rollback(ctx context.Context) error {
+	if applied == nil {
+		return nil
+	}
+	return applied.applier.Rollback(ctx, applied.result)
+}
+
+func (a *App) applyProfileConfig(ctx context.Context, state persistedState, raw []byte) (*appliedProfileConfig, error) {
 	managed, err := profile.MergeManagedConfig(raw, profile.OverlayOptions{
 		ExternalController: state.Controller,
 		Secret:             state.Secret,
 		Settings:           state.Settings,
 	})
 	if err != nil {
-		return fmt.Errorf("生成活动配置失败: %w", err)
+		return nil, fmt.Errorf("生成活动配置失败: %w", err)
 	}
 	systemd, err := platform.NewSystemd(a.runner, state.Installation.Unit)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	service, err := systemd.Status(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	client, err := mihomo.New(state.Controller, state.Secret, mihomo.WithRequestTimeout(time.Second))
 	if err != nil {
-		return err
+		return nil, err
 	}
-	healthCalls := 0
+	activationCalls := 0
 	applier := platform.ConfigApplier{
 		Runner: a.runner,
 		Paths: platform.ApplyPaths{
@@ -178,17 +234,17 @@ func (a *App) applyProfileConfig(ctx context.Context, state persistedState, raw 
 			BackupDir:    a.paths.BackupDir,
 		},
 		Activate: func(activateCtx context.Context) error {
+			activationCalls++
 			if !service.Active {
 				return nil
 			}
 			return systemd.Restart(activateCtx)
 		},
 		HealthCheck: func(healthCtx context.Context) error {
-			healthCalls++
 			if !service.Active {
 				return nil
 			}
-			if healthCalls > 1 {
+			if activationCalls > 1 {
 				status, statusErr := systemd.Status(healthCtx)
 				if statusErr == nil && status.Active {
 					return nil
@@ -198,10 +254,11 @@ func (a *App) applyProfileConfig(ctx context.Context, state persistedState, raw 
 			return waitForAPI(healthCtx, client, 8*time.Second)
 		},
 	}
-	if _, err := applier.Apply(ctx, managed); err != nil {
-		return fmt.Errorf("应用 Mihomo 配置失败: %w", err)
+	result, err := applier.Apply(ctx, managed)
+	if err != nil {
+		return nil, fmt.Errorf("应用 Mihomo 配置失败: %w", err)
 	}
-	return nil
+	return &appliedProfileConfig{applier: applier, result: result}, nil
 }
 
 func waitForAPI(ctx context.Context, client *mihomo.Client, timeout time.Duration) error {
@@ -228,30 +285,46 @@ func waitForAPI(ctx context.Context, client *mihomo.Client, timeout time.Duratio
 func (a *App) Service(ctx context.Context, action string) error {
 	action = strings.ToLower(strings.TrimSpace(action))
 	switch action {
-	case "start", "stop", "restart", "enable", "disable":
+	case "start", "stop", "restart", "enable", "disable", "enable-now":
 	default:
 		return fmt.Errorf("不支持的服务操作 %q", action)
 	}
 	if !a.isRoot() {
-		return a.runElevated(ctx, []string{"service", action, "--output", "json"}, "")
+		if err := a.requireManagedInstallation(); err != nil {
+			return err
+		}
+		args := []string{"service", action, "--output", "json"}
+		if action == "enable-now" {
+			base, _, _ := strings.Cut(action, "-")
+			args = []string{"service", base, "--now", "--output", "json"}
+		}
+		return a.runElevated(ctx, args, "")
 	}
-	systemd, err := platform.NewSystemd(a.runner, a.serviceName())
-	if err != nil {
-		return err
-	}
-	switch action {
-	case "start":
-		return systemd.Start(ctx)
-	case "stop":
-		return systemd.Stop(ctx)
-	case "restart":
-		return systemd.Restart(ctx)
-	case "enable":
-		return systemd.Enable(ctx)
-	case "disable":
-		return systemd.Disable(ctx)
-	}
-	return nil
+	return a.withMutation(ctx, func() error {
+		state, _, err := a.rootStateSnapshot()
+		if err != nil {
+			return err
+		}
+		systemd, err := platform.NewSystemd(a.runner, state.Installation.Unit)
+		if err != nil {
+			return err
+		}
+		switch action {
+		case "start":
+			return systemd.Start(ctx)
+		case "stop":
+			return systemd.Stop(ctx)
+		case "restart":
+			return systemd.Restart(ctx)
+		case "enable":
+			return systemd.Enable(ctx)
+		case "disable":
+			return systemd.Disable(ctx)
+		case "enable-now":
+			return systemd.EnableNow(ctx)
+		}
+		return nil
+	})
 }
 
 func (a *App) SetMode(ctx context.Context, mode domain.Mode) error {
@@ -322,9 +395,54 @@ func (a *App) SyncPublicState(ctx context.Context) error {
 		}
 		return a.runElevated(ctx, []string{"--output", "json", "config", "sync-public-state"}, "")
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	_, store, err := a.requireRootState()
+	return a.withMutation(ctx, func() error { return a.syncPublicStateRoot(ctx) })
+}
+
+// SyncClientState writes the controller credentials to the current sudo
+// caller's private config path. It is useful after an administrator performs
+// a custom-path initialization from an independent root session.
+func (a *App) SyncClientState(ctx context.Context) error {
+	if !a.isRoot() {
+		if err := a.requireManagedInstallation(); err != nil {
+			return err
+		}
+		if err := a.runElevated(ctx, []string{"--output", "json", "config", "sync-client"}, ""); err != nil {
+			return err
+		}
+		a.mu.Lock()
+		a.reloadDiskStateLocked()
+		a.mu.Unlock()
+		return nil
+	}
+	return a.withMutation(ctx, func() error {
+		state, store, err := a.rootStateSnapshot()
+		if err != nil {
+			return err
+		}
+		active, err := store.Active()
+		if err != nil {
+			return err
+		}
+		rollback, err := a.fileRollback(a.paths.ClientFile)
+		if err != nil {
+			return err
+		}
+		a.mu.Lock()
+		err = a.saveClient(state, active.Name)
+		a.mu.Unlock()
+		if err != nil {
+			return a.failAndReload(ctx, rollback, err)
+		}
+		return nil
+	})
+}
+
+func (a *App) syncPublicStateRoot(ctx context.Context) error {
+	_, store, err := a.rootStateSnapshot()
+	if err != nil {
+		return err
+	}
+	rollback, err := a.fileRollback(a.paths.PublicFile)
 	if err != nil {
 		return err
 	}
@@ -332,7 +450,10 @@ func (a *App) SyncPublicState(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return a.writePublicProfiles(profiles)
+	if err := a.publishProfiles(profiles); err != nil {
+		return rollback.fail(ctx, err)
+	}
+	return nil
 }
 
 func (a *App) ValidateConfigValue(key, value string) error {
@@ -359,9 +480,13 @@ func (a *App) ValidateConfigValue(key, value string) error {
 }
 
 func (a *App) changeSettings(ctx context.Context, mutate func(*domain.ManagedSettings)) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	state, store, err := a.requireRootState()
+	return a.withMutation(ctx, func() error {
+		return a.changeSettingsRoot(ctx, mutate)
+	})
+}
+
+func (a *App) changeSettingsRoot(ctx context.Context, mutate func(*domain.ManagedSettings)) error {
+	state, store, err := a.rootStateSnapshot()
 	if err != nil {
 		return err
 	}
@@ -373,22 +498,42 @@ func (a *App) changeSettings(ctx context.Context, mutate func(*domain.ManagedSet
 	if err != nil {
 		return err
 	}
-	if err := a.applyProfileConfig(ctx, state, config); err != nil {
-		return err
-	}
-	if err := a.saveState(state); err != nil {
-		return err
-	}
-	a.rebuildAPI()
-	active, _ := store.Active()
-	if err := a.saveClient(state, active.Name); err != nil {
-		return err
-	}
-	profiles, err := store.List()
+	rollback, err := a.fileRollback(a.paths.ConfigFile, a.paths.PublicFile, a.paths.ClientFile)
 	if err != nil {
 		return err
 	}
-	return a.writePublicProfiles(profiles)
+	applied, err := a.applyProfileConfig(ctx, state, config)
+	if err != nil {
+		return a.failAndReload(ctx, rollback, err)
+	}
+	rollback.add("Mihomo 配置", applied.rollback)
+	a.mu.Lock()
+	err = a.saveState(state)
+	if err == nil {
+		a.rebuildAPI()
+	}
+	a.mu.Unlock()
+	if err != nil {
+		return a.failAndReload(ctx, rollback, err)
+	}
+	active, err := store.Active()
+	if err != nil {
+		return a.failAndReload(ctx, rollback, err)
+	}
+	a.mu.Lock()
+	err = a.saveClient(state, active.Name)
+	a.mu.Unlock()
+	if err != nil {
+		return a.failAndReload(ctx, rollback, err)
+	}
+	profiles, err := store.List()
+	if err != nil {
+		return a.failAndReload(ctx, rollback, err)
+	}
+	if err := a.publishProfiles(profiles); err != nil {
+		return a.failAndReload(ctx, rollback, err)
+	}
+	return nil
 }
 
 func inferSettings(raw []byte) domain.ManagedSettings {

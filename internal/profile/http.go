@@ -38,7 +38,7 @@ func (s *Store) fetchRemote(ctx context.Context, rawURL, etag, lastModified stri
 	if lastModified != "" {
 		request.Header.Set("If-Modified-Since", lastModified)
 	}
-	response, err := s.client.Do(request)
+	response, err := redirectSafeClient(s.client).Do(request)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return fetchResult{}, fmt.Errorf("download %s: %w", RedactURL(rawURL), ctxErr)
@@ -70,6 +70,73 @@ func (s *Store) fetchRemote(ctx context.Context, rawURL, etag, lastModified stri
 		return fetchResult{}, fmt.Errorf("download %s: %w", RedactURL(rawURL), err)
 	}
 	return result, nil
+}
+
+// redirectSafeClient returns a shallow copy so redirect policy remains local
+// to this request. In particular, WithHTTPClient callers retain ownership of
+// their client and its CheckRedirect hook.
+func redirectSafeClient(base *http.Client) *http.Client {
+	client := *base
+	original := base.CheckRedirect
+	client.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+		request.Header.Del("Referer")
+		if original != nil {
+			if err := original(request, via); err != nil {
+				return err
+			}
+		} else if len(via) >= 10 {
+			return fmt.Errorf("stopped after 10 redirects")
+		}
+
+		// Go derives Referer from the complete previous URL, including query
+		// values commonly used as subscription tokens. Never forward it.
+		request.Header.Del("Referer")
+		if len(via) == 0 {
+			return nil
+		}
+		previousURL := via[len(via)-1].URL
+		initialURL := via[0].URL
+		if !sameHTTPOrigin(initialURL, request.URL) {
+			// Validators can identify a private subscription just as readily as
+			// credentials. Anchor this decision to the initial origin so a later
+			// same-origin hop on the redirect target cannot add them back.
+			request.Header.Del("If-None-Match")
+			request.Header.Del("If-Modified-Since")
+		}
+		previousScheme := strings.ToLower(previousURL.Scheme)
+		nextScheme := strings.ToLower(request.URL.Scheme)
+		if nextScheme != "http" && nextScheme != "https" {
+			return fmt.Errorf("redirect target must use HTTP or HTTPS")
+		}
+		if previousScheme == "https" && nextScheme != "https" {
+			return fmt.Errorf("refusing HTTPS redirect downgrade")
+		}
+		return nil
+	}
+	return &client
+}
+
+func sameHTTPOrigin(left, right *url.URL) bool {
+	if left == nil || right == nil ||
+		!strings.EqualFold(left.Scheme, right.Scheme) ||
+		!strings.EqualFold(left.Hostname(), right.Hostname()) {
+		return false
+	}
+	return originPort(left) == originPort(right)
+}
+
+func originPort(value *url.URL) string {
+	if port := value.Port(); port != "" {
+		return port
+	}
+	switch strings.ToLower(value.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
 }
 
 func readLimited(reader io.Reader, limit int64) ([]byte, error) {

@@ -185,6 +185,15 @@ func TestFooterKeepsHelpAndQuitWithTransientMessages(t *testing.T) {
 		apply func(*Model)
 	}{
 		{"loading", func(m *Model) { m.loading = true }},
+		{"privileged", func(m *Model) {
+			m.loading = true
+			m.privilegedOperation = true
+		}},
+		{"authorizing", func(m *Model) {
+			m.loading = true
+			m.privilegedOperation = true
+			m.authorizing = true
+		}},
 		{"error", func(m *Model) { m.err = strings.Repeat("控制器不可用", 20) }},
 		{"toast", func(m *Model) { m.toast = strings.Repeat("操作完成", 20) }},
 	}
@@ -228,8 +237,8 @@ func TestFilterConnections(t *testing.T) {
 	m := testModel()
 	m.connections = append(m.connections, domain.Connection{ID: "2", Host: "openai.com", Process: "browser"})
 	m.filter = "openai"
-	got := m.filteredConnections()
-	if len(got) != 1 || got[0].ID != "2" {
+	got := m.currentConnectionViews()
+	if len(got) != 1 || m.connections[got[0].connectionIndex].ID != "2" {
 		t.Fatalf("unexpected filter result: %#v", got)
 	}
 }
@@ -238,9 +247,8 @@ func TestFilterLogs(t *testing.T) {
 	m := testModel()
 	m.logs = []domain.LogEntry{{Level: "info", Message: "connected"}, {Level: "error", Message: "timeout"}}
 	m.filter = "TIME"
-	got := m.filteredLogs()
-	if len(got) != 1 || got[0].Message != "timeout" {
-		t.Fatalf("unexpected log filter result: %#v", got)
+	if got := m.logViewLen(); got != 1 || m.logViewEntry(0).Message != "timeout" {
+		t.Fatalf("unexpected log filter result: count=%d", got)
 	}
 }
 
@@ -696,7 +704,7 @@ func TestProxyTableColumnsStayAlignedAtResponsiveWidths(t *testing.T) {
 
 					widths := proxyColumnWidths(rowWidth - 2)
 					header := proxyTableHeader(rowWidth)
-					row := m.proxyTableRow(group, proxy, selected, rowWidth)
+					row := m.proxyTableRowAt(group, proxy, 0, selected, rowWidth)
 					if got := ansi.StringWidth(header); got != rowWidth {
 						t.Fatalf("header width = %d, want %d", got, rowWidth)
 					}
@@ -1023,7 +1031,8 @@ func TestGroupNameFilterShowsMembersAndPreservesSelection(t *testing.T) {
 			m.syncViewports()
 
 			m.applyFilter("special-group")
-			if m.groupCursor != 0 || m.proxyCursor != 20 || len(filteredProxies(m.filteredGroups()[0], m.filter)) != 30 {
+			views := m.currentGroupViews()
+			if m.groupCursor != 0 || m.proxyCursor != 20 || len(views) != 1 || len(views[0].proxies) != 30 {
 				t.Fatalf("group-name filter lost selection: group=%d proxy=%d", m.groupCursor, m.proxyCursor)
 			}
 			requireSelectedVisible(t, m, "node-20")
@@ -1169,8 +1178,8 @@ func TestGroupTestWithoutUsableDelayIsExplicit(t *testing.T) {
 	if got := m.groups[0].Proxies[0]; got.Name != original.Name || got.Alive != original.Alive || got.Delay != original.Delay {
 		t.Fatalf("empty success map overwrote existing health: %#v", got)
 	}
-	if refresh == nil {
-		t.Fatal("empty success map did not request an authoritative core refresh")
+	if refresh != nil {
+		t.Fatal("group test performed a redundant proxy refresh")
 	}
 }
 

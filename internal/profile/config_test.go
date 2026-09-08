@@ -1,6 +1,8 @@
 package profile
 
 import (
+	"encoding/base64"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -18,6 +20,104 @@ func TestNormalizeSourcePreservesYAML(t *testing.T) {
 	}
 	if converted || string(got) != string(raw) {
 		t.Fatalf("NormalizeSource() = %q, %v", got, converted)
+	}
+}
+
+func TestNormalizeSourceURIForms(t *testing.T) {
+	direct := "trojan://first@example.com:443#First"
+	multiple := direct + "\n" + "vless://00000000-0000-0000-0000-000000000001@example.net:8443#Second"
+	encoded := base64.RawStdEncoding.EncodeToString([]byte(multiple))
+	vmessJSON := base64.RawStdEncoding.EncodeToString([]byte(`{"v":"2","ps":"First","add":"vm.example","port":"443","id":"00000000-0000-0000-0000-000000000001","aid":"0","net":"tcp"}`))
+	for name, source := range map[string]string{
+		"single URI":                   direct,
+		"multiple URI":                 multiple,
+		"base64 list":                  encoded,
+		"legacy VMess without slashes": "vmess:" + vmessJSON,
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, converted, err := NormalizeSource([]byte(source))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !converted || !strings.Contains(string(got), "proxy-groups:") || !strings.Contains(string(got), "First") {
+				t.Fatalf("NormalizeSource() converted = %v, config = %q", converted, got)
+			}
+		})
+	}
+}
+
+func TestBase64SubscriptionFastClassifier(t *testing.T) {
+	encoded := base64.RawURLEncoding.EncodeToString([]byte("trojan://secret@example.com:443#Node"))
+	if !looksLikeBase64Subscription([]byte(" \n" + encoded + "\n")) {
+		t.Fatal("base64 URI subscription was not recognized")
+	}
+	for _, source := range []string{"proxies: []", "# comment", "[yaml, sequence]", "abcde"} {
+		if looksLikeBase64Subscription([]byte(source)) {
+			t.Fatalf("%q was incorrectly classified as base64", source)
+		}
+	}
+}
+
+func TestNormalizeSourceClassifiesYAMLBeforeBase64Fallback(t *testing.T) {
+	raw := []byte("# provider config\ncustom-key: keep\nproxies: []\n")
+	if looksLikeDirectURIList(raw) {
+		t.Fatal("YAML was classified as a direct URI list")
+	}
+	got, converted, err := NormalizeSource(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if converted || string(got) != string(raw) {
+		t.Fatalf("NormalizeSource() = %q, %v", got, converted)
+	}
+
+	// A URI-looking YAML key must still fall back to YAML when URI parsing
+	// fails instead of being rejected by the fast classifier.
+	raw = []byte("ss://provider: value\nproxies: []\n")
+	got, converted, err = NormalizeSource(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if converted || string(got) != string(raw) {
+		t.Fatalf("URI-looking YAML = %q, %v", got, converted)
+	}
+}
+
+func TestNormalizeSourceKeepsUsefulInvalidSourceErrors(t *testing.T) {
+	_, _, err := NormalizeSource([]byte("[unterminated"))
+	if err == nil || !strings.Contains(err.Error(), "neither valid Mihomo YAML nor a URI subscription") {
+		t.Fatalf("invalid source error = %v", err)
+	}
+	_, _, err = NormalizeSource([]byte("plain scalar"))
+	if err == nil || !strings.Contains(err.Error(), "root must be a mapping") {
+		t.Fatalf("scalar source error = %v", err)
+	}
+}
+
+func BenchmarkNormalizeSourceLargeYAML(b *testing.B) {
+	for _, size := range []int{1 << 20, 5 << 20} {
+		raw := []byte("proxies: []\npayload: \"" + strings.Repeat("a", size) + "\"\n")
+		b.Run(fmt.Sprintf("%dMiB", size>>20), func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(raw)))
+			for b.Loop() {
+				if _, converted, err := NormalizeSource(raw); err != nil || converted {
+					b.Fatalf("NormalizeSource() = converted %v, error %v", converted, err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkNormalizeSourceBase64URI(b *testing.B) {
+	line := "trojan://benchmark-secret@example.com:443#Node\n"
+	raw := []byte(base64.RawStdEncoding.EncodeToString([]byte(strings.Repeat(line, 1_000))))
+	b.ReportAllocs()
+	b.SetBytes(int64(len(raw)))
+	for b.Loop() {
+		if _, converted, err := NormalizeSource(raw); err != nil || !converted {
+			b.Fatalf("NormalizeSource() = converted %v, error %v", converted, err)
+		}
 	}
 }
 

@@ -76,18 +76,82 @@ func GenerateConfig(nodes []Node) ([]byte, error) {
 // NormalizeSource validates Mihomo YAML or converts a URI subscription into
 // Mihomo YAML. The boolean reports whether conversion occurred.
 func NormalizeSource(source []byte) ([]byte, bool, error) {
-	if nodes, err := ParseURIList(string(source)); err == nil {
-		config, generateErr := GenerateConfig(nodes)
-		return config, true, generateErr
+	// Direct URI lists are cheap to recognize and should not pay for a YAML
+	// parse. Everything else tries YAML first, avoiding several whole-input
+	// scans and base64 decode attempts for large provider configurations.
+	uriAttempted := looksLikeDirectURIList(source) || looksLikeBase64Subscription(source)
+	if uriAttempted {
+		if config, err := normalizeURIList(source); err == nil {
+			return config, true, nil
+		}
 	}
-	doc, err := decodeYAMLDocument(source)
+
+	doc, yamlErr := decodeYAMLDocument(source)
+	if yamlErr == nil && doc.Content[0].Kind == yaml.MappingNode {
+		return append([]byte(nil), source...), false, nil
+	}
+	if !uriAttempted {
+		if config, uriErr := normalizeURIList(source); uriErr == nil {
+			return config, true, nil
+		}
+	}
+	if yamlErr != nil {
+		return nil, false, fmt.Errorf("source is neither valid Mihomo YAML nor a URI subscription: %w", yamlErr)
+	}
+	return nil, false, fmt.Errorf("Mihomo YAML root must be a mapping")
+}
+
+func looksLikeBase64Subscription(source []byte) bool {
+	source = bytes.TrimSpace(bytes.TrimPrefix(source, []byte("\xef\xbb\xbf")))
+	encodedLength := 0
+	for _, character := range source {
+		switch {
+		case character >= 'a' && character <= 'z':
+		case character >= 'A' && character <= 'Z':
+		case character >= '0' && character <= '9':
+		case character == '+', character == '/', character == '-', character == '_', character == '=':
+		case character == ' ', character == '\t', character == '\r', character == '\n':
+			continue
+		default:
+			return false
+		}
+		encodedLength++
+	}
+	return encodedLength >= 8 && encodedLength%4 != 1
+}
+
+func normalizeURIList(source []byte) ([]byte, error) {
+	nodes, err := ParseURIList(string(source))
 	if err != nil {
-		return nil, false, fmt.Errorf("source is neither valid Mihomo YAML nor a URI subscription: %w", err)
+		return nil, err
 	}
-	if doc.Content[0].Kind != yaml.MappingNode {
-		return nil, false, fmt.Errorf("Mihomo YAML root must be a mapping")
+	return GenerateConfig(nodes)
+}
+
+func looksLikeDirectURIList(source []byte) bool {
+	firstLine := true
+	for len(source) > 0 {
+		line := source
+		if end := bytes.IndexByte(source, '\n'); end >= 0 {
+			line, source = source[:end], source[end+1:]
+		} else {
+			source = nil
+		}
+		line = bytes.TrimSpace(line)
+		if firstLine {
+			line = bytes.TrimPrefix(line, []byte("\xef\xbb\xbf"))
+			firstLine = false
+		}
+		if len(line) == 0 || line[0] == '#' {
+			continue
+		}
+		separator := bytes.IndexByte(line, ':')
+		if separator <= 0 {
+			return false
+		}
+		return supportedSchemes[string(bytes.ToLower(line[:separator]))]
 	}
-	return append([]byte(nil), source...), false, nil
+	return false
 }
 
 // MergeManagedConfig applies mihomoctl-owned settings with yaml.Node so keys,

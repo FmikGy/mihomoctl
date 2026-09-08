@@ -3,6 +3,7 @@ package profile
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"go.yaml.in/yaml/v3"
+	"golang.org/x/sys/unix"
 
 	"mihomoctl/internal/domain"
 )
@@ -80,8 +82,12 @@ func (s *Store) Root() string { return s.root }
 
 // Add imports the source, validates it, and stores a last-known-good config.
 func (s *Store) Add(ctx context.Context, request AddRequest) (domain.Profile, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return domain.Profile{}, err
+	}
 	request.Name = strings.TrimSpace(request.Name)
 	request.Source = strings.TrimSpace(request.Source)
 	if request.Name == "" || request.Source == "" {
@@ -120,7 +126,7 @@ func (s *Store) Add(ctx context.Context, request AddRequest) (domain.Profile, er
 		profile.Subscription = fetched.subscription
 		profile.Source = RedactURL(request.Source)
 	case domain.ProfileLocal:
-		file, err := os.Open(request.Source)
+		file, err := openLocalProfile(request.Source)
 		if err != nil {
 			return domain.Profile{}, fmt.Errorf("open local profile: %w", err)
 		}
@@ -144,14 +150,20 @@ func (s *Store) Add(ctx context.Context, request AddRequest) (domain.Profile, er
 	if err != nil {
 		return domain.Profile{}, err
 	}
+	if err := ctx.Err(); err != nil {
+		return domain.Profile{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return domain.Profile{}, err
+	}
 	return s.addPreparedUnlocked(profile, []byte(request.Source), raw, config)
 }
 
 // AddSnapshot imports content as an immutable local recovery point. Snapshots
 // have no live origin and are excluded from scheduled and bulk refreshes.
 func (s *Store) AddSnapshot(name string, raw []byte) (domain.Profile, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return domain.Profile{}, fmt.Errorf("profile name is required")
@@ -172,6 +184,8 @@ func (s *Store) AddSnapshot(name string, raw []byte) (domain.Profile, error) {
 		Source:         "[immutable snapshot]",
 		UpdateInterval: 0,
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.addPreparedUnlocked(profile, nil, raw, config)
 }
 
@@ -326,111 +340,262 @@ func (s *Store) Remove(id string) error {
 	return nil
 }
 
-// Update refreshes a remote/local source or re-renders a stored URI profile.
-func (s *Store) Update(ctx context.Context, id string) (UpdateResult, error) {
+type updateBaseline struct {
+	profile domain.Profile
+	origin  []byte
+	source  []byte
+	config  []byte
+}
+
+// PrepareUpdate downloads or reads and normalizes a profile without holding
+// the store mutex. CommitUpdate rejects the result if its on-disk baseline has
+// changed in the meantime.
+func (s *Store) PrepareUpdate(ctx context.Context, id string) (PreparedUpdate, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return PreparedUpdate{}, err
+	}
+	baseline, err := s.readUpdateBaseline(id)
+	if err != nil {
+		return PreparedUpdate{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return PreparedUpdate{}, err
+	}
+
+	var raw []byte
+	var fetched fetchResult
+	switch baseline.profile.Kind {
+	case domain.ProfileRemote:
+		fetched, err = s.fetchRemote(ctx, string(baseline.origin), baseline.profile.ETag, baseline.profile.LastModified)
+		if err != nil {
+			return PreparedUpdate{}, err
+		}
+	case domain.ProfileLocal:
+		file, openErr := openLocalProfile(string(baseline.origin))
+		if openErr != nil {
+			return PreparedUpdate{}, fmt.Errorf("open local profile: %w", openErr)
+		}
+		raw, err = readLimited(file, s.maxSourceBytes)
+		closeErr := file.Close()
+		if err != nil {
+			return PreparedUpdate{}, fmt.Errorf("read local profile: %w", err)
+		}
+		if closeErr != nil {
+			return PreparedUpdate{}, fmt.Errorf("close local profile: %w", closeErr)
+		}
+	case domain.ProfileURI:
+		raw = append([]byte(nil), baseline.origin...)
+	default:
+		return PreparedUpdate{}, fmt.Errorf("unsupported profile kind %q", baseline.profile.Kind)
+	}
+	if err := ctx.Err(); err != nil {
+		return PreparedUpdate{}, err
+	}
+
+	prepared := PreparedUpdate{
+		store:       s,
+		profile:     baseline.profile,
+		originHash:  sha256.Sum256(baseline.origin),
+		sourceHash:  sha256.Sum256(baseline.source),
+		configHash:  sha256.Sum256(baseline.config),
+		fetched:     fetched,
+		notModified: fetched.notModified,
+	}
+	if !prepared.notModified {
+		if baseline.profile.Kind == domain.ProfileRemote {
+			raw = fetched.body
+		}
+		prepared.config, _, err = NormalizeSource(raw)
+		if err != nil {
+			return PreparedUpdate{}, err
+		}
+		prepared.raw = raw
+	}
+	if err := ctx.Err(); err != nil {
+		return PreparedUpdate{}, err
+	}
+	s.mu.Lock()
+	prepared.preparedAt = s.now().UTC()
+	if !prepared.preparedAt.After(baseline.profile.LastUpdated) {
+		prepared.preparedAt = baseline.profile.LastUpdated.Add(time.Nanosecond)
+	}
+	s.mu.Unlock()
+	return prepared, nil
+}
+
+// openLocalProfile prevents FIFOs and devices from blocking an import while
+// retaining compatibility with symlinks that resolve to regular files.
+func openLocalProfile(path string) (*os.File, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return nil, errors.Join(err, unix.Close(fd))
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
+		return nil, errors.Join(errors.New("local profile must be a regular file"), unix.Close(fd))
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		return nil, errors.Join(errors.New("open local profile file descriptor"), unix.Close(fd))
+	}
+	return file, nil
+}
+
+// ReadLocalSource reads a caller-accessible local profile without allowing a
+// FIFO or device to block the process. Privilege boundaries use this before
+// elevation so the root child never needs the caller-supplied path.
+func ReadLocalSource(path string) ([]byte, error) {
+	file, err := openLocalProfile(strings.TrimSpace(path))
+	if err != nil {
+		return nil, fmt.Errorf("open local profile: %w", err)
+	}
+	content, readErr := readLimited(file, DefaultMaxSourceBytes)
+	closeErr := file.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return nil, fmt.Errorf("read local profile: %w", err)
+	}
+	return content, nil
+}
+
+func (s *Store) readUpdateBaseline(id string) (updateBaseline, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.loadStateUnlocked()
+	if err != nil {
+		return updateBaseline{}, err
+	}
+	profile, _, err := findProfile(state, id)
+	if err != nil {
+		return updateBaseline{}, err
+	}
+	if profile.UpdateInterval <= 0 {
+		return updateBaseline{}, fmt.Errorf("%w: %s", ErrImmutable, profile.Name)
+	}
+	origin, err := os.ReadFile(filepath.Join(s.profileDir(id), "origin"))
+	if err != nil {
+		return updateBaseline{}, fmt.Errorf("read profile origin: %w", err)
+	}
+	source, err := os.ReadFile(filepath.Join(s.profileDir(id), "source"))
+	if err != nil {
+		return updateBaseline{}, fmt.Errorf("read prior profile source: %w", err)
+	}
+	config, err := os.ReadFile(filepath.Join(s.profileDir(id), "config.yaml"))
+	if err != nil {
+		return updateBaseline{}, fmt.Errorf("read prior profile config: %w", err)
+	}
+	return updateBaseline{profile: profile, origin: origin, source: source, config: config}, nil
+}
+
+// CommitUpdate atomically installs a prepared refresh if its profile has not
+// changed since preparation began.
+func (s *Store) CommitUpdate(prepared PreparedUpdate) (UpdateResult, error) {
+	if prepared.store != s || prepared.profile.ID == "" || prepared.preparedAt.IsZero() {
+		return UpdateResult{}, fmt.Errorf("invalid prepared profile update")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	state, err := s.loadStateUnlocked()
 	if err != nil {
 		return UpdateResult{}, err
 	}
-	profile, index, err := findProfile(state, id)
+	profile, index, err := findProfile(state, prepared.profile.ID)
 	if err != nil {
-		return UpdateResult{}, err
+		return UpdateResult{}, fmt.Errorf("%w: profile no longer exists", ErrStaleUpdate)
 	}
-	if profile.UpdateInterval <= 0 {
-		return UpdateResult{}, fmt.Errorf("%w: %s", ErrImmutable, profile.Name)
+	if profile != prepared.profile {
+		return UpdateResult{}, ErrStaleUpdate
 	}
-	origin, err := os.ReadFile(filepath.Join(s.profileDir(id), "origin"))
-	if err != nil {
-		return UpdateResult{}, fmt.Errorf("read profile origin: %w", err)
+	directory := s.profileDir(profile.ID)
+	if !fileMatchesHash(filepath.Join(directory, "origin"), prepared.originHash) ||
+		!fileMatchesHash(filepath.Join(directory, "source"), prepared.sourceHash) ||
+		!fileMatchesHash(filepath.Join(directory, "config.yaml"), prepared.configHash) {
+		return UpdateResult{}, ErrStaleUpdate
 	}
 
-	var raw []byte
-	var fetched fetchResult
-	switch profile.Kind {
-	case domain.ProfileRemote:
-		fetched, err = s.fetchRemote(ctx, string(origin), profile.ETag, profile.LastModified)
-		if err != nil {
+	if prepared.notModified {
+		profile.LastUpdated = prepared.preparedAt
+		if prepared.fetched.etag != "" {
+			profile.ETag = prepared.fetched.etag
+		}
+		if prepared.fetched.lastModified != "" {
+			profile.LastModified = prepared.fetched.lastModified
+		}
+		if prepared.fetched.subscription != (domain.SubscriptionInfo{}) {
+			profile.Subscription = prepared.fetched.subscription
+		}
+		state.Profiles[index] = profile
+		if err := s.saveStateUnlocked(state); err != nil {
 			return UpdateResult{}, err
 		}
-		if fetched.notModified {
-			profile.LastUpdated = s.now().UTC()
-			if fetched.etag != "" {
-				profile.ETag = fetched.etag
-			}
-			if fetched.lastModified != "" {
-				profile.LastModified = fetched.lastModified
-			}
-			if fetched.subscription != (domain.SubscriptionInfo{}) {
-				profile.Subscription = fetched.subscription
-			}
-			state.Profiles[index] = profile
-			if err := s.saveStateUnlocked(state); err != nil {
-				return UpdateResult{}, err
-			}
-			profile.Active = state.ActiveID == id
-			return UpdateResult{Profile: profile, NotModified: true}, nil
-		}
-		raw = fetched.body
-	case domain.ProfileLocal:
-		file, openErr := os.Open(string(origin))
-		if openErr != nil {
-			return UpdateResult{}, fmt.Errorf("open local profile: %w", openErr)
-		}
-		raw, err = readLimited(file, s.maxSourceBytes)
-		closeErr := file.Close()
-		if err != nil {
-			return UpdateResult{}, fmt.Errorf("read local profile: %w", err)
-		}
-		if closeErr != nil {
-			return UpdateResult{}, fmt.Errorf("close local profile: %w", closeErr)
-		}
-	case domain.ProfileURI:
-		raw = append([]byte(nil), origin...)
-	default:
-		return UpdateResult{}, fmt.Errorf("unsupported profile kind %q", profile.Kind)
+		profile.Active = state.ActiveID == profile.ID
+		return UpdateResult{Profile: profile, NotModified: true}, nil
 	}
-	config, _, err := NormalizeSource(raw)
-	if err != nil {
-		return UpdateResult{}, err
-	}
-	oldRaw, err := os.ReadFile(filepath.Join(s.profileDir(id), "source"))
+
+	oldRaw, err := os.ReadFile(filepath.Join(directory, "source"))
 	if err != nil {
 		return UpdateResult{}, fmt.Errorf("read prior profile source: %w", err)
 	}
-	oldConfig, err := os.ReadFile(filepath.Join(s.profileDir(id), "config.yaml"))
+	oldConfig, err := os.ReadFile(filepath.Join(directory, "config.yaml"))
 	if err != nil {
 		return UpdateResult{}, fmt.Errorf("read prior profile config: %w", err)
 	}
-	changed := !bytes.Equal(oldRaw, raw) || !bytes.Equal(oldConfig, config)
+	changed := !bytes.Equal(oldRaw, prepared.raw) || !bytes.Equal(oldConfig, prepared.config)
 	if changed {
-		if err := atomicWrite(filepath.Join(s.profileDir(id), "source"), raw, 0o600); err != nil {
+		if err := atomicWrite(filepath.Join(directory, "source"), prepared.raw, 0o600); err != nil {
 			return UpdateResult{}, err
 		}
-		if err := atomicWrite(filepath.Join(s.profileDir(id), "config.yaml"), config, 0o600); err != nil {
-			_ = atomicWrite(filepath.Join(s.profileDir(id), "source"), oldRaw, 0o600)
-			return UpdateResult{}, err
+		if err := atomicWrite(filepath.Join(directory, "config.yaml"), prepared.config, 0o600); err != nil {
+			restoreErr := atomicWrite(filepath.Join(directory, "source"), oldRaw, 0o600)
+			return UpdateResult{}, errors.Join(err, restoreErr)
 		}
 	}
 	oldProfile := state.Profiles[index]
-	profile.LastUpdated = s.now().UTC()
+	profile.LastUpdated = prepared.preparedAt
 	if profile.Kind == domain.ProfileRemote {
-		profile.ETag = fetched.etag
-		profile.LastModified = fetched.lastModified
-		profile.Subscription = fetched.subscription
+		profile.ETag = prepared.fetched.etag
+		profile.LastModified = prepared.fetched.lastModified
+		profile.Subscription = prepared.fetched.subscription
 	}
 	state.Profiles[index] = profile
 	if err := s.saveStateUnlocked(state); err != nil {
+		var restoreErrors []error
 		if changed {
-			_ = atomicWrite(filepath.Join(s.profileDir(id), "source"), oldRaw, 0o600)
-			_ = atomicWrite(filepath.Join(s.profileDir(id), "config.yaml"), oldConfig, 0o600)
+			restoreErrors = append(restoreErrors,
+				atomicWrite(filepath.Join(directory, "source"), oldRaw, 0o600),
+				atomicWrite(filepath.Join(directory, "config.yaml"), oldConfig, 0o600),
+			)
 		}
 		state.Profiles[index] = oldProfile
+		return UpdateResult{}, errors.Join(append([]error{err}, restoreErrors...)...)
+	}
+	profile.Active = state.ActiveID == profile.ID
+	return UpdateResult{Profile: profile, Changed: changed}, nil
+}
+
+func fileMatchesHash(path string, expected [32]byte) bool {
+	content, err := os.ReadFile(path)
+	return err == nil && sha256.Sum256(content) == expected
+}
+
+// Update refreshes a remote/local source or re-renders a stored URI profile.
+func (s *Store) Update(ctx context.Context, id string) (UpdateResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	prepared, err := s.PrepareUpdate(ctx, id)
+	if err != nil {
 		return UpdateResult{}, err
 	}
-	profile.Active = state.ActiveID == id
-	return UpdateResult{Profile: profile, Changed: changed}, nil
+	if err := ctx.Err(); err != nil {
+		return UpdateResult{}, err
+	}
+	return s.CommitUpdate(prepared)
 }
 
 // Updatable returns profiles backed by a refreshable remote, local, or URI
@@ -532,6 +697,10 @@ func (s *Store) loadStateUnlocked() (persistedState, error) {
 	if err != nil {
 		return persistedState{}, fmt.Errorf("read profile state: %w", err)
 	}
+	return decodeState(content)
+}
+
+func decodeState(content []byte) (persistedState, error) {
 	var state persistedState
 	if err := yaml.Unmarshal(content, &state); err != nil {
 		return persistedState{}, fmt.Errorf("decode profile state: %w", err)

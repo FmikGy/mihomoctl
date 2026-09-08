@@ -53,8 +53,8 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Test
-        run: go test ./...
+      - name: Quality checks
+        run: make check
 
       - name: Create release tag
         if: github.event_name == 'workflow_dispatch' && steps.version.outputs.tag_exists == 'false'

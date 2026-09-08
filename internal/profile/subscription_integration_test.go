@@ -2,11 +2,11 @@ package profile
 
 import (
 	"context"
-	"io"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -78,13 +78,41 @@ func TestLiveSubscriptionEndToEnd(t *testing.T) {
 	}
 	command := exec.CommandContext(ctx, binary, "-t", "-d", coreRoot, "-f", configPath)
 	command.Env = childEnvironmentWithoutSubscription(coreRoot)
-	command.Stdout = io.Discard
-	command.Stderr = io.Discard
-	if err := command.Run(); err != nil {
+	output, runErr := command.CombinedOutput()
+	if runErr != nil {
 		if ctx.Err() != nil {
 			t.Fatal("mihomo validation of live subscription timed out")
 		}
-		t.Fatal("mihomo rejected the managed live subscription config")
+		t.Fatalf("mihomo rejected the managed live subscription config: %s", sanitizeMihomoTestOutput(output, subscriptionURL))
+	}
+}
+
+var mihomoTestURL = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://[^\s"'<>]+`)
+
+func sanitizeMihomoTestOutput(output []byte, secrets ...string) string {
+	message := string(output)
+	for _, secret := range secrets {
+		if secret != "" {
+			message = strings.ReplaceAll(message, secret, "[redacted]")
+		}
+	}
+	message = mihomoTestURL.ReplaceAllString(message, "[redacted URL]")
+	message = strings.TrimSpace(message)
+	const limit = 4 << 10
+	if len(message) > limit {
+		message = message[:limit] + "..."
+	}
+	return message
+}
+
+func TestSanitizeMihomoTestOutput(t *testing.T) {
+	const secretURL = "https://provider.example/rules.yaml?token=private"
+	message := sanitizeMihomoTestOutput([]byte(`provider download `+secretURL+` failed; fallback ss://credential@example:443`), secretURL)
+	if strings.Contains(message, "private") || strings.Contains(message, "credential") || strings.Contains(message, "provider.example") {
+		t.Fatalf("sanitized output retained sensitive data: %q", message)
+	}
+	if !strings.Contains(message, "provider download") || !strings.Contains(message, "failed") {
+		t.Fatalf("sanitized output lost useful context: %q", message)
 	}
 }
 

@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"mihomoctl/internal/domain"
 )
 
@@ -112,6 +114,68 @@ func TestStoreLocalInvalidUpdateKeepsLastGood(t *testing.T) {
 	}
 }
 
+func TestStoreLocalSourceMustResolveToRegularFile(t *testing.T) {
+	ctx := context.Background()
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("fifo is rejected without blocking", func(t *testing.T) {
+		fifo := filepath.Join(t.TempDir(), "subscription.fifo")
+		if err := unix.Mkfifo(fifo, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		started := time.Now()
+		_, err := store.AddLocal(ctx, "FIFO", fifo)
+		if err == nil || !strings.Contains(err.Error(), "regular file") {
+			t.Fatalf("FIFO import error = %v", err)
+		}
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("FIFO import blocked for %s", elapsed)
+		}
+	})
+
+	t.Run("fifo replacement is rejected without blocking", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "subscription.yaml")
+		if err := os.WriteFile(path, []byte(validYAML), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		created, err := store.AddLocal(ctx, "FIFO update", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := unix.Mkfifo(path, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		started := time.Now()
+		_, err = store.PrepareUpdate(ctx, created.ID)
+		if err == nil || !strings.Contains(err.Error(), "regular file") {
+			t.Fatalf("FIFO update error = %v", err)
+		}
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("FIFO update blocked for %s", elapsed)
+		}
+	})
+
+	t.Run("symlink to regular file remains supported", func(t *testing.T) {
+		target := filepath.Join(t.TempDir(), "subscription.yaml")
+		if err := os.WriteFile(target, []byte(validYAML), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(t.TempDir(), "subscription.yaml")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.AddLocal(ctx, "Symlink", link); err != nil {
+			t.Fatalf("regular-file symlink import failed: %v", err)
+		}
+	})
+}
+
 func TestStoreRemoteConditionalUpdateAndRedaction(t *testing.T) {
 	ctx := context.Background()
 	var mu sync.Mutex
@@ -197,6 +261,182 @@ func TestStoreRemoteConditionalUpdateAndRedaction(t *testing.T) {
 	stillGood, err := store.Config(profile.ID)
 	if err != nil || string(stillGood) != string(changed) {
 		t.Fatal("invalid remote update replaced last-known-good config")
+	}
+}
+
+func TestRemoteAddDoesNotBlockStoreReadsWhileDownloading(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseResponse := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		close(requestStarted)
+		select {
+		case <-releaseResponse:
+			_, _ = writer.Write([]byte(validYAML))
+		case <-request.Context().Done():
+		}
+	}))
+	defer server.Close()
+
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	addDone := make(chan error, 1)
+	go func() {
+		_, addErr := store.AddRemote(context.Background(), "Remote", server.URL, time.Hour)
+		addDone <- addErr
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		close(releaseResponse)
+		t.Fatal("remote add did not start")
+	}
+
+	listDone := make(chan error, 1)
+	go func() {
+		_, listErr := store.List()
+		listDone <- listErr
+	}()
+	select {
+	case err := <-listDone:
+		if err != nil {
+			close(releaseResponse)
+			t.Fatal(err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		close(releaseResponse)
+		t.Fatal("store read blocked behind remote download")
+	}
+	close(releaseResponse)
+	if err := <-addDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPrepareUpdateDoesNotHoldStoreMutexDuringDownload(t *testing.T) {
+	ctx := context.Background()
+	requestCount := 0
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requestCount++
+		if requestCount == 2 {
+			close(started)
+			<-release
+		}
+		_, _ = writer.Write([]byte(validYAML))
+	}))
+	defer server.Close()
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := store.AddRemote(ctx, "Remote", server.URL, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	preparedResult := make(chan PreparedUpdate, 1)
+	prepareErrors := make(chan error, 1)
+	go func() {
+		prepared, prepareErr := store.PrepareUpdate(ctx, profile.ID)
+		preparedResult <- prepared
+		prepareErrors <- prepareErr
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("update download did not start")
+	}
+	listDone := make(chan error, 1)
+	go func() {
+		_, listErr := store.List()
+		listDone <- listErr
+	}()
+	select {
+	case listErr := <-listDone:
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Store.List blocked behind update download")
+	}
+	close(release)
+	prepared := <-preparedResult
+	if err := <-prepareErrors; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CommitUpdate(prepared); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPrepareUpdateHonorsCanceledContextForLocalAndURI(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	localPath := filepath.Join(t.TempDir(), "local.yaml")
+	if err := os.WriteFile(localPath, []byte(validYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	local, err := store.AddLocal(context.Background(), "Local", localPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uri, err := store.AddURI(context.Background(), "URI", "trojan://private@example.com:443#Node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, profile := range []domain.Profile{local, uri} {
+		if _, err := store.PrepareUpdate(ctx, profile.ID); !errors.Is(err, context.Canceled) {
+			t.Fatalf("PrepareUpdate(%s) error = %v, want context.Canceled", profile.Name, err)
+		}
+		if _, err := store.Update(ctx, profile.ID); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Update(%s) error = %v, want context.Canceled", profile.Name, err)
+		}
+		unchanged, err := store.Get(profile.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !unchanged.LastUpdated.Equal(profile.LastUpdated) {
+			t.Fatalf("canceled update changed %s timestamp", profile.Name)
+		}
+	}
+}
+
+func TestCommitUpdateRejectsStaleBaseline(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := store.AddURI(context.Background(), "URI", "trojan://private@example.com:443#Node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := store.PrepareUpdate(context.Background(), profile.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CommitUpdate(prepared); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CommitUpdate(prepared); !errors.Is(err, ErrStaleUpdate) {
+		t.Fatalf("second CommitUpdate() error = %v, want ErrStaleUpdate", err)
+	}
+
+	prepared, err = store.PrepareUpdate(context.Background(), profile.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicWrite(filepath.Join(store.profileDir(profile.ID), "origin"), []byte("trojan://changed@example.com:443"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CommitUpdate(prepared); !errors.Is(err, ErrStaleUpdate) {
+		t.Fatalf("CommitUpdate() after origin change error = %v, want ErrStaleUpdate", err)
 	}
 }
 
@@ -334,5 +574,38 @@ func TestImmutableSnapshotNeverRefreshes(t *testing.T) {
 	}
 	if string(stored) != string(original) {
 		t.Fatalf("immutable config changed:\n%s", stored)
+	}
+}
+
+func TestAddSnapshotNormalizesBeforeWaitingForStoreLock(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store.mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			store.mu.Unlock()
+		}
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		_, addErr := store.AddSnapshot("Invalid", []byte("[unterminated"))
+		done <- addErr
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("invalid snapshot unexpectedly succeeded")
+		}
+	case <-time.After(time.Second):
+		store.mu.Unlock()
+		locked = false
+		<-done
+		t.Fatal("snapshot normalization waited for the store lock")
 	}
 }

@@ -71,7 +71,8 @@ func (d *Discoverer) discoverUnit(ctx context.Context) (Installation, error) {
 			continue
 		}
 		result, err := d.Runner.Run(ctx, "systemctl", "show", "--no-pager",
-			"--property=LoadState", "--property=FragmentPath", "--property=ExecStart", "--", unit)
+			"--property=LoadState", "--property=FragmentPath", "--property=ExecStart",
+			"--property=WorkingDirectory", "--", unit)
 		if err != nil {
 			continue
 		}
@@ -84,7 +85,7 @@ func (d *Discoverer) discoverUnit(ctx context.Context) (Installation, error) {
 		if err != nil {
 			return Installation{}, fmt.Errorf("parse %s ExecStart: %w", unit, err)
 		}
-		configDir, configPath := extractConfigPaths(args)
+		configDir, configPath := extractConfigPathsAt(args, properties["WorkingDirectory"])
 		return Installation{
 			BinaryPath: path,
 			Unit:       unit,
@@ -241,6 +242,10 @@ func splitCommandLine(value string) ([]string, error) {
 }
 
 func extractConfigPaths(args []string) (configDir, configPath string) {
+	return extractConfigPathsAt(args, "")
+}
+
+func extractConfigPathsAt(args []string, workingDirectory string) (configDir, configPath string) {
 	for i := 1; i < len(args); i++ {
 		arg := args[i]
 		switch arg {
@@ -262,10 +267,22 @@ func extractConfigPaths(args []string) (configDir, configPath string) {
 			}
 		}
 	}
+	workingDirectory = strings.TrimSpace(workingDirectory)
+	if strings.HasPrefix(workingDirectory, "-") || strings.HasPrefix(workingDirectory, "!") {
+		workingDirectory = workingDirectory[1:]
+	}
+	if !filepath.IsAbs(workingDirectory) {
+		workingDirectory = ""
+	}
+	if configDir != "" && !filepath.IsAbs(configDir) && workingDirectory != "" {
+		configDir = filepath.Join(workingDirectory, configDir)
+	}
 	if configPath == "" && configDir != "" {
 		configPath = filepath.Join(configDir, "config.yaml")
 	} else if configPath != "" && !filepath.IsAbs(configPath) && configDir != "" {
 		configPath = filepath.Join(configDir, configPath)
+	} else if configPath != "" && !filepath.IsAbs(configPath) && workingDirectory != "" {
+		configPath = filepath.Join(workingDirectory, configPath)
 	}
 	configDir = filepath.Clean(configDir)
 	configPath = filepath.Clean(configPath)

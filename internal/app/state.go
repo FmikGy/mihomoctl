@@ -19,11 +19,24 @@ import (
 
 const stateVersion = 1
 
+const (
+	dataDirEnvironment      = "MIHOMOCTL_DATA_DIR"
+	configEnvironment       = "MIHOMOCTL_CONFIG"
+	profileDirEnvironment   = "MIHOMOCTL_PROFILE_DIR"
+	backupDirEnvironment    = "MIHOMOCTL_BACKUP_DIR"
+	lockFileEnvironment     = "MIHOMOCTL_LOCK_FILE"
+	publicStateEnvironment  = "MIHOMOCTL_PUBLIC_STATE"
+	clientConfigEnvironment = "MIHOMOCTL_CLIENT_CONFIG"
+	serviceEnvironment      = "MIHOMOCTL_SERVICE"
+	timerEnvironment        = "MIHOMOCTL_TIMER"
+)
+
 type Paths struct {
 	ConfigFile     string
 	DataDir        string
 	ProfileRoot    string
 	BackupDir      string
+	OperationLock  string
 	PublicFile     string
 	ClientFile     string
 	DefaultService string
@@ -31,16 +44,68 @@ type Paths struct {
 }
 
 func DefaultPaths() Paths {
-	dataDir := envOr("MIHOMOCTL_DATA_DIR", "/var/lib/mihomoctl")
+	dataDir := envOr(dataDirEnvironment, "/var/lib/mihomoctl")
 	return Paths{
-		ConfigFile:     envOr("MIHOMOCTL_CONFIG", "/etc/mihomoctl/config.yaml"),
+		ConfigFile:     envOr(configEnvironment, "/etc/mihomoctl/config.yaml"),
 		DataDir:        dataDir,
-		ProfileRoot:    envOr("MIHOMOCTL_PROFILE_DIR", filepath.Join(dataDir, "store")),
-		BackupDir:      envOr("MIHOMOCTL_BACKUP_DIR", filepath.Join(dataDir, "backups")),
-		PublicFile:     envOr("MIHOMOCTL_PUBLIC_STATE", filepath.Join(dataDir, "public.json")),
+		ProfileRoot:    envOr(profileDirEnvironment, filepath.Join(dataDir, "store")),
+		BackupDir:      envOr(backupDirEnvironment, filepath.Join(dataDir, "backups")),
+		OperationLock:  envOr(lockFileEnvironment, filepath.Join(dataDir, ".operation.lock")),
+		PublicFile:     envOr(publicStateEnvironment, filepath.Join(dataDir, "public.json")),
 		ClientFile:     clientConfigPath(),
-		DefaultService: envOr("MIHOMOCTL_SERVICE", "mihomo.service"),
-		TimerUnit:      envOr("MIHOMOCTL_TIMER", "mihomoctl-update.timer"),
+		DefaultService: envOr(serviceEnvironment, "mihomo.service"),
+		TimerUnit:      envOr(timerEnvironment, "mihomoctl-update.timer"),
+	}
+}
+
+// defaultElevatedPaths describes what a clean root process launched by sudo
+// resolves without MIHOMOCTL_* overrides. The client path uses the real
+// caller's account instead of HOME or SUDO_* supplied by the parent process.
+func defaultElevatedPaths() Paths {
+	dataDir := "/var/lib/mihomoctl"
+	clientFile := ""
+	callerUID := strconv.Itoa(os.Getuid())
+	if os.Geteuid() == 0 {
+		if sudoUID := strings.TrimSpace(os.Getenv("SUDO_UID")); sudoUID != "" {
+			callerUID = sudoUID
+		}
+	}
+	if account, err := user.LookupId(callerUID); err == nil && account.HomeDir != "" {
+		clientFile = filepath.Join(account.HomeDir, ".config", "mihomoctl", "client.yaml")
+	}
+	return Paths{
+		ConfigFile:     "/etc/mihomoctl/config.yaml",
+		DataDir:        dataDir,
+		ProfileRoot:    filepath.Join(dataDir, "store"),
+		BackupDir:      filepath.Join(dataDir, "backups"),
+		OperationLock:  filepath.Join(dataDir, ".operation.lock"),
+		PublicFile:     filepath.Join(dataDir, "public.json"),
+		ClientFile:     clientFile,
+		DefaultService: "mihomo.service",
+		TimerUnit:      "mihomoctl-update.timer",
+	}
+}
+
+type supportedEnvironmentOverride struct {
+	name       string
+	value      string
+	unitSuffix string
+}
+
+// supportedEnvironmentOverrides is the complete environment contract accepted
+// by DefaultPaths. Privileged re-execution uses this fixed list instead of
+// forwarding the caller's environment.
+func (paths Paths) supportedEnvironmentOverrides() []supportedEnvironmentOverride {
+	return []supportedEnvironmentOverride{
+		{name: dataDirEnvironment, value: paths.DataDir},
+		{name: configEnvironment, value: paths.ConfigFile},
+		{name: profileDirEnvironment, value: paths.ProfileRoot},
+		{name: backupDirEnvironment, value: paths.BackupDir},
+		{name: lockFileEnvironment, value: paths.OperationLock},
+		{name: publicStateEnvironment, value: paths.PublicFile},
+		{name: clientConfigEnvironment, value: paths.ClientFile},
+		{name: serviceEnvironment, value: paths.DefaultService, unitSuffix: ".service"},
+		{name: timerEnvironment, value: paths.TimerUnit, unitSuffix: ".timer"},
 	}
 }
 
@@ -80,9 +145,11 @@ type publicProfile struct {
 }
 
 type clientOwnerPlan struct {
-	uid         int
-	gid         int
-	directories []string
+	uid                 int
+	gid                 int
+	home                string
+	directoryComponents []string
+	filename            string
 }
 
 func envOr(key, fallback string) string {
@@ -93,10 +160,14 @@ func envOr(key, fallback string) string {
 }
 
 func clientConfigPath() string {
-	if value := strings.TrimSpace(os.Getenv("MIHOMOCTL_CLIENT_CONFIG")); value != "" {
+	return clientConfigPathForEUID(os.Geteuid())
+}
+
+func clientConfigPathForEUID(euid int) string {
+	if value := strings.TrimSpace(os.Getenv(clientConfigEnvironment)); value != "" {
 		return value
 	}
-	if uid := strings.TrimSpace(os.Getenv("SUDO_UID")); uid != "" {
+	if uid := strings.TrimSpace(os.Getenv("SUDO_UID")); euid == 0 && uid != "" {
 		if account, err := user.LookupId(uid); err == nil && account.HomeDir != "" {
 			return filepath.Join(account.HomeDir, ".config", "mihomoctl", "client.yaml")
 		}
@@ -111,7 +182,7 @@ func clientConfigPath() string {
 
 func loadYAML[T any](path string) (T, error) {
 	var value T
-	content, err := os.ReadFile(path)
+	content, _, err := readRegularFileNoFollow(path, maxApplicationStateBytes)
 	if err != nil {
 		return value, err
 	}
@@ -130,6 +201,13 @@ func writeYAML(path string, value any, mode os.FileMode) error {
 }
 
 func atomicWrite(path string, content []byte, mode os.FileMode) error {
+	if int64(len(content)) > maxApplicationStateBytes {
+		return fmt.Errorf("写入 %s 失败: 状态文件超过 %d 字节上限", path, maxApplicationStateBytes)
+	}
+	return atomicWriteOwned(path, content, mode, -1, -1)
+}
+
+func atomicWriteOwned(path string, content []byte, mode os.FileMode, uid, gid int) error {
 	directory := filepath.Dir(path)
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return fmt.Errorf("创建目录 %s 失败: %w", directory, err)
@@ -140,6 +218,12 @@ func atomicWrite(path string, content []byte, mode os.FileMode) error {
 	}
 	tempPath := temp.Name()
 	defer os.Remove(tempPath)
+	if uid >= 0 || gid >= 0 {
+		if err := temp.Chown(uid, gid); err != nil {
+			temp.Close()
+			return err
+		}
+	}
 	if err := temp.Chmod(mode); err != nil {
 		temp.Close()
 		return err
@@ -158,9 +242,6 @@ func atomicWrite(path string, content []byte, mode os.FileMode) error {
 	if err := os.Rename(tempPath, path); err != nil {
 		return err
 	}
-	if err := os.Chmod(path, mode); err != nil {
-		return err
-	}
 	directoryHandle, err := os.Open(directory)
 	if err != nil {
 		return err
@@ -171,7 +252,20 @@ func atomicWrite(path string, content []byte, mode os.FileMode) error {
 }
 
 func (a *App) loadState() error {
-	state, err := loadYAML[persistedState](a.paths.ConfigFile)
+	var state persistedState
+	var err error
+	if os.Geteuid() == 0 {
+		var content []byte
+		content, err = platform.ReadManagedConfig(a.paths.ConfigFile, maxApplicationStateBytes)
+		if err == nil {
+			err = yaml.Unmarshal(content, &state)
+			if err != nil {
+				err = &InvalidStateError{Cause: fmt.Errorf("读取 %s 失败: %w", a.paths.ConfigFile, err)}
+			}
+		}
+	} else {
+		state, err = loadYAML[persistedState](a.paths.ConfigFile)
+	}
 	if err != nil {
 		return err
 	}
@@ -194,9 +288,22 @@ func (a *App) saveState(state persistedState) error {
 }
 
 func (a *App) loadClient() error {
-	client, err := loadYAML[clientState](a.paths.ClientFile)
+	owner, err := planClientOwnership(a.paths.ClientFile)
 	if err != nil {
 		return err
+	}
+	var content []byte
+	if owner == nil {
+		content, err = readLocalClientFile(a.paths.ClientFile)
+	} else {
+		content, err = readOwnedClientFile(owner)
+	}
+	if err != nil {
+		return err
+	}
+	var client clientState
+	if err := yaml.Unmarshal(content, &client); err != nil {
+		return &InvalidStateError{Cause: fmt.Errorf("读取 %s 失败: %w", a.paths.ClientFile, err)}
 	}
 	if client.Version != stateVersion {
 		return &InvalidStateError{Cause: fmt.Errorf("不支持的客户端状态版本 %d", client.Version)}
@@ -218,21 +325,17 @@ func (a *App) saveClient(state persistedState, activeProfile string) error {
 	if err != nil {
 		return err
 	}
-	if err := writeYAML(a.paths.ClientFile, client, 0o600); err != nil {
-		return err
+	content, err := yaml.Marshal(client)
+	if err != nil {
+		return fmt.Errorf("编码状态失败: %w", err)
 	}
-	if owner != nil {
-		for _, directory := range owner.directories {
-			if err := os.Chown(directory, owner.uid, owner.gid); err != nil {
-				return fmt.Errorf("设置客户端目录所有者失败: %w", err)
-			}
-			if err := os.Chmod(directory, 0o700); err != nil {
-				return fmt.Errorf("设置客户端目录权限失败: %w", err)
-			}
-		}
-		if err := os.Chown(a.paths.ClientFile, owner.uid, owner.gid); err != nil {
-			return fmt.Errorf("设置客户端状态所有者失败: %w", err)
-		}
+	if owner == nil {
+		err = atomicWrite(a.paths.ClientFile, content, 0o600)
+	} else {
+		err = writeOwnedClientFile(owner, content, 0o600, owner.uid, owner.gid)
+	}
+	if err != nil {
+		return err
 	}
 	a.client = &client
 	a.clientLoadErr = nil
@@ -257,42 +360,36 @@ func planClientOwnership(path string) (*clientOwnerPlan, error) {
 	if err != nil {
 		return nil, err
 	}
+	resolvedHome, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		return nil, fmt.Errorf("解析 sudo 用户主目录失败: %w", err)
+	}
 	target, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
 	}
 	relative, err := filepath.Rel(home, target)
-	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 		return nil, errors.New("客户端状态文件必须位于 sudo 用户主目录中")
 	}
-
-	directory := filepath.Dir(target)
-	relativeDirectory, err := filepath.Rel(home, directory)
-	if err != nil {
-		return nil, err
-	}
-	plan := &clientOwnerPlan{uid: uid, gid: gid}
-	current := home
-	if relativeDirectory != "." {
-		for _, component := range strings.Split(relativeDirectory, string(filepath.Separator)) {
-			current = filepath.Join(current, component)
-			info, statErr := os.Lstat(current)
-			switch {
-			case errors.Is(statErr, os.ErrNotExist):
-				plan.directories = append(plan.directories, current)
-			case statErr != nil:
-				return nil, statErr
-			case info.Mode()&os.ModeSymlink != 0:
-				return nil, fmt.Errorf("客户端状态目录不能是符号链接: %s", current)
-			case !info.IsDir():
-				return nil, fmt.Errorf("客户端状态路径不是目录: %s", current)
+	directory := filepath.Dir(relative)
+	components := []string(nil)
+	if directory != "." {
+		components = strings.Split(directory, string(filepath.Separator))
+		for _, component := range components {
+			if component == "" || component == "." || component == ".." {
+				return nil, errors.New("客户端状态路径无效")
 			}
 		}
 	}
-	if directory != home && (len(plan.directories) == 0 || plan.directories[len(plan.directories)-1] != directory) {
-		plan.directories = append(plan.directories, directory)
+	filename := filepath.Base(relative)
+	if filename == "" || filename == "." || filename == ".." {
+		return nil, errors.New("客户端状态文件名无效")
 	}
-	return plan, nil
+	return &clientOwnerPlan{
+		uid: uid, gid: gid, home: resolvedHome,
+		directoryComponents: components, filename: filename,
+	}, nil
 }
 
 func (a *App) writePublicProfiles(profiles []domain.Profile) error {
@@ -312,7 +409,7 @@ func (a *App) writePublicProfiles(profiles []domain.Profile) error {
 	}
 	state := publicState{SchemaVersion: stateVersion, Profiles: public}
 	if a.state != nil && a.state.Installation.ConfigPath != "" {
-		content, err := os.ReadFile(a.state.Installation.ConfigPath)
+		content, err := platform.ReadManagedConfig(a.state.Installation.ConfigPath, platform.MaxManagedConfigBytes)
 		if err != nil {
 			return fmt.Errorf("读取活动 Mihomo 配置失败: %w", err)
 		}
@@ -357,7 +454,7 @@ func (a *App) readPublicSettings() (domain.EffectiveConfig, bool, error) {
 }
 
 func (a *App) readPublicState() (publicState, error) {
-	content, err := os.ReadFile(a.paths.PublicFile)
+	content, _, err := readRegularFileNoFollow(a.paths.PublicFile, maxApplicationStateBytes)
 	if err != nil {
 		return publicState{}, err
 	}

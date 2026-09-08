@@ -278,6 +278,84 @@ func TestUIRefactorBackgroundRefreshDoesNotOwnLoadingState(t *testing.T) {
 	}
 }
 
+func TestUIRefactorMutationRejectsStatusStartedBeforeCompletion(t *testing.T) {
+	m := testModel()
+	m.status.ActiveProfile = "current"
+	requestedAt := time.Now().Add(-time.Second)
+	m.statusRequest = requestState{inFlight: true, generation: 5}
+
+	var cmd tea.Cmd
+	m, cmd = updateUIModel(t, m, operationMsg{message: "完成"})
+	if !m.statusRequest.queued {
+		t.Fatalf("successful mutation did not queue a forced status refresh: state=%+v", m.statusRequest)
+	}
+	m, cmd = updateUIModel(t, m, statusMsg{
+		status:      domain.RuntimeStatus{ActiveProfile: "stale"},
+		requestedAt: requestedAt,
+		generation:  5,
+	})
+	if m.status.ActiveProfile != "current" {
+		t.Fatalf("pre-mutation status was accepted: %q", m.status.ActiveProfile)
+	}
+	if cmd == nil || !m.statusRequest.inFlight || m.statusRequest.generation <= 5 {
+		t.Fatalf("queued post-mutation refresh was not started: cmd=%v state=%+v", cmd != nil, m.statusRequest)
+	}
+}
+
+func TestUIRefactorMutationInvalidatesCurrentPageSnapshot(t *testing.T) {
+	tests := []struct {
+		name    string
+		page    page
+		prepare func(*Model, context.CancelFunc)
+		stale   tea.Msg
+		assert  func(*testing.T, Model)
+	}{
+		{
+			name: "profiles", page: pageProfiles,
+			prepare: func(m *Model, cancel context.CancelFunc) {
+				m.profiles = []domain.Profile{{Name: "current"}}
+				m.profileRequest = requestState{inFlight: true, generation: 7, cancel: cancel}
+			},
+			stale: profilesMsg{profiles: []domain.Profile{{Name: "stale"}}, generation: 7},
+			assert: func(t *testing.T, m Model) {
+				if len(m.profiles) != 1 || m.profiles[0].Name != "current" {
+					t.Fatalf("stale profile response was applied: %#v", m.profiles)
+				}
+			},
+		},
+		{
+			name: "connections", page: pageConnections,
+			prepare: func(m *Model, cancel context.CancelFunc) {
+				m.status.Service.Active = true
+				m.connections = []domain.Connection{{ID: "current"}}
+				m.connectionRequest = requestState{inFlight: true, generation: 11, cancel: cancel}
+			},
+			stale: connectionsMsg{connections: []domain.Connection{{ID: "stale"}}, generation: 11},
+			assert: func(t *testing.T, m Model) {
+				if len(m.connections) != 1 || m.connections[0].ID != "current" {
+					t.Fatalf("stale connection response was applied: %#v", m.connections)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			m := testModel()
+			m.page = test.page
+			canceled := false
+			test.prepare(&m, func() { canceled = true })
+
+			m, cmd := updateUIModel(t, m, operationMsg{message: "完成"})
+			if !canceled || cmd == nil {
+				t.Fatalf("successful operation did not replace old page request: canceled=%v cmd=%v", canceled, cmd != nil)
+			}
+			m, _ = updateUIModel(t, m, test.stale)
+			test.assert(t, m)
+		})
+	}
+}
+
 func TestUIRefactorNavigationAndRefreshStayNonBlocking(t *testing.T) {
 	m := testModel()
 	m.page = pageOverview
@@ -323,16 +401,16 @@ func TestUIRefactorPausedLogsKeepBoundedBufferAndUnread(t *testing.T) {
 	m := testModel()
 	m.page, m.logPaused, m.logGeneration = pageLogs, true, 7
 	m.logs = nil
-	m.logCh = make(chan domain.LogEntry)
+	entries := make([]domain.LogEntry, 1005)
 	for i := 0; i < 1005; i++ {
-		entry := domain.LogEntry{Time: "12:00:00", Level: "info", Message: "message-" + strconv.Itoa(i)}
-		m, _ = updateUIModel(t, m, logMsg{entry: entry, ok: true, generation: 7})
+		entries[i] = domain.LogEntry{Time: "12:00:00", Level: "info", Message: "message-" + strconv.Itoa(i)}
 	}
+	m, _ = updateUIModel(t, m, logBatchMsg{entries: entries, generation: 7})
 	if len(m.logs) != 1000 {
 		t.Fatalf("paused log buffer length = %d, want 1000", len(m.logs))
 	}
-	if m.logs[0].Message != "message-5" || m.logs[len(m.logs)-1].Message != "message-1004" {
-		t.Fatalf("paused log buffer retained wrong range: first=%q last=%q", m.logs[0].Message, m.logs[len(m.logs)-1].Message)
+	if first, last := m.logViewEntry(0), m.logViewEntry(m.logViewLen()-1); first.Message != "message-5" || last.Message != "message-1004" {
+		t.Fatalf("paused log buffer retained wrong range: first=%q last=%q", first.Message, last.Message)
 	}
 	if m.logUnread != 1005 {
 		t.Fatalf("paused unread count = %d, want 1005", m.logUnread)
@@ -573,6 +651,81 @@ func TestUIRefactorHeaderOnlyTreatsStatusFailureAsUnavailable(t *testing.T) {
 	m.setSourceError(errorStatus, errors.New("状态刷新失败"))
 	if header := ansi.Strip(m.renderHeader()); !strings.Contains(header, "不可用") {
 		t.Fatalf("status error was not reflected in header: %q", header)
+	}
+}
+
+func TestUIRefactorUnknownStatusFailureClearsStaleRunningState(t *testing.T) {
+	m := testModel()
+	m.page = pageLogs
+	m.status.Service = domain.ServiceStatus{Active: true, Enabled: true, State: "active", PID: 42}
+	m.status.Memory = 1024
+	m.status.ConnectionCount = 3
+	m.status.Traffic = domain.Traffic{Up: 10, Down: 20}
+	m.trafficHistory = []trafficSample{{up: 10, down: 20}}
+
+	trafficCtx, cancelTraffic := context.WithCancel(context.Background())
+	logCtx, cancelLogs := context.WithCancel(context.Background())
+	m.trafficCancel = cancelTraffic
+	m.trafficCh = make(chan domain.Traffic)
+	m.trafficReconnectPending = true
+	m.logCancel = cancelLogs
+	m.logCh = make(chan domain.LogEntry)
+	m.logReconnectPending = true
+	m.statusRequest = requestState{inFlight: true, generation: 5}
+
+	m, cmd := updateUIModel(t, m, statusMsg{
+		err:         errors.New("无法连接 Mihomo API"),
+		requestedAt: time.Now(),
+		generation:  5,
+	})
+	if cmd != nil {
+		t.Fatal("unknown service status scheduled a runtime command")
+	}
+	if serviceStatusAvailable(m.status.Service) || m.status.Service.Active {
+		t.Fatalf("stale service status retained after complete failure: %#v", m.status.Service)
+	}
+	if m.trafficStreamPresent() || m.logStreamPresent() {
+		t.Fatalf("runtime streams retained after complete failure: traffic=%v logs=%v", m.trafficStreamPresent(), m.logStreamPresent())
+	}
+	for name, ctx := range map[string]context.Context{"traffic": trafficCtx, "logs": logCtx} {
+		select {
+		case <-ctx.Done():
+		default:
+			t.Fatalf("%s stream context was not canceled", name)
+		}
+	}
+	if m.status.Memory != 0 || m.status.ConnectionCount != 0 || m.status.Traffic != (domain.Traffic{}) || len(m.trafficHistory) != 0 {
+		t.Fatalf("stale runtime telemetry retained: status=%#v history=%#v", m.status, m.trafficHistory)
+	}
+	header := ansi.Strip(m.renderHeader())
+	if !strings.Contains(header, "不可用") || strings.Contains(header, "运行中") {
+		t.Fatalf("complete status failure rendered stale service state: %q", header)
+	}
+}
+
+func TestUIRefactorServiceRecoveryForcesRuntimePageRefresh(t *testing.T) {
+	m := testModel()
+	m.page = pageProxies
+	now := time.Now()
+	m.groupRequest = requestState{lastStart: now}
+	m.statusRequest = requestState{inFlight: true, generation: 1}
+
+	m, _ = updateUIModel(t, m, statusMsg{
+		status:      domain.RuntimeStatus{Service: domain.ServiceStatus{State: "inactive"}},
+		requestedAt: now,
+		generation:  1,
+	})
+	if m.status.Service.Active {
+		t.Fatal("inactive status was not applied")
+	}
+	m.statusRequest = requestState{inFlight: true, generation: 2}
+	m, cmd := updateUIModel(t, m, statusMsg{
+		status:      domain.RuntimeStatus{Service: domain.ServiceStatus{Active: true, State: "running"}},
+		requestedAt: now.Add(time.Second),
+		generation:  2,
+	})
+	if cmd == nil || !m.groupRequest.inFlight {
+		t.Fatalf("service recovery did not force proxy refresh: cmd=%v request=%+v", cmd != nil, m.groupRequest)
 	}
 }
 
