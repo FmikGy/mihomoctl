@@ -748,6 +748,137 @@ func TestStatusLiveAPIOverridesPublicSnapshot(t *testing.T) {
 	}
 }
 
+func TestStatusKeepsConfiguredMixedPortWhenCoreReportsZero(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/version":
+			_, _ = writer.Write([]byte(`{"version":"1.19.0"}`))
+		case "/configs":
+			_, _ = writer.Write([]byte(`{"mode":"rule","mixed-port":0,"log-level":"info","tun":{"enable":false}}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	api, err := mihomo.New(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := testPaths(t.TempDir())
+	if err := os.MkdirAll(paths.DataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	settings := domain.EffectiveConfig{Mode: domain.ModeRule, MixedPort: 7980, LogLevel: "info"}
+	content, err := json.Marshal(publicState{SchemaVersion: 1, Profiles: []publicProfile{}, Settings: &settings})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.PublicFile, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	application := &App{
+		paths: paths, runner: &fakeRunner{active: true}, euid: func() int { return 1000 },
+		client: &clientState{Service: "mihomo.service"}, api: api,
+	}
+	status, err := application.CoreStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.MixedPort != 7980 {
+		t.Fatalf("mixed port = %d, want configured value 7980", status.MixedPort)
+	}
+}
+
+func TestUseProfileRemembersSelectorChoicesPerProfile(t *testing.T) {
+	fixture := newTransactionFixture(t)
+	secondPath := filepath.Join(filepath.Dir(fixture.configPath), "remembered-second.yaml")
+	secondConfig := []byte("mixed-port: 7891\nmode: rule\ncustom-field: remembered-second\nproxies: []\nproxy-groups: []\nrules:\n  - MATCH,DIRECT\n")
+	if err := os.WriteFile(secondPath, secondConfig, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.application.AddProfile(context.Background(), "Second", secondPath, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	profiles, err := fixture.application.Profiles(context.Background())
+	if err != nil || len(profiles) != 2 {
+		t.Fatalf("profiles = %#v, %v", profiles, err)
+	}
+	first, second := profiles[0], profiles[1]
+	if err := fixture.application.store.SaveSelections(second.ID, map[string]string{"Proxies": "B2"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var proxySnapshots atomic.Int32
+	var selectedMu sync.Mutex
+	selected := make([]string, 0, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/version":
+			_, _ = writer.Write([]byte(`{"version":"1.19.0"}`))
+		case request.Method == http.MethodGet && request.URL.Path == "/proxies":
+			index := proxySnapshots.Add(1)
+			prefix := "A"
+			if index == 2 || index == 3 {
+				prefix = "B"
+			}
+			_, _ = fmt.Fprintf(writer, `{"proxies":{"Proxies":{"name":"Proxies","type":"Selector","now":"%[1]s2","all":["%[1]s1","%[1]s2"]},"%[1]s1":{"name":"%[1]s1","type":"AnyTLS","alive":true},"%[1]s2":{"name":"%[1]s2","type":"AnyTLS","alive":true},"Auto":{"name":"Auto","type":"URLTest","now":"%[1]s1","all":["%[1]s1","%[1]s2"]}}}`, prefix)
+		case request.Method == http.MethodPut && request.URL.Path == "/proxies/Proxies":
+			var payload struct {
+				Name string `json:"name"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Errorf("decode selector choice: %v", err)
+			}
+			selectedMu.Lock()
+			selected = append(selected, payload.Name)
+			selectedMu.Unlock()
+			writer.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	fixture.application.mu.Lock()
+	state := *fixture.application.state
+	state.Controller = strings.TrimPrefix(server.URL, "http://")
+	if err := fixture.application.saveState(state); err != nil {
+		fixture.application.mu.Unlock()
+		t.Fatal(err)
+	}
+	fixture.application.rebuildAPI()
+	fixture.application.mu.Unlock()
+	fixture.runner.mu.Lock()
+	fixture.runner.active = true
+	fixture.runner.mu.Unlock()
+
+	if err := fixture.application.UseProfile(context.Background(), second.ID); err != nil {
+		t.Fatal(err)
+	}
+	firstSelections, err := fixture.application.store.Selections(first.ID)
+	if err != nil || firstSelections["Proxies"] != "A2" {
+		t.Fatalf("first selections = %#v, %v", firstSelections, err)
+	}
+	if _, exists := firstSelections["Auto"]; exists {
+		t.Fatalf("automatic group was remembered: %#v", firstSelections)
+	}
+	if err := fixture.application.UseProfile(context.Background(), first.ID); err != nil {
+		t.Fatal(err)
+	}
+	secondSelections, err := fixture.application.store.Selections(second.ID)
+	if err != nil || secondSelections["Proxies"] != "B2" {
+		t.Fatalf("second selections = %#v, %v", secondSelections, err)
+	}
+	selectedMu.Lock()
+	defer selectedMu.Unlock()
+	if len(selected) != 2 || selected[0] != "B2" || selected[1] != "A2" {
+		t.Fatalf("restored selector choices = %#v", selected)
+	}
+}
+
 func TestStatusFetchesCoreAndTelemetryConcurrently(t *testing.T) {
 	memoryStarted := make(chan struct{})
 	var memoryOnce sync.Once

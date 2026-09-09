@@ -7,10 +7,12 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
 
+	"mihomoctl/internal/domain"
 	"mihomoctl/internal/platform"
 )
 
@@ -224,6 +226,120 @@ func TestInteractiveConfigSuccessPreservesMetadata(t *testing.T) {
 	})
 	if m.logLevel != "debug" || m.toast != "日志级别已更新" || m.loading || m.privilegedOperation || m.authorizing {
 		t.Fatalf("config completion state = level:%q toast:%q loading:%v privileged:%v authorizing:%v", m.logLevel, m.toast, m.loading, m.privilegedOperation, m.authorizing)
+	}
+}
+
+func TestMixedPortSuccessUpdatesStatusBeforeRefresh(t *testing.T) {
+	m := elevatedTestModel()
+	m.status.ConfigAvailable = false
+	m.status.MixedPort = 0
+	m.loading = true
+	m.privilegedOperation = true
+	m.authorizing = true
+	m.mutationGeneration = 4
+
+	m, _ = updateUIModel(t, m, operationMsg{
+		message: "混合端口已更新", generation: 4, privileged: true, interactive: true,
+		configKey: string(settingMixedPort), configValue: "7980",
+	})
+	if !m.status.ConfigAvailable || m.status.MixedPort != 7980 {
+		t.Fatalf("mixed port status = available:%v port:%d", m.status.ConfigAvailable, m.status.MixedPort)
+	}
+}
+
+func TestRuntimeMutationSuppressesExpectedControllerDisconnects(t *testing.T) {
+	m := elevatedTestModel()
+	m.page = pageLogs
+	m.status = domain.RuntimeStatus{
+		Service:     domain.ServiceStatus{Active: true, State: "running"},
+		CoreVersion: "v1.19.30",
+	}
+	trafficCtx, cancelTraffic := context.WithCancel(context.Background())
+	logCtx, cancelLogs := context.WithCancel(context.Background())
+	m.trafficCancel = cancelTraffic
+	m.trafficCh = make(chan domain.Traffic)
+	m.logCancel = cancelLogs
+	m.logCh = make(chan domain.LogEntry)
+	m.setSourceError(errorTraffic, errors.New("旧流量错误"))
+	m.setSourceError(errorLogs, errors.New("旧日志错误"))
+
+	cmd := m.beginPrivilegedConfigOperation("修改混合端口", "混合端口已更新", string(settingMixedPort), "7980")
+	if cmd == nil || !m.runtimeMutation || m.trafficStreamPresent() || m.logStreamPresent() {
+		t.Fatalf("runtime mutation state = cmd:%v mutation:%v traffic:%v logs:%v", cmd != nil, m.runtimeMutation, m.trafficStreamPresent(), m.logStreamPresent())
+	}
+	if _, exists := m.errors[errorTraffic]; exists {
+		t.Fatal("runtime mutation retained the old traffic error")
+	}
+	if _, exists := m.errors[errorLogs]; exists {
+		t.Fatal("runtime mutation retained the old log error")
+	}
+	for name, ctx := range map[string]context.Context{"traffic": trafficCtx, "logs": logCtx} {
+		select {
+		case <-ctx.Done():
+		default:
+			t.Fatalf("%s stream was not canceled before the mutation", name)
+		}
+	}
+	if refresh := m.beginStatusRefresh(time.Now(), true); refresh != nil {
+		t.Fatal("status refresh started while the runtime was being changed")
+	}
+
+	operation := cmd().(operationMsg)
+	m, _ = updateUIModel(t, m, operation)
+	if m.runtimeMutation || m.runtimeRecoveryUntil.IsZero() {
+		t.Fatalf("post-mutation recovery state = mutation:%v until:%v", m.runtimeMutation, m.runtimeRecoveryUntil)
+	}
+	statusGeneration := m.statusRequest.generation
+	requestedAt := m.statusSnapshotFloor.Add(time.Nanosecond)
+	m, _ = updateUIModel(t, m, statusMsg{
+		status: domain.RuntimeStatus{
+			Service:     domain.ServiceStatus{Active: true, State: "running"},
+			CoreVersion: "控制器不可用",
+		},
+		err:         errors.New("Mihomo 控制器不可用: 流量流已断开"),
+		generation:  statusGeneration,
+		requestedAt: requestedAt,
+	})
+	if _, exists := m.errors[errorStatus]; exists {
+		t.Fatalf("recovery status error was shown: %#v", m.errors[errorStatus])
+	}
+	if m.status.CoreVersion != "v1.19.30" {
+		t.Fatalf("transient recovery replaced the core version with %q", m.status.CoreVersion)
+	}
+
+	m.trafficGeneration = 20
+	m.trafficErrCh = make(chan error)
+	m, reconnect := updateUIModel(t, m, trafficErrMsg{
+		err: errors.New("流量流已断开"), generation: 20,
+	})
+	if reconnect == nil || !m.trafficReconnectPending {
+		t.Fatal("suppressed stream error did not retain reconnect behavior")
+	}
+	if _, exists := m.errors[errorTraffic]; exists {
+		t.Fatalf("recovery traffic error was shown: %#v", m.errors[errorTraffic])
+	}
+
+	m, _ = updateUIModel(t, m, statusMsg{
+		status: domain.RuntimeStatus{
+			Service:     domain.ServiceStatus{Active: true, State: "running"},
+			CoreVersion: "v1.19.30",
+		},
+	})
+	if !m.runtimeRecoveryUntil.IsZero() {
+		t.Fatalf("successful status did not end recovery: %v", m.runtimeRecoveryUntil)
+	}
+	m.setSourceError(errorTraffic, errors.New("持续的流量错误"))
+	if _, exists := m.errors[errorTraffic]; !exists {
+		t.Fatal("runtime errors remained suppressed after recovery")
+	}
+}
+
+func TestExpiredRuntimeRecoveryShowsPersistentError(t *testing.T) {
+	m := testModel()
+	m.runtimeRecoveryUntil = time.Now().Add(-time.Second)
+	m.setSourceError(errorStatus, errors.New("Mihomo 控制器仍不可用"))
+	if !strings.Contains(m.err, "仍不可用") {
+		t.Fatalf("persistent controller error was hidden: %q", m.err)
 	}
 }
 

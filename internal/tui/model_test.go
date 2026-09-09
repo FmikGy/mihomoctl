@@ -462,6 +462,64 @@ func TestTrafficSparklineScalingAndWidth(t *testing.T) {
 	}
 }
 
+func TestTrafficAreaPlotScalesVertically(t *testing.T) {
+	got := trafficAreaPlot([]int64{0, 50, 100}, 3, 4, 100)
+	want := []string{"  █", "  █", " ██", "▁██"}
+	if len(got) != len(want) {
+		t.Fatalf("plot height = %d, want %d", len(got), len(want))
+	}
+	for row := range want {
+		if got[row] != want[row] {
+			t.Fatalf("plot row %d = %q, want %q", row, got[row], want[row])
+		}
+		if width := ansi.StringWidth(got[row]); width != 3 {
+			t.Fatalf("plot row %d width = %d, want 3", row, width)
+		}
+	}
+}
+
+func TestOverviewTrafficChartsUseAvailableHeight(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	axisRows := func(height int) (int, string) {
+		m := testModel()
+		m.width, m.height, m.page = 80, height, pageOverview
+		started := time.Unix(100, 0)
+		for index := range 30 {
+			m.trafficHistory = append(m.trafficHistory, trafficSample{
+				at:   started.Add(time.Duration(index) * time.Second),
+				down: int64((index + 1) * 1024),
+				up:   int64((30 - index) * 512),
+			})
+		}
+		view := ansi.Strip(m.render())
+		count := 0
+		for _, line := range strings.Split(view, "\n") {
+			if strings.Contains(line, "│") || strings.Contains(line, "┤") {
+				count++
+			}
+			if width := ansi.StringWidth(line); width > m.width {
+				t.Fatalf("%dx%d overview line width = %d, want <= %d", m.width, height, width, m.width)
+			}
+		}
+		return count, view
+	}
+	standardRows, standardView := axisRows(24)
+	tallRows, tallView := axisRows(34)
+	if standardRows < 7 {
+		t.Fatalf("standard overview chart has only %d vertical rows:\n%s", standardRows, standardView)
+	}
+	if tallRows <= standardRows {
+		t.Fatalf("tall overview did not grow charts: standard=%d tall=%d\n%s", standardRows, tallRows, tallView)
+	}
+	for _, view := range []string{standardView, tallView} {
+		for _, text := range []string{"↓ 下载", "↑ 上传", "当前", "峰", "累计下载", "运行状态", "混合端口"} {
+			if !strings.Contains(view, text) {
+				t.Fatalf("responsive overview missing %q:\n%s", text, view)
+			}
+		}
+	}
+}
+
 func TestOverviewShowsTrafficChartsAtMinimumSize(t *testing.T) {
 	m := testModel()
 	m.width, m.height, m.page = 60, 16, pageOverview

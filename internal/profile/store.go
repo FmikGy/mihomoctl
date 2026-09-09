@@ -21,12 +21,17 @@ import (
 	"mihomoctl/internal/domain"
 )
 
-const stateVersion = 1
+const (
+	stateVersion                 = 1
+	maxRememberedSelectionGroups = 512
+	maxRememberedSelectionName   = 4096
+)
 
 type persistedState struct {
-	Version  int              `yaml:"version"`
-	ActiveID string           `yaml:"active_profile,omitempty"`
-	Profiles []domain.Profile `yaml:"profiles,omitempty"`
+	Version    int                          `yaml:"version"`
+	ActiveID   string                       `yaml:"active_profile,omitempty"`
+	Profiles   []domain.Profile             `yaml:"profiles,omitempty"`
+	Selections map[string]map[string]string `yaml:"selected_proxies,omitempty"`
 }
 
 // Store owns profile metadata, original sources, and last-known-good configs.
@@ -312,6 +317,47 @@ func (s *Store) Use(id string) (domain.Profile, error) {
 	return profile, nil
 }
 
+// Selections returns the last manual selector choices remembered for a
+// profile. The returned map is detached from the store's internal state.
+func (s *Store) Selections(id string) (map[string]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.loadStateUnlocked()
+	if err != nil {
+		return nil, err
+	}
+	if _, _, err := findProfile(state, id); err != nil {
+		return nil, err
+	}
+	return cloneSelections(state.Selections[id]), nil
+}
+
+// SaveSelections replaces the remembered manual selector choices for a
+// profile. Empty choices remove the profile's entry from persisted state.
+func (s *Store) SaveSelections(id string, selections map[string]string) error {
+	if err := validateSelections(selections); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.loadStateUnlocked()
+	if err != nil {
+		return err
+	}
+	if _, _, err := findProfile(state, id); err != nil {
+		return err
+	}
+	if len(selections) == 0 {
+		delete(state.Selections, id)
+	} else {
+		if state.Selections == nil {
+			state.Selections = make(map[string]map[string]string)
+		}
+		state.Selections[id] = cloneSelections(selections)
+	}
+	return s.saveStateUnlocked(state)
+}
+
 // Remove deletes profile metadata and its private source files.
 func (s *Store) Remove(id string) error {
 	s.mu.Lock()
@@ -325,6 +371,7 @@ func (s *Store) Remove(id string) error {
 		return err
 	}
 	state.Profiles = append(state.Profiles[:index], state.Profiles[index+1:]...)
+	delete(state.Selections, id)
 	if state.ActiveID == id {
 		state.ActiveID = ""
 		if len(state.Profiles) > 0 {
@@ -718,7 +765,41 @@ func decodeState(content []byte) (persistedState, error) {
 	if state.ActiveID != "" && !seen[state.ActiveID] {
 		return persistedState{}, fmt.Errorf("active profile does not exist")
 	}
+	for id, selections := range state.Selections {
+		if !seen[id] {
+			return persistedState{}, fmt.Errorf("remembered selections reference a missing profile")
+		}
+		if err := validateSelections(selections); err != nil {
+			return persistedState{}, fmt.Errorf("invalid remembered selections: %w", err)
+		}
+	}
 	return state, nil
+}
+
+func validateSelections(selections map[string]string) error {
+	if len(selections) > maxRememberedSelectionGroups {
+		return fmt.Errorf("too many remembered selector groups")
+	}
+	for group, proxyName := range selections {
+		if strings.TrimSpace(group) == "" || strings.TrimSpace(proxyName) == "" {
+			return fmt.Errorf("selector group and proxy names must not be empty")
+		}
+		if len(group) > maxRememberedSelectionName || len(proxyName) > maxRememberedSelectionName {
+			return fmt.Errorf("remembered selector name is too long")
+		}
+	}
+	return nil
+}
+
+func cloneSelections(source map[string]string) map[string]string {
+	if len(source) == 0 {
+		return map[string]string{}
+	}
+	result := make(map[string]string, len(source))
+	for group, proxyName := range source {
+		result[group] = proxyName
+	}
+	return result
 }
 
 func (s *Store) saveStateUnlocked(state persistedState) error {

@@ -156,10 +156,18 @@ func (a *App) CoreStatus(ctx context.Context) (domain.RuntimeStatus, error) {
 	wait.Wait()
 
 	if configErr == nil {
-		applyEffectiveConfig(&status, domain.EffectiveConfig{
+		liveConfig := domain.EffectiveConfig{
 			Mode: config.Mode, TUN: config.TUN.Enable, MixedPort: config.MixedPort,
 			AllowLAN: config.AllowLAN, IPv6: config.IPv6, LogLevel: config.LogLevel,
-		})
+		}
+		// Mihomo reports zero when a configured mixed port cannot be bound (for
+		// example when a legacy HTTP port uses the same number). Keep the
+		// persisted value visible so the settings screen does not revert to
+		// "未设置" immediately after a successful edit.
+		if liveConfig.MixedPort == 0 && status.ConfigAvailable && status.MixedPort > 0 {
+			liveConfig.MixedPort = status.MixedPort
+		}
+		applyEffectiveConfig(&status, liveConfig)
 	}
 	if versionFresh {
 		status.CoreVersion = cachedVersion

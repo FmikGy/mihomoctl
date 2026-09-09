@@ -355,6 +355,10 @@ func (a *App) useProfileRoot(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
+	current, err := store.Active()
+	if err != nil {
+		return err
+	}
 	target, err := resolveProfile(store, name)
 	if err != nil {
 		return err
@@ -372,9 +376,16 @@ func (a *App) useProfileRoot(ctx context.Context, name string) error {
 		return err
 	}
 	rollback.add("配置存储", func(context.Context) error { return store.RestoreCheckpoint(storeCheckpoint) })
+	if err := a.rememberProfileSelections(ctx, store, current.ID); err != nil {
+		return a.failAndReload(ctx, rollback, err)
+	}
+	targetSelections, err := store.Selections(target.ID)
+	if err != nil {
+		return a.failAndReload(ctx, rollback, err)
+	}
 	applied, err := a.applyProfileConfig(ctx, state, config)
 	if err != nil {
-		return err
+		return a.failAndReload(ctx, rollback, err)
 	}
 	rollback.add("Mihomo 配置", applied.rollback)
 	if _, err := store.Use(target.ID); err != nil {
@@ -393,7 +404,65 @@ func (a *App) useProfileRoot(ctx context.Context, name string) error {
 	if err != nil {
 		return a.failAndReload(ctx, rollback, err)
 	}
+	a.restoreProfileSelections(ctx, targetSelections)
 	return nil
+}
+
+func (a *App) rememberProfileSelections(ctx context.Context, store *profile.Store, id string) error {
+	requestCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	groups, err := a.Groups(requestCtx)
+	if err != nil {
+		// A stopped or temporarily unavailable controller must not prevent a
+		// configuration switch. Keep the last successful snapshot instead.
+		return nil
+	}
+	selections := make(map[string]string)
+	for _, group := range groups {
+		if !strings.EqualFold(group.Type, "selector") || group.Now == "" || !containsName(group.All, group.Now) {
+			continue
+		}
+		selections[group.Name] = group.Now
+	}
+	return store.SaveSelections(id, selections)
+}
+
+func (a *App) restoreProfileSelections(ctx context.Context, selections map[string]string) {
+	if len(selections) == 0 {
+		return
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	groups, err := a.Groups(requestCtx)
+	if err != nil {
+		return
+	}
+	available := make(map[string]domain.ProxyGroup, len(groups))
+	for _, group := range groups {
+		available[group.Name] = group
+	}
+	names := make([]string, 0, len(selections))
+	for groupName := range selections {
+		names = append(names, groupName)
+	}
+	sort.Strings(names)
+	for _, groupName := range names {
+		group, exists := available[groupName]
+		proxyName := selections[groupName]
+		if !exists || !strings.EqualFold(group.Type, "selector") || !containsName(group.All, proxyName) {
+			continue
+		}
+		_ = a.SelectProxy(requestCtx, groupName, proxyName)
+	}
+}
+
+func containsName(names []string, wanted string) bool {
+	for _, name := range names {
+		if name == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *App) RemoveProfile(ctx context.Context, name string) error {

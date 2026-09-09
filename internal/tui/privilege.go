@@ -35,22 +35,26 @@ func isAuthorizationRequired(err error) bool {
 }
 
 func (m *Model) beginPrivilegedOperation(action, message string, fn func(context.Context) error) tea.Cmd {
-	return m.beginOperationAttempt(action, message, "", "", m.needsElevation(), fn)
+	return m.beginOperationAttempt(action, message, "", "", m.needsElevation(), true, fn)
 }
 
 func (m *Model) beginPrivilegedConfigOperation(action, message, key, value string) tea.Cmd {
-	return m.beginOperationAttempt(action, message, key, value, m.needsElevation(), func(ctx context.Context) error {
+	return m.beginOperationAttempt(action, message, key, value, m.needsElevation(), true, func(ctx context.Context) error {
 		return m.backend.SetConfig(ctx, key, value)
 	})
 }
 
-func (m *Model) beginOperationAttempt(action, message, configKey, configValue string, privileged bool, fn func(context.Context) error) tea.Cmd {
+func (m *Model) beginOperationAttempt(action, message, configKey, configValue string, privileged, runtimeMutation bool, fn func(context.Context) error) tea.Cmd {
 	if m.loading {
 		return nil
 	}
 	m.loading = true
 	m.privilegedOperation = privileged
 	m.authorizing = false
+	m.runtimeMutation = runtimeMutation
+	if runtimeMutation {
+		m.suspendRuntimeObservers()
+	}
 	m.mutationGeneration++
 	m.clearForegroundErrors()
 	generation := m.mutationGeneration

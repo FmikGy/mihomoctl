@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"image/color"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -160,12 +161,31 @@ func (m Model) renderBody() string {
 func (m Model) renderOverview(height int) string {
 	c := colors()
 	contentWidth := max(1, m.width-4)
-	graphWidth := max(8, contentWidth-39)
-	down, up, downPeak, upPeak := trafficChartSeries(m.trafficHistory, graphWidth)
+	innerHeight := max(0, height-2)
+	chartHeight := max(2, innerHeight-6)
 	rows := []string{
 		titleLine("实时速度", trafficWindowLabel(m.trafficHistory), contentWidth),
-		trafficChartLine("↓ 下载", m.status.Traffic.Down, downPeak, trafficSparkline(down, graphWidth, downPeak), c.accent, contentWidth),
-		trafficChartLine("↑ 上传", m.status.Traffic.Up, upPeak, trafficSparkline(up, graphWidth, upPeak), c.good, contentWidth),
+	}
+	if chartHeight < 6 {
+		graphWidth := max(8, contentWidth-39)
+		down, up, downPeak, upPeak := trafficChartSeries(m.trafficHistory, graphWidth)
+		rows = append(rows,
+			trafficChartLine("↓ 下载", m.status.Traffic.Down, downPeak, trafficSparkline(down, graphWidth, downPeak), c.accent, contentWidth),
+			trafficChartLine("↑ 上传", m.status.Traffic.Up, upPeak, trafficSparkline(up, graphWidth, upPeak), c.good, contentWidth),
+		)
+		for len(rows) < chartHeight+1 {
+			rows = append(rows, "")
+		}
+	} else {
+		const axisWidth = 9
+		plotWidth := max(8, contentWidth-axisWidth-2)
+		down, up, downPeak, upPeak := trafficChartSeries(m.trafficHistory, plotWidth)
+		downHeight := chartHeight / 2
+		upHeight := chartHeight - downHeight
+		rows = append(rows, trafficAreaChartRows("↓ 下载", m.status.Traffic.Down, downPeak, down, contentWidth, downHeight, c.accent)...)
+		rows = append(rows, trafficAreaChartRows("↑ 上传", m.status.Traffic.Up, upPeak, up, contentWidth, upHeight, c.good)...)
+	}
+	rows = append(rows,
 		overviewColumns(contentWidth,
 			overviewMetric("累计下载", formatBytes(m.status.Traffic.DownTotal)),
 			overviewMetric("累计上传", formatBytes(m.status.Traffic.UpTotal))),
@@ -180,7 +200,7 @@ func (m Model) renderOverview(height int) string {
 			overviewMetric("模式", modeLabel(m.status.Mode)),
 			overviewMetric("TUN", onOff(m.status.TUN)),
 			overviewMetric("混合端口", portLabel(m.status.MixedPort))),
-	}
+	)
 	return renderPage(rows, m.width, height)
 }
 
@@ -265,6 +285,98 @@ func trafficChartLine(label string, rate, peak int64, graph string, chartColor c
 	chart := ansi.Truncate(graph, available, "")
 	chart = padRight(chart, available)
 	return labelText + rateText + peakText + lipgloss.NewStyle().Foreground(chartColor).Render(chart)
+}
+
+func trafficAreaChartRows(label string, rate, peak int64, values []int64, width, height int, chartColor color.Color) []string {
+	if height <= 0 {
+		return nil
+	}
+	c := colors()
+	header := joinSides(
+		lipgloss.NewStyle().Bold(true).Foreground(chartColor).Render(label),
+		lipgloss.NewStyle().Foreground(c.text).Render("当前 "+formatRate(rate))+"  "+
+			lipgloss.NewStyle().Foreground(c.muted).Render("峰 "+formatRate(peak)),
+		width,
+	)
+	if height == 1 {
+		return []string{header}
+	}
+
+	const axisWidth = 9
+	plotHeight := height - 1
+	plotWidth := max(0, width-axisWidth-2)
+	plot := trafficAreaPlot(values, plotWidth, plotHeight, peak)
+	rows := make([]string, 0, height)
+	rows = append(rows, header)
+	for row := range plotHeight {
+		axisLabel := ""
+		tick := "│"
+		switch {
+		case row == 0:
+			axisLabel = formatCompactRate(peak)
+			tick = "┤"
+		case row == plotHeight-1:
+			axisLabel = "0"
+			tick = "┤"
+		case peak > 0 && plotHeight >= 5 && row == plotHeight/2:
+			axisLabel = formatCompactRate(peak / 2)
+			tick = "┤"
+		}
+		axis := lipgloss.NewStyle().Foreground(c.muted).Render(padLeft(axisLabel, axisWidth) + " " + tick)
+		rows = append(rows, axis+lipgloss.NewStyle().Foreground(chartColor).Render(plot[row]))
+	}
+	return rows
+}
+
+func trafficAreaPlot(values []int64, width, height int, peak int64) []string {
+	width, height = max(0, width), max(0, height)
+	if height == 0 {
+		return nil
+	}
+	grid := make([][]rune, height)
+	for row := range grid {
+		grid[row] = []rune(strings.Repeat(" ", width))
+	}
+	if width == 0 || len(values) == 0 {
+		rows := make([]string, height)
+		for row := range grid {
+			rows[row] = string(grid[row])
+		}
+		return rows
+	}
+	if len(values) > width {
+		values = values[len(values)-width:]
+	}
+	levels := []rune(trafficLevels)
+	start := width - len(values)
+	maximumUnits := height * len(levels)
+	for column, value := range values {
+		value = nonNegativeTraffic(value)
+		filled := 1
+		if peak > 0 && value > 0 {
+			filled = int(math.Ceil(float64(value) / float64(peak) * float64(maximumUnits)))
+			filled = max(1, min(filled, maximumUnits))
+		}
+		for row := range height {
+			units := filled - (height-row-1)*len(levels)
+			if units <= 0 {
+				continue
+			}
+			grid[row][start+column] = levels[min(units, len(levels))-1]
+		}
+	}
+	rows := make([]string, height)
+	for row := range grid {
+		rows[row] = string(grid[row])
+	}
+	return rows
+}
+
+func formatCompactRate(bytes int64) string {
+	if bytes <= 0 {
+		return "0 B/s"
+	}
+	return formatCompactBytes(bytes) + "/s"
 }
 
 func trafficWindowLabel(history []trafficSample) string {

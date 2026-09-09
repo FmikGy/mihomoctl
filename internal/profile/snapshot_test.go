@@ -103,6 +103,80 @@ func TestCheckpointRestoresAddRemoveUseAndUpdate(t *testing.T) {
 	}
 }
 
+func TestSelectionsPersistAndFollowCheckpointRollback(t *testing.T) {
+	storeRoot := t.TempDir()
+	store, err := NewStore(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.AddURI(context.Background(), "First", "trojan://first@example.com:443#First")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.AddURI(context.Background(), "Second", "trojan://second@example.com:443#Second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"Proxies": "First-2", "AI": "First-3"}
+	if err := store.SaveSelections(first.ID, want); err != nil {
+		t.Fatal(err)
+	}
+	want["Proxies"] = "caller-mutated"
+
+	reopened, err := NewStore(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := reopened.Selections(first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["Proxies"] != "First-2" || got["AI"] != "First-3" {
+		t.Fatalf("persisted selections = %#v", got)
+	}
+	got["Proxies"] = "result-mutated"
+	again, err := reopened.Selections(first.ID)
+	if err != nil || again["Proxies"] != "First-2" {
+		t.Fatalf("store returned aliased selections: %#v, %v", again, err)
+	}
+
+	checkpoint, err := reopened.Checkpoint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.SaveSelections(first.ID, map[string]string{"Proxies": "New"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.SaveSelections(second.ID, map[string]string{"Proxies": "Second-2"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.RestoreCheckpoint(checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := reopened.Selections(first.ID)
+	if err != nil || restored["Proxies"] != "First-2" || len(restored) != 2 {
+		t.Fatalf("checkpoint selections = %#v, %v", restored, err)
+	}
+	secondSelections, err := reopened.Selections(second.ID)
+	if err != nil || len(secondSelections) != 0 {
+		t.Fatalf("checkpoint retained new selections = %#v, %v", secondSelections, err)
+	}
+
+	if err := reopened.SaveSelections(second.ID, map[string]string{"Proxies": "Second-2"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Remove(second.ID); err != nil {
+		t.Fatal(err)
+	}
+	state, err := reopened.loadStateUnlocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := state.Selections[second.ID]; exists {
+		t.Fatal("removing a profile retained its selections")
+	}
+}
+
 func TestRestoreCheckpointRecoversCorruptStateAndSafelyCleansNewEntries(t *testing.T) {
 	ctx := context.Background()
 	store, err := NewStore(t.TempDir())

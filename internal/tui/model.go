@@ -88,6 +88,7 @@ const (
 	settingsRefreshEvery   = 30 * time.Second
 	toastLifetime          = 3 * time.Second
 	streamRetryMaximum     = 30 * time.Second
+	runtimeRecoveryGrace   = 6 * time.Second
 	logBatchWindow         = 50 * time.Millisecond
 	logBatchMaximum        = 128
 	logBufferMaximum       = 1000
@@ -257,26 +258,28 @@ type Model struct {
 
 	// loading only tracks a user-triggered mutation or delay test. Background
 	// refreshes remain non-blocking and never change it.
-	loading             bool
-	err                 string
-	errors              map[errorSource]sourceError
-	errorSequence       uint64
-	toast               string
-	toastWarning        bool
-	toastExpires        time.Time
-	help                bool
-	filter              string
-	input               textinput.Model
-	inMode              inputMode
-	inputError          string
-	picker              settingPicker
-	pickerCursor        int
-	confirm             confirmMode
-	confirmTarget       confirmTarget
-	mutationGeneration  uint64
-	privilegedOperation bool
-	authorizing         bool
-	quitPending         bool
+	loading              bool
+	err                  string
+	errors               map[errorSource]sourceError
+	errorSequence        uint64
+	toast                string
+	toastWarning         bool
+	toastExpires         time.Time
+	help                 bool
+	filter               string
+	input                textinput.Model
+	inMode               inputMode
+	inputError           string
+	picker               settingPicker
+	pickerCursor         int
+	confirm              confirmMode
+	confirmTarget        confirmTarget
+	mutationGeneration   uint64
+	privilegedOperation  bool
+	authorizing          bool
+	runtimeMutation      bool
+	runtimeRecoveryUntil time.Time
+	quitPending          bool
 }
 
 type tickMsg time.Time
@@ -484,6 +487,9 @@ func cancelRequest(state *requestState) {
 }
 
 func (m *Model) beginStatusRefresh(now time.Time, force bool) tea.Cmd {
+	if m.runtimeMutation {
+		return nil
+	}
 	generation, ok := queueOrStart(&m.statusRequest, now, statusRefreshEvery, force)
 	if !ok {
 		return nil
@@ -502,7 +508,7 @@ func (m *Model) beginStatusRefresh(now time.Time, force bool) tea.Cmd {
 }
 
 func (m *Model) beginOverviewRefresh(now time.Time, force bool) tea.Cmd {
-	if !m.status.Service.Active {
+	if m.runtimeMutation || !m.status.Service.Active {
 		return nil
 	}
 	backend, ok := m.backend.(OverviewTelemetryBackend)
@@ -524,7 +530,7 @@ func (m *Model) beginOverviewRefresh(now time.Time, force bool) tea.Cmd {
 }
 
 func (m *Model) beginGroupsRefresh(now time.Time, force bool) tea.Cmd {
-	if !m.status.Service.Active {
+	if m.runtimeMutation || !m.status.Service.Active {
 		return nil
 	}
 	generation, ok := queueOrStart(&m.groupRequest, now, groupRefreshEvery, force)
@@ -554,7 +560,7 @@ func (m *Model) beginProfilesRefresh(now time.Time, force bool) tea.Cmd {
 }
 
 func (m *Model) beginConnectionsRefresh(now time.Time, force bool) tea.Cmd {
-	if !m.status.Service.Active {
+	if m.runtimeMutation || !m.status.Service.Active {
 		return nil
 	}
 	generation, ok := queueOrStart(&m.connectionRequest, now, connectionRefreshEvery, force)
@@ -710,7 +716,7 @@ func (m *Model) beginLogs(force bool) tea.Cmd {
 		m.stopLogs()
 		m.clearSourceError(errorLogs)
 	}
-	if m.page != pageLogs || !m.status.Service.Active || m.logConnecting || m.logCh != nil || m.logErrCh != nil || m.logReconnectPending || m.ctx.Err() != nil {
+	if m.runtimeMutation || m.page != pageLogs || !m.status.Service.Active || m.logConnecting || m.logCh != nil || m.logErrCh != nil || m.logReconnectPending || m.ctx.Err() != nil {
 		return nil
 	}
 	m.logGeneration++
@@ -728,7 +734,7 @@ func (m *Model) beginTraffic(force bool) tea.Cmd {
 	if force {
 		m.stopTraffic()
 	}
-	if !m.status.Service.Active || m.trafficConnecting || m.trafficCh != nil || m.trafficErrCh != nil || m.trafficReconnectPending || m.ctx.Err() != nil {
+	if m.runtimeMutation || !m.status.Service.Active || m.trafficConnecting || m.trafficCh != nil || m.trafficErrCh != nil || m.trafficReconnectPending || m.ctx.Err() != nil {
 		return nil
 	}
 	m.trafficGeneration++
@@ -823,7 +829,7 @@ func (m *Model) stopTraffic() {
 }
 
 func (m *Model) beginOperation(message string, fn func(context.Context) error) tea.Cmd {
-	return m.beginOperationAttempt("", message, "", "", false, fn)
+	return m.beginOperationAttempt("", message, "", "", false, false, fn)
 }
 
 func (m *Model) beginGroupTest(group string) tea.Cmd {
@@ -863,11 +869,45 @@ func (m *Model) setSourceError(source errorSource, err error) {
 		m.clearSourceError(source)
 		return
 	}
+	if isRuntimeErrorSource(source) && m.runtimeErrorSuppressed(time.Now()) {
+		m.clearSourceError(source)
+		return
+	}
 	if m.errors == nil {
 		m.errors = make(map[errorSource]sourceError)
 	}
 	m.errorSequence++
 	m.errors[source] = sourceError{message: err.Error(), sequence: m.errorSequence}
+	m.syncVisibleError()
+}
+
+func isRuntimeErrorSource(source errorSource) bool {
+	switch source {
+	case errorStatus, errorOverview, errorGroups, errorConnections, errorTraffic, errorLogs:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m Model) runtimeErrorSuppressed(now time.Time) bool {
+	return m.runtimeMutation || (!m.runtimeRecoveryUntil.IsZero() && now.Before(m.runtimeRecoveryUntil))
+}
+
+func (m *Model) suspendRuntimeObservers() {
+	cancelRequest(&m.statusRequest)
+	cancelRequest(&m.overviewRequest)
+	cancelRequest(&m.groupRequest)
+	cancelRequest(&m.connectionRequest)
+	m.statusRequest.lastStart = time.Time{}
+	m.overviewRequest.lastStart = time.Time{}
+	m.groupRequest.lastStart = time.Time{}
+	m.connectionRequest.lastStart = time.Time{}
+	m.stopTraffic()
+	m.stopLogs()
+	for _, source := range []errorSource{errorStatus, errorOverview, errorGroups, errorConnections, errorTraffic, errorLogs} {
+		delete(m.errors, source)
+	}
 	m.syncVisibleError()
 }
 
@@ -971,9 +1011,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusSnapshotFloor = msg.requestedAt
 		}
 		previous := m.status
+		recoveringRuntime := m.runtimeErrorSuppressed(time.Now())
 		serviceKnown := msg.err == nil || serviceStatusAvailable(msg.status.Service)
 		if msg.err != nil {
-			mergePartialStatus(&m.status, msg.status)
+			partial := msg.status
+			if recoveringRuntime {
+				partial.CoreVersion = ""
+			}
+			mergePartialStatus(&m.status, partial)
 			m.setSourceError(errorStatus, msg.err)
 		} else {
 			m.status = msg.status
@@ -991,8 +1036,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status.Traffic.Down = previous.Traffic.Down
 			}
 			m.clearSourceError(errorStatus)
+			if serviceKnown {
+				m.runtimeRecoveryUntil = time.Time{}
+			}
 		}
-		if msg.generation != 0 && msg.err != nil && !serviceKnown {
+		if msg.generation != 0 && msg.err != nil && !serviceKnown && !recoveringRuntime {
 			m.status.Service = domain.ServiceStatus{}
 			m.resetInactiveRuntime()
 		} else if serviceKnown && !m.status.Service.Active {
@@ -1138,6 +1186,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.authorizing = true
 			return m, m.retryPrivilegedOperation(msg)
 		}
+		runtimeMutation := m.runtimeMutation
+		m.runtimeMutation = false
 		m.loading = false
 		m.privilegedOperation = false
 		m.authorizing = false
@@ -1148,7 +1198,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.quitPending {
 				return m, tea.Quit
 			}
+			if runtimeMutation {
+				m.runtimeRecoveryUntil = time.Now().Add(runtimeRecoveryGrace)
+			}
 			return m, nil
+		}
+		if msg.configKey == string(settingMixedPort) {
+			if port, err := strconv.Atoi(msg.configValue); err == nil && port >= 1 && port <= 65535 {
+				m.status.ConfigAvailable = true
+				m.status.MixedPort = port
+			}
 		}
 		if msg.configKey == string(settingLogLevel) {
 			if level, ok := normalizeLogLevel(msg.configValue); ok {
@@ -1161,6 +1220,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		now := time.Now()
+		if runtimeMutation {
+			m.runtimeRecoveryUntil = now.Add(runtimeRecoveryGrace)
+		}
 		// A request started before this mutation describes the old runtime.
 		// Ignore it while the forced post-mutation refresh is queued.
 		m.statusSnapshotFloor = now
