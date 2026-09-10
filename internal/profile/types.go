@@ -43,6 +43,33 @@ type PreparedUpdate struct {
 func (PreparedUpdate) String() string   { return "[redacted prepared profile update]" }
 func (PreparedUpdate) GoString() string { return "profile.PreparedUpdate{[redacted]}" }
 
+// ValidateManagedConfig confirms that a prepared update can accept the
+// mihomoctl overlay without exceeding the final config size limit.
+func (p PreparedUpdate) ValidateManagedConfig(options OverlayOptions, limit int64) error {
+	// Structural validity is owned by CommitUpdate. Keeping that check there
+	// preserves its stale/invalid transaction semantics.
+	if p.store == nil || p.profile.ID == "" || p.preparedAt.IsZero() {
+		return nil
+	}
+	if p.notModified {
+		return nil
+	}
+	return ValidateManagedConfigSize(p.config, options, limit)
+}
+
+// ValidateManagedConfigSize validates the size of the final encoded config,
+// including all settings owned by mihomoctl.
+func ValidateManagedConfigSize(raw []byte, options OverlayOptions, limit int64) error {
+	managed, err := MergeManagedConfig(raw, options)
+	if err != nil {
+		return err
+	}
+	if limit > 0 && int64(len(managed)) > limit {
+		return ErrSourceTooLarge
+	}
+	return nil
+}
+
 // AddRequest describes a remote URL, local YAML file, or URI subscription.
 type AddRequest struct {
 	Name           string

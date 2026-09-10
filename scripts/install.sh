@@ -106,8 +106,10 @@ docdir="$destdir$prefix/share/doc/mihomoctl"
 "${install_prefix[@]}" install -m 0644 "$repo_dir/LICENSE" "$repo_dir/README.md" "$docdir/"
 
 if ((install_units)); then
+	sed "s|^ExecStart=.*|ExecStart=$prefix/bin/mihomoctl profile update --due --output json|" \
+		"$repo_dir/packaging/systemd/mihomoctl-update.service" > "$build_dir/mihomoctl-update.service"
 	"${install_prefix[@]}" install -d -m 0755 "$unitdir"
-	"${install_prefix[@]}" install -m 0644 "$repo_dir/packaging/systemd/mihomoctl-update.service" "$unitdir/mihomoctl-update.service"
+	"${install_prefix[@]}" install -m 0644 "$build_dir/mihomoctl-update.service" "$unitdir/mihomoctl-update.service"
 	"${install_prefix[@]}" install -m 0644 "$repo_dir/packaging/systemd/mihomoctl-update.timer" "$unitdir/mihomoctl-update.timer"
 	if [[ -z "$destdir" ]] && command -v systemctl >/dev/null 2>&1; then
 		"${install_prefix[@]}" systemctl daemon-reload

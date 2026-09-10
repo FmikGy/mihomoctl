@@ -18,7 +18,16 @@ func TestPostinstallReloadsSystemdAndBestEffortSyncsPublicState(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	command := exec.Command("/bin/sh", "./postinstall.sh")
+	script, err := os.ReadFile("./postinstall.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script = []byte(strings.ReplaceAll(string(script), "/usr/bin/mihomoctl", filepath.Join(root, "mihomoctl")))
+	testScript := filepath.Join(root, "postinstall.sh")
+	if err := os.WriteFile(testScript, script, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("/bin/sh", testScript)
 	command.Env = append(os.Environ(), "PATH="+root, "MIHOMOCTL_TEST_CALL_LOG="+callLog)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("postinstall did not tolerate migration failure: %v\n%s", err, output)

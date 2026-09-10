@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	osuser "os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -212,11 +214,19 @@ func (a *App) applyProfileConfig(ctx context.Context, state persistedState, raw 
 	if err != nil {
 		return nil, fmt.Errorf("生成活动配置失败: %w", err)
 	}
+	expected, err := effectiveConfigFromYAML(managed)
+	if err != nil {
+		return nil, fmt.Errorf("读取活动配置失败: %w", err)
+	}
 	systemd, err := platform.NewSystemd(a.runner, state.Installation.Unit)
 	if err != nil {
 		return nil, err
 	}
 	service, err := systemd.Status(ctx)
+	if err != nil {
+		return nil, err
+	}
+	configAccess, err := serviceConfigAccess(ctx, systemd)
 	if err != nil {
 		return nil, err
 	}
@@ -233,6 +243,7 @@ func (a *App) applyProfileConfig(ctx context.Context, state persistedState, raw 
 			ConfigDir:    state.Installation.ConfigDir,
 			BackupDir:    a.paths.BackupDir,
 		},
+		ConfigAccess: configAccess,
 		Activate: func(activateCtx context.Context) error {
 			activationCalls++
 			if !service.Active {
@@ -251,7 +262,7 @@ func (a *App) applyProfileConfig(ctx context.Context, state persistedState, raw 
 				}
 				return errors.Join(statusErr, errors.New("恢复后的 Mihomo 服务未运行"))
 			}
-			return waitForAPI(healthCtx, client, 8*time.Second)
+			return waitForAppliedConfig(healthCtx, client, expected, 8*time.Second)
 		},
 	}
 	result, err := applier.Apply(ctx, managed)
@@ -261,23 +272,76 @@ func (a *App) applyProfileConfig(ctx context.Context, state persistedState, raw 
 	return &appliedProfileConfig{applier: applier, result: result}, nil
 }
 
-func waitForAPI(ctx context.Context, client *mihomo.Client, timeout time.Duration) error {
+func serviceConfigAccess(ctx context.Context, systemd *platform.Systemd) (*platform.ConfigAccess, error) {
+	identity, err := systemd.Identity(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("读取 Mihomo 服务用户失败: %w", err)
+	}
+	serviceUser := strings.TrimSpace(identity.User)
+	if !identity.DynamicUser && (serviceUser == "" || serviceUser == "root" || serviceUser == "0") {
+		return &platform.ConfigAccess{UID: os.Geteuid(), GID: os.Getegid()}, nil
+	}
+
+	groupName := strings.TrimSpace(identity.Group)
+	if groupName == "" {
+		if identity.DynamicUser {
+			return nil, errors.New("Mihomo 使用 DynamicUser 但没有固定 Group；请在服务中配置可解析的静态 Group 后重试")
+		}
+		account, lookupErr := lookupUser(serviceUser)
+		if lookupErr != nil {
+			return nil, fmt.Errorf("无法解析 Mihomo 服务用户 %q；请为服务配置可解析的 User 和 Group: %w", serviceUser, lookupErr)
+		}
+		groupName = account.Gid
+	}
+	group, err := lookupGroup(groupName)
+	if err != nil {
+		return nil, fmt.Errorf("无法解析 Mihomo 服务组 %q；请在 systemd 服务中配置现有的 Group: %w", groupName, err)
+	}
+	gid, err := strconv.Atoi(group.Gid)
+	if err != nil || gid < 0 {
+		return nil, fmt.Errorf("Mihomo 服务组 %q 的 GID 无效", groupName)
+	}
+	return &platform.ConfigAccess{UID: 0, GID: gid, GroupReadable: true}, nil
+}
+
+func lookupUser(value string) (*osuser.User, error) {
+	if _, err := strconv.ParseUint(value, 10, 32); err == nil {
+		return osuser.LookupId(value)
+	}
+	return osuser.Lookup(value)
+}
+
+func lookupGroup(value string) (*osuser.Group, error) {
+	if _, err := strconv.ParseUint(value, 10, 32); err == nil {
+		return osuser.LookupGroupId(value)
+	}
+	return osuser.LookupGroup(value)
+}
+
+func waitForAppliedConfig(ctx context.Context, client *mihomo.Client, expected domain.EffectiveConfig, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for {
 		attemptCtx, cancel := context.WithTimeout(ctx, time.Second)
-		_, lastErr = client.Version(attemptCtx)
+		_, versionErr := client.Version(attemptCtx)
+		config, configErr := client.Configs(attemptCtx)
 		cancel()
+		lastErr = errors.Join(versionErr, configErr)
 		if lastErr == nil {
-			return nil
+			drift := effectiveConfigDrift(expected, effectiveConfigFromMihomo(config))
+			if len(drift) == 0 {
+				return nil
+			}
+			lastErr = fmt.Errorf("运行配置与期望值不一致: %s", strings.Join(drift, "、"))
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("Mihomo 控制器健康检查超时: %w", lastErr)
+			return fmt.Errorf("Mihomo 配置生效检查超时: %w", lastErr)
 		}
+		wait := min(200*time.Millisecond, time.Until(deadline))
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(200 * time.Millisecond):
+		case <-time.After(wait):
 		}
 	}
 }

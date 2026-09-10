@@ -76,6 +76,33 @@ type exitCoder interface {
 	ExitCode() int
 }
 
+type warningError interface {
+	Warning() bool
+}
+
+func onlyWarnings(err error) bool {
+	if err == nil {
+		return false
+	}
+	if many, ok := err.(interface{ Unwrap() []error }); ok {
+		children := many.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !onlyWarnings(child) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return onlyWarnings(wrapped.Unwrap())
+	}
+	warning, ok := err.(warningError)
+	return ok && warning.Warning()
+}
+
 type application struct {
 	backend Backend
 	stdout  io.Writer
@@ -610,10 +637,14 @@ func (a *application) profileCommand() *cobra.Command {
 				} else {
 					err = a.backend.RemoveProfile(cmd.Context(), args[0])
 				}
+				warning := ""
 				if err != nil {
-					return err
+					if action != "use" || !onlyWarnings(err) {
+						return err
+					}
+					warning = err.Error()
 				}
-				return a.writeResult(map[string]any{"action": action, "name": args[0]}, map[string]string{"use": "配置已激活", "remove": "配置已删除"}[action])
+				return a.writeWarningResult(map[string]any{"action": action, "name": args[0]}, map[string]string{"use": "配置已激活", "remove": "配置已删除"}[action], warning)
 			},
 		})
 	}

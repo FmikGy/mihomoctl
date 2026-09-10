@@ -19,6 +19,12 @@ type Systemd struct {
 	Unit   string
 }
 
+type ServiceIdentity struct {
+	User        string
+	Group       string
+	DynamicUser bool
+}
+
 func NewSystemd(runner CommandRunner, unit string) (*Systemd, error) {
 	if runner == nil {
 		return nil, fmt.Errorf("systemd command runner is required")
@@ -55,6 +61,28 @@ func (s *Systemd) Status(ctx context.Context) (domain.ServiceStatus, error) {
 		Enabled: unitFileState == "enabled" || unitFileState == "enabled-runtime",
 		State:   state,
 		PID:     pid,
+	}, nil
+}
+
+// Identity returns the account systemd uses to start the service. Empty User
+// and Group values have systemd's usual root defaults.
+func (s *Systemd) Identity(ctx context.Context) (ServiceIdentity, error) {
+	if err := s.validate(); err != nil {
+		return ServiceIdentity{}, err
+	}
+	result, err := s.Runner.Run(ctx, "systemctl", "show", "--no-pager",
+		"--property=LoadState", "--property=User", "--property=Group",
+		"--property=DynamicUser", "--", s.Unit)
+	if err != nil {
+		return ServiceIdentity{}, fmt.Errorf("query %s identity: %w", s.Unit, err)
+	}
+	properties := parseProperties(string(result.Stdout))
+	if properties["LoadState"] == "not-found" || properties["LoadState"] == "" {
+		return ServiceIdentity{}, fmt.Errorf("systemd unit %s is not loaded", s.Unit)
+	}
+	return ServiceIdentity{
+		User: strings.TrimSpace(properties["User"]), Group: strings.TrimSpace(properties["Group"]),
+		DynamicUser: strings.EqualFold(properties["DynamicUser"], "yes"),
 	}, nil
 }
 

@@ -236,6 +236,26 @@ func TestSettingsUnknownValuesAndNarrowViewport(t *testing.T) {
 	}
 }
 
+func TestUnknownServiceSettingsDoNotGuessAnAction(t *testing.T) {
+	m := testModel()
+	m.page = pageSettings
+	m.status.Service = domain.ServiceStatus{}
+	rows := m.settingRows()
+	for _, target := range []settingID{settingService, settingStartup} {
+		for _, row := range rows {
+			if row.id == target && row.value != "未知" {
+				t.Fatalf("unknown %s rendered as %q", target, row.value)
+			}
+		}
+		m.settingCursor = settingCursorFor(t, target)
+		updated, cmd := m.activateSetting()
+		m = updated.(Model)
+		if cmd != nil || !m.toastWarning || !strings.Contains(m.toast, "服务状态未知") {
+			t.Fatalf("unknown %s action: cmd=%v toast=%q warning=%v", target, cmd != nil, m.toast, m.toastWarning)
+		}
+	}
+}
+
 func TestStatusLogLevelChangeRestartsActiveLogStream(t *testing.T) {
 	m := testModel()
 	backend := &uiLogRecordingBackend{fakeBackend: m.backend.(*fakeBackend)}

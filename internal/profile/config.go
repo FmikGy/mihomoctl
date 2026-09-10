@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"sort"
+	"strings"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -99,6 +101,64 @@ func NormalizeSource(source []byte) ([]byte, bool, error) {
 		return nil, false, fmt.Errorf("source is neither valid Mihomo YAML nor a URI subscription: %w", yamlErr)
 	}
 	return nil, false, fmt.Errorf("Mihomo YAML root must be a mapping")
+}
+
+// NormalizeUntrustedSource normalizes a remote profile and prevents it from
+// opening unmanaged inbound or management endpoints. URI subscriptions are
+// built by GenerateConfig and therefore do not need a second encode pass.
+func NormalizeUntrustedSource(source []byte) ([]byte, bool, error) {
+	config, converted, err := NormalizeSource(source)
+	if err != nil || converted {
+		return config, converted, err
+	}
+	sanitized, err := sanitizeUntrustedConfig(config)
+	return sanitized, false, err
+}
+
+func sanitizeUntrustedConfig(raw []byte) ([]byte, error) {
+	doc, err := decodeYAMLDocument(raw)
+	if err != nil {
+		return nil, err
+	}
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("Mihomo YAML root must be a mapping")
+	}
+	for index := 0; index+1 < len(root.Content); index += 2 {
+		key := root.Content[index]
+		if key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
+			return nil, fmt.Errorf("remote profile contains an unsupported top-level YAML key at line %d", key.Line)
+		}
+	}
+	forbidden := []string{"listeners", "ss-config", "tuic-server", "tunnels", "vmess-config"}
+	present := make([]string, 0, len(forbidden))
+	for _, key := range forbidden {
+		if mapValue(root, key) != nil {
+			present = append(present, key)
+		}
+	}
+	if len(present) > 0 {
+		sort.Strings(present)
+		return nil, fmt.Errorf("remote profile contains forbidden listener fields: %s", strings.Join(present, ", "))
+	}
+	for _, key := range []string{
+		"port", "redir-port", "socks-port", "tproxy-port",
+		"external-controller", "external-controller-cors", "external-controller-pipe",
+		"external-controller-routing-mark", "external-controller-tls", "external-controller-unix",
+		"external-doh-server", "external-ui", "external-ui-name", "external-ui-url", "secret", "tls",
+	} {
+		deleteMapValue(root, key)
+	}
+	var output bytes.Buffer
+	encoder := yaml.NewEncoder(&output)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(doc); err != nil {
+		return nil, fmt.Errorf("encode sanitized config: %w", err)
+	}
+	if err := encoder.Close(); err != nil {
+		return nil, fmt.Errorf("finish sanitized config: %w", err)
+	}
+	return output.Bytes(), nil
 }
 
 func looksLikeBase64Subscription(source []byte) bool {
@@ -311,6 +371,9 @@ func decodeYAMLDocument(raw []byte) (*yaml.Node, error) {
 	if len(doc.Content) == 0 {
 		return nil, fmt.Errorf("YAML document is empty")
 	}
+	if err := validateUniqueMappingKeys(&doc, "$", make(map[*yaml.Node]bool)); err != nil {
+		return nil, err
+	}
 	var trailing yaml.Node
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		if err == nil {
@@ -319,6 +382,48 @@ func decodeYAMLDocument(raw []byte) (*yaml.Node, error) {
 		return nil, fmt.Errorf("decode trailing YAML: %w", err)
 	}
 	return &doc, nil
+}
+
+func validateUniqueMappingKeys(node *yaml.Node, path string, visited map[*yaml.Node]bool) error {
+	if node == nil || visited[node] {
+		return nil
+	}
+	visited[node] = true
+	switch node.Kind {
+	case yaml.DocumentNode, yaml.SequenceNode:
+		for index, child := range node.Content {
+			childPath := path
+			if node.Kind == yaml.SequenceNode {
+				childPath = fmt.Sprintf("%s[%d]", path, index)
+			}
+			if err := validateUniqueMappingKeys(child, childPath, visited); err != nil {
+				return err
+			}
+		}
+	case yaml.MappingNode:
+		seen := make(map[string]*yaml.Node, len(node.Content)/2)
+		for index := 0; index+1 < len(node.Content); index += 2 {
+			key, value := node.Content[index], node.Content[index+1]
+			childPath := path
+			if key.Kind == yaml.ScalarNode {
+				identity := key.Tag + "\x00" + key.Value
+				if previous := seen[identity]; previous != nil {
+					return fmt.Errorf("duplicate YAML key %q at %s (lines %d and %d)", key.Value, path, previous.Line, key.Line)
+				}
+				seen[identity] = key
+				childPath += "." + key.Value
+			}
+			if err := validateUniqueMappingKeys(key, path, visited); err != nil {
+				return err
+			}
+			if err := validateUniqueMappingKeys(value, childPath, visited); err != nil {
+				return err
+			}
+		}
+	case yaml.AliasNode:
+		return validateUniqueMappingKeys(node.Alias, path, visited)
+	}
+	return nil
 }
 
 func ensureMapValue(mapping *yaml.Node, key string) (*yaml.Node, error) {
@@ -359,6 +464,15 @@ func setMapValue(mapping *yaml.Node, key string, value *yaml.Node) {
 		}
 	}
 	mapping.Content = append(mapping.Content, scalarString(key), value)
+}
+
+func deleteMapValue(mapping *yaml.Node, key string) {
+	for index := 0; index+1 < len(mapping.Content); index += 2 {
+		if mapping.Content[index].Value == key {
+			mapping.Content = append(mapping.Content[:index], mapping.Content[index+2:]...)
+			return
+		}
+	}
 }
 
 func setMapValueIfMissing(mapping *yaml.Node, key string, value *yaml.Node) {

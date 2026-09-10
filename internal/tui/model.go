@@ -225,6 +225,7 @@ type Model struct {
 	logUnread               int
 	logCh                   <-chan domain.LogEntry
 	logErrCh                <-chan error
+	logDone                 <-chan struct{}
 	logCancel               context.CancelFunc
 	logConnecting           bool
 	logGeneration           uint64
@@ -232,6 +233,7 @@ type Model struct {
 	logReconnectPending     bool
 	trafficCh               <-chan domain.Traffic
 	trafficErrCh            <-chan error
+	trafficDone             <-chan struct{}
 	trafficCancel           context.CancelFunc
 	trafficConnecting       bool
 	trafficGeneration       uint64
@@ -278,6 +280,7 @@ type Model struct {
 	privilegedOperation  bool
 	authorizing          bool
 	runtimeMutation      bool
+	coreMutation         bool
 	runtimeRecoveryUntil time.Time
 	quitPending          bool
 }
@@ -324,15 +327,16 @@ type connectionsMsg struct {
 	generation  uint64
 }
 type operationMsg struct {
-	action      string
-	message     string
-	err         error
-	generation  uint64
-	configKey   string
-	configValue string
-	privileged  bool
-	interactive bool
-	retry       func(context.Context) error
+	action       string
+	message      string
+	err          error
+	generation   uint64
+	configKey    string
+	configValue  string
+	privileged   bool
+	interactive  bool
+	coreMutation bool
+	retry        func(context.Context) error
 }
 type groupTestMsg struct {
 	group       string
@@ -354,6 +358,7 @@ type logErrMsg struct {
 type logChannelsMsg struct {
 	entries    <-chan domain.LogEntry
 	errs       <-chan error
+	done       <-chan struct{}
 	generation uint64
 }
 type logReconnectMsg struct{ generation uint64 }
@@ -371,6 +376,7 @@ type trafficErrMsg struct {
 type trafficChannelsMsg struct {
 	traffic    <-chan domain.Traffic
 	errs       <-chan error
+	done       <-chan struct{}
 	generation uint64
 }
 type trafficReconnectMsg struct{ generation uint64 }
@@ -650,9 +656,19 @@ func (m *Model) invalidatePageSnapshot(target page) {
 	}
 }
 
-func waitLogBatch(entries <-chan domain.LogEntry, generation uint64) tea.Cmd {
+func waitLogBatch(entries <-chan domain.LogEntry, generation uint64, done ...<-chan struct{}) tea.Cmd {
 	return func() tea.Msg {
-		entry, ok := <-entries
+		var canceled <-chan struct{}
+		if len(done) > 0 {
+			canceled = done[0]
+		}
+		var entry domain.LogEntry
+		var ok bool
+		select {
+		case entry, ok = <-entries:
+		case <-canceled:
+			return logBatchMsg{closed: true, generation: generation}
+		}
 		if !ok {
 			return logBatchMsg{closed: true, generation: generation}
 		}
@@ -669,30 +685,56 @@ func waitLogBatch(entries <-chan domain.LogEntry, generation uint64) tea.Cmd {
 				batch = append(batch, entry)
 			case <-timer.C:
 				return logBatchMsg{entries: batch, generation: generation}
+			case <-canceled:
+				return logBatchMsg{entries: batch, closed: true, generation: generation}
 			}
 		}
 		return logBatchMsg{entries: batch, generation: generation}
 	}
 }
 
-func waitLogError(errs <-chan error, generation uint64) tea.Cmd {
+func waitLogError(errs <-chan error, generation uint64, done ...<-chan struct{}) tea.Cmd {
 	return func() tea.Msg {
-		err, ok := <-errs
-		return logErrMsg{err: err, ok: ok, generation: generation}
+		var canceled <-chan struct{}
+		if len(done) > 0 {
+			canceled = done[0]
+		}
+		select {
+		case err, ok := <-errs:
+			return logErrMsg{err: err, ok: ok, generation: generation}
+		case <-canceled:
+			return logErrMsg{generation: generation}
+		}
 	}
 }
 
-func waitTraffic(traffic <-chan domain.Traffic, generation uint64) tea.Cmd {
+func waitTraffic(traffic <-chan domain.Traffic, generation uint64, done ...<-chan struct{}) tea.Cmd {
 	return func() tea.Msg {
-		sample, ok := <-traffic
-		return trafficMsg{traffic: sample, at: time.Now(), ok: ok, generation: generation}
+		var canceled <-chan struct{}
+		if len(done) > 0 {
+			canceled = done[0]
+		}
+		select {
+		case sample, ok := <-traffic:
+			return trafficMsg{traffic: sample, at: time.Now(), ok: ok, generation: generation}
+		case <-canceled:
+			return trafficMsg{generation: generation}
+		}
 	}
 }
 
-func waitTrafficError(errs <-chan error, generation uint64) tea.Cmd {
+func waitTrafficError(errs <-chan error, generation uint64, done ...<-chan struct{}) tea.Cmd {
 	return func() tea.Msg {
-		err, ok := <-errs
-		return trafficErrMsg{err: err, ok: ok, generation: generation}
+		var canceled <-chan struct{}
+		if len(done) > 0 {
+			canceled = done[0]
+		}
+		select {
+		case err, ok := <-errs:
+			return trafficErrMsg{err: err, ok: ok, generation: generation}
+		case <-canceled:
+			return trafficErrMsg{generation: generation}
+		}
 	}
 }
 
@@ -726,7 +768,7 @@ func (m *Model) beginLogs(force bool) tea.Cmd {
 	m.logConnecting = true
 	return func() tea.Msg {
 		entries, errs := m.backend.WatchLogs(streamCtx, m.logLevel)
-		return logChannelsMsg{entries: entries, errs: errs, generation: generation}
+		return logChannelsMsg{entries: entries, errs: errs, done: streamCtx.Done(), generation: generation}
 	}
 }
 
@@ -744,7 +786,7 @@ func (m *Model) beginTraffic(force bool) tea.Cmd {
 	m.trafficConnecting = true
 	return func() tea.Msg {
 		traffic, errs := m.backend.WatchTraffic(streamCtx)
-		return trafficChannelsMsg{traffic: traffic, errs: errs, generation: generation}
+		return trafficChannelsMsg{traffic: traffic, errs: errs, done: streamCtx.Done(), generation: generation}
 	}
 }
 
@@ -778,7 +820,7 @@ func (m *Model) disconnectLogs(generation uint64, err error) tea.Cmd {
 		m.logCancel()
 	}
 	m.logCancel = nil
-	m.logCh, m.logErrCh = nil, nil
+	m.logCh, m.logErrCh, m.logDone = nil, nil, nil
 	m.logConnecting = false
 	m.logGeneration++
 	if err != nil && m.ctx.Err() == nil && m.status.Service.Active {
@@ -795,7 +837,7 @@ func (m *Model) disconnectTraffic(generation uint64, err error) tea.Cmd {
 		m.trafficCancel()
 	}
 	m.trafficCancel = nil
-	m.trafficCh, m.trafficErrCh = nil, nil
+	m.trafficCh, m.trafficErrCh, m.trafficDone = nil, nil, nil
 	m.trafficConnecting = false
 	m.trafficGeneration++
 	if err != nil && m.ctx.Err() == nil && m.status.Service.Active {
@@ -809,7 +851,7 @@ func (m *Model) stopLogs() {
 		m.logCancel()
 	}
 	m.logCancel = nil
-	m.logCh, m.logErrCh = nil, nil
+	m.logCh, m.logErrCh, m.logDone = nil, nil, nil
 	m.logConnecting = false
 	m.logReconnectPending = false
 	m.logRetry = 0
@@ -821,7 +863,7 @@ func (m *Model) stopTraffic() {
 		m.trafficCancel()
 	}
 	m.trafficCancel = nil
-	m.trafficCh, m.trafficErrCh = nil, nil
+	m.trafficCh, m.trafficErrCh, m.trafficDone = nil, nil, nil
 	m.trafficConnecting = false
 	m.trafficReconnectPending = false
 	m.trafficRetry = 0
@@ -1187,12 +1229,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.retryPrivilegedOperation(msg)
 		}
 		runtimeMutation := m.runtimeMutation
+		coreMutation := m.coreMutation || msg.coreMutation
 		m.runtimeMutation = false
+		m.coreMutation = false
 		m.loading = false
 		m.privilegedOperation = false
 		m.authorizing = false
 		m.confirm = confirmNone
 		m.confirmTarget = confirmTarget{}
+		warning := ""
+		if isOperationWarning(msg.err) {
+			warning = msg.err.Error()
+			msg.err = nil
+		}
+		if coreMutation {
+			m.resetTrafficEpoch()
+		}
 		if msg.err != nil {
 			m.setSourceError(errorOperation, msg.err)
 			if m.quitPending {
@@ -1215,7 +1267,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.clearSourceError(errorOperation)
-		m.showToast(msg.message, false, time.Now())
+		toast := msg.message
+		if warning != "" {
+			toast += "；" + warning
+		}
+		m.showToast(toast, warning != "", time.Now())
 		if m.quitPending {
 			return m, tea.Quit
 		}
@@ -1260,16 +1316,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.logConnecting = false
-		m.logCh, m.logErrCh = msg.entries, msg.errs
+		m.logCh, m.logErrCh, m.logDone = msg.entries, msg.errs, msg.done
+		m.logRetry = 0
+		m.clearSourceError(errorLogs)
 		if m.logCh == nil && m.logErrCh == nil {
 			return m, m.disconnectLogs(msg.generation, fmt.Errorf("日志流未返回数据通道"))
 		}
 		var entryCmd, errorCmd tea.Cmd
 		if m.logCh != nil {
-			entryCmd = waitLogBatch(m.logCh, msg.generation)
+			entryCmd = waitLogBatch(m.logCh, msg.generation, m.logDone)
 		}
 		if m.logErrCh != nil {
-			errorCmd = waitLogError(m.logErrCh, msg.generation)
+			errorCmd = waitLogError(m.logErrCh, msg.generation, m.logDone)
 		}
 		return m, tea.Batch(entryCmd, errorCmd)
 	case logBatchMsg:
@@ -1289,7 +1347,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.logCh != nil {
-			return m, waitLogBatch(m.logCh, msg.generation)
+			return m, waitLogBatch(m.logCh, msg.generation, m.logDone)
 		}
 		return m, nil
 	case logErrMsg:
@@ -1315,16 +1373,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.trafficConnecting = false
-		m.trafficCh, m.trafficErrCh = msg.traffic, msg.errs
+		m.trafficCh, m.trafficErrCh, m.trafficDone = msg.traffic, msg.errs, msg.done
 		if m.trafficCh == nil && m.trafficErrCh == nil {
 			return m, m.disconnectTraffic(msg.generation, fmt.Errorf("流量流未返回数据通道"))
 		}
 		var trafficCmd, errorCmd tea.Cmd
 		if m.trafficCh != nil {
-			trafficCmd = waitTraffic(m.trafficCh, msg.generation)
+			trafficCmd = waitTraffic(m.trafficCh, msg.generation, m.trafficDone)
 		}
 		if m.trafficErrCh != nil {
-			errorCmd = waitTrafficError(m.trafficErrCh, msg.generation)
+			errorCmd = waitTrafficError(m.trafficErrCh, msg.generation, m.trafficDone)
 		}
 		return m, tea.Batch(trafficCmd, errorCmd)
 	case trafficMsg:
@@ -1340,7 +1398,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.trafficRetry = 0
 			m.clearSourceError(errorTraffic)
 			if m.trafficCh != nil {
-				return m, waitTraffic(m.trafficCh, msg.generation)
+				return m, waitTraffic(m.trafficCh, msg.generation, m.trafficDone)
 			}
 			return m, nil
 		}
@@ -1526,8 +1584,13 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	case "u":
 		if m.page == pageProfiles && len(m.profiles) > 0 {
-			name := m.profiles[clamp(m.profileCursor, 0, len(m.profiles)-1)].Name
-			return m, m.beginPrivilegedOperation("更新配置 "+name, "配置已更新", func(ctx context.Context) error {
+			target := m.profiles[clamp(m.profileCursor, 0, len(m.profiles)-1)]
+			name := target.Name
+			begin := m.beginPrivilegedMetadataOperation
+			if target.Active {
+				begin = m.beginPrivilegedCoreOperation
+			}
+			return m, begin("更新配置 "+name, "配置已更新", func(ctx context.Context) error {
 				return m.backend.UpdateProfile(ctx, name)
 			})
 		}
@@ -1616,7 +1679,11 @@ func (m Model) updateInput(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if value == "" {
 				return m, nil
 			}
-			return m, m.beginPrivilegedOperation("添加配置", "配置已添加，请选中后按 Enter 激活", func(ctx context.Context) error {
+			begin := m.beginPrivilegedMetadataOperation
+			if len(m.profiles) == 0 {
+				begin = m.beginPrivilegedCoreOperation
+			}
+			return m, begin("添加配置", "配置已添加，请选中后按 Enter 激活", func(ctx context.Context) error {
 				return m.backend.AddProfile(ctx, "", value, 24*time.Hour)
 			})
 		}
@@ -1677,7 +1744,7 @@ func (m Model) updatePicker(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		switch kind {
 		case pickerTUN:
 			enabled := value == "on"
-			return m, m.beginPrivilegedOperation("修改 TUN 设置", "TUN 设置已更新", func(ctx context.Context) error {
+			return m, m.beginPrivilegedCoreOperation("修改 TUN 设置", "TUN 设置已更新", func(ctx context.Context) error {
 				return m.backend.SetTUN(ctx, enabled)
 			})
 		case pickerAllowLAN:
@@ -1752,6 +1819,20 @@ func serviceStatusAvailable(service domain.ServiceStatus) bool {
 	return service.State != "" || service.Active || service.Enabled || service.PID > 0
 }
 
+func (m Model) serviceStatusKnown() bool {
+	return serviceStatusAvailable(m.status.Service)
+}
+
+func (m *Model) showUnknownServiceWarning() {
+	m.showToast("服务状态未知，请先按 r 刷新后重试", true, time.Now())
+}
+
+func (m *Model) resetTrafficEpoch() {
+	m.trafficHistory = nil
+	m.lastTrafficAt = time.Time{}
+	m.status.Traffic = domain.Traffic{}
+}
+
 func mergePartialStatus(target *domain.RuntimeStatus, source domain.RuntimeStatus) {
 	serviceKnown := serviceStatusAvailable(source.Service)
 	if serviceKnown {
@@ -1821,12 +1902,16 @@ func normalizeMixedPort(value string) (string, error) {
 func (m Model) activate() (tea.Model, tea.Cmd) {
 	switch m.page {
 	case pageOverview:
+		if !m.serviceStatusKnown() {
+			m.showUnknownServiceWarning()
+			return m, nil
+		}
 		if m.status.Service.Active {
 			m.confirm = confirmStopService
 			m.confirmTarget = confirmTarget{label: "Mihomo 服务"}
 			return m, nil
 		}
-		return m, m.beginPrivilegedOperation("启动 Mihomo 服务", "Mihomo 已启动", func(ctx context.Context) error {
+		return m, m.beginPrivilegedCoreOperation("启动 Mihomo 服务", "Mihomo 已启动", func(ctx context.Context) error {
 			return m.backend.Service(ctx, "start")
 		})
 	case pageProxies:
@@ -1851,7 +1936,7 @@ func (m Model) activate() (tea.Model, tea.Cmd) {
 			if profile.Active {
 				return m, nil
 			}
-			return m, m.beginPrivilegedOperation("激活配置 "+name, "已启用 "+name, func(ctx context.Context) error {
+			return m, m.beginPrivilegedCoreOperation("激活配置 "+name, "已启用 "+name, func(ctx context.Context) error {
 				return m.backend.UseProfile(ctx, name)
 			})
 		}
@@ -1871,14 +1956,22 @@ func (m Model) activate() (tea.Model, tea.Cmd) {
 func (m Model) activateSetting() (tea.Model, tea.Cmd) {
 	switch m.selectedSetting() {
 	case settingService:
+		if !m.serviceStatusKnown() {
+			m.showUnknownServiceWarning()
+			return m, nil
+		}
 		action, message := "start", "Mihomo 已启动"
 		if m.status.Service.Active {
 			m.confirm = confirmStopService
 			m.confirmTarget = confirmTarget{label: "Mihomo 服务"}
 			return m, nil
 		}
-		return m, m.beginPrivilegedOperation("启动 Mihomo 服务", message, func(ctx context.Context) error { return m.backend.Service(ctx, action) })
+		return m, m.beginPrivilegedCoreOperation("启动 Mihomo 服务", message, func(ctx context.Context) error { return m.backend.Service(ctx, action) })
 	case settingStartup:
+		if !m.serviceStatusKnown() {
+			m.showUnknownServiceWarning()
+			return m, nil
+		}
 		action := "enable"
 		message := "开机启动已启用"
 		if m.status.Service.Enabled {
@@ -1888,7 +1981,7 @@ func (m Model) activateSetting() (tea.Model, tea.Cmd) {
 		if action == "disable" {
 			privilegeAction = "关闭开机启动"
 		}
-		return m, m.beginPrivilegedOperation(privilegeAction, message, func(ctx context.Context) error { return m.backend.Service(ctx, action) })
+		return m, m.beginPrivilegedMetadataOperation(privilegeAction, message, func(ctx context.Context) error { return m.backend.Service(ctx, action) })
 	case settingMode:
 		next := domain.ModeRule
 		if m.status.Mode == domain.ModeRule {
@@ -1896,19 +1989,19 @@ func (m Model) activateSetting() (tea.Model, tea.Cmd) {
 		} else if m.status.Mode == domain.ModeGlobal {
 			next = domain.ModeDirect
 		}
-		return m, m.beginPrivilegedOperation("切换运行模式", "运行模式已切换", func(ctx context.Context) error { return m.backend.SetMode(ctx, next) })
+		return m, m.beginPrivilegedCoreOperation("切换运行模式", "运行模式已切换", func(ctx context.Context) error { return m.backend.SetMode(ctx, next) })
 	case settingTUN:
 		if !m.status.ConfigAvailable {
 			m.openPicker(pickerTUN, "")
 			return m, nil
 		}
-		return m, m.beginPrivilegedOperation("修改 TUN 设置", "TUN 设置已更新", func(ctx context.Context) error { return m.backend.SetTUN(ctx, !m.status.TUN) })
+		return m, m.beginPrivilegedCoreOperation("修改 TUN 设置", "TUN 设置已更新", func(ctx context.Context) error { return m.backend.SetTUN(ctx, !m.status.TUN) })
 	case settingSchedule:
 		enabled := true
 		if m.scheduleOK {
 			enabled = !m.schedule.Enabled
 		}
-		return m, m.beginPrivilegedOperation("修改定时更新设置", "定时更新设置已更新", func(ctx context.Context) error { return m.backend.SetSchedule(ctx, enabled) })
+		return m, m.beginPrivilegedMetadataOperation("修改定时更新设置", "定时更新设置已更新", func(ctx context.Context) error { return m.backend.SetSchedule(ctx, enabled) })
 	case settingMixedPort:
 		value := "7890"
 		if m.status.ConfigAvailable && m.status.MixedPort > 0 {
@@ -1964,7 +2057,7 @@ func (m Model) runConfirmed() (tea.Model, tea.Cmd) {
 		if target.name == "" {
 			return m, nil
 		}
-		return m, m.beginPrivilegedOperation("删除配置 "+target.name, "配置已删除", func(ctx context.Context) error { return m.backend.RemoveProfile(ctx, target.name) })
+		return m, m.beginPrivilegedMetadataOperation("删除配置 "+target.name, "配置已删除", func(ctx context.Context) error { return m.backend.RemoveProfile(ctx, target.name) })
 	case confirmCloseConnection:
 		if target.id == "" {
 			return m, nil
@@ -1973,7 +2066,7 @@ func (m Model) runConfirmed() (tea.Model, tea.Cmd) {
 	case confirmCloseAll:
 		return m, m.beginOperation("全部连接已关闭", m.backend.CloseAllConnections)
 	case confirmStopService:
-		return m, m.beginPrivilegedOperation("停止 Mihomo 服务", "Mihomo 已停止", func(ctx context.Context) error { return m.backend.Service(ctx, "stop") })
+		return m, m.beginPrivilegedCoreOperation("停止 Mihomo 服务", "Mihomo 已停止", func(ctx context.Context) error { return m.backend.Service(ctx, "stop") })
 	case confirmEnableLAN:
 		return m, m.beginPrivilegedConfigOperation("开启局域网访问", "局域网访问已开启", string(settingAllowLAN), "on")
 	}

@@ -12,12 +12,15 @@ import (
 
 // Installation describes the local Mihomo service without modifying it.
 type Installation struct {
-	BinaryPath string
-	Unit       string
-	UnitPath   string
-	ExecArgs   []string
-	ConfigDir  string
-	ConfigPath string
+	BinaryPath   string
+	Unit         string
+	UnitPath     string
+	ExecArgs     []string
+	ConfigDir    string
+	ConfigPath   string
+	ServiceUser  string
+	ServiceGroup string
+	DynamicUser  bool
 }
 
 type Discoverer struct {
@@ -72,7 +75,8 @@ func (d *Discoverer) discoverUnit(ctx context.Context) (Installation, error) {
 		}
 		result, err := d.Runner.Run(ctx, "systemctl", "show", "--no-pager",
 			"--property=LoadState", "--property=FragmentPath", "--property=ExecStart",
-			"--property=WorkingDirectory", "--", unit)
+			"--property=WorkingDirectory", "--property=User", "--property=Group",
+			"--property=DynamicUser", "--", unit)
 		if err != nil {
 			continue
 		}
@@ -87,12 +91,15 @@ func (d *Discoverer) discoverUnit(ctx context.Context) (Installation, error) {
 		}
 		configDir, configPath := extractConfigPathsAt(args, properties["WorkingDirectory"])
 		return Installation{
-			BinaryPath: path,
-			Unit:       unit,
-			UnitPath:   properties["FragmentPath"],
-			ExecArgs:   args,
-			ConfigDir:  configDir,
-			ConfigPath: configPath,
+			BinaryPath:   path,
+			Unit:         unit,
+			UnitPath:     properties["FragmentPath"],
+			ExecArgs:     args,
+			ConfigDir:    configDir,
+			ConfigPath:   configPath,
+			ServiceUser:  properties["User"],
+			ServiceGroup: properties["Group"],
+			DynamicUser:  strings.EqualFold(properties["DynamicUser"], "yes"),
 		}, nil
 	}
 	return Installation{}, fmt.Errorf("mihomo systemd service was not found")

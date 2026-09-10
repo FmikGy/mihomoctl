@@ -19,6 +19,33 @@ type authorizationRequiredError interface {
 	AuthorizationRequired() bool
 }
 
+type operationWarningError interface {
+	Warning() bool
+}
+
+func isOperationWarning(err error) bool {
+	if err == nil {
+		return false
+	}
+	if many, ok := err.(interface{ Unwrap() []error }); ok {
+		children := many.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !isOperationWarning(child) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return isOperationWarning(wrapped.Unwrap())
+	}
+	target, ok := err.(operationWarningError)
+	return ok && target.Warning()
+}
+
 var execInteractiveOperation = tea.Exec
 
 func (m Model) needsElevation() bool {
@@ -35,16 +62,28 @@ func isAuthorizationRequired(err error) bool {
 }
 
 func (m *Model) beginPrivilegedOperation(action, message string, fn func(context.Context) error) tea.Cmd {
-	return m.beginOperationAttempt(action, message, "", "", m.needsElevation(), true, fn)
+	return m.beginOperationAttemptWithCore(action, message, "", "", m.needsElevation(), true, false, fn)
+}
+
+func (m *Model) beginPrivilegedCoreOperation(action, message string, fn func(context.Context) error) tea.Cmd {
+	return m.beginOperationAttemptWithCore(action, message, "", "", m.needsElevation(), true, true, fn)
+}
+
+func (m *Model) beginPrivilegedMetadataOperation(action, message string, fn func(context.Context) error) tea.Cmd {
+	return m.beginOperationAttemptWithCore(action, message, "", "", m.needsElevation(), false, false, fn)
 }
 
 func (m *Model) beginPrivilegedConfigOperation(action, message, key, value string) tea.Cmd {
-	return m.beginOperationAttempt(action, message, key, value, m.needsElevation(), true, func(ctx context.Context) error {
+	return m.beginOperationAttemptWithCore(action, message, key, value, m.needsElevation(), true, true, func(ctx context.Context) error {
 		return m.backend.SetConfig(ctx, key, value)
 	})
 }
 
 func (m *Model) beginOperationAttempt(action, message, configKey, configValue string, privileged, runtimeMutation bool, fn func(context.Context) error) tea.Cmd {
+	return m.beginOperationAttemptWithCore(action, message, configKey, configValue, privileged, runtimeMutation, false, fn)
+}
+
+func (m *Model) beginOperationAttemptWithCore(action, message, configKey, configValue string, privileged, runtimeMutation, coreMutation bool, fn func(context.Context) error) tea.Cmd {
 	if m.loading {
 		return nil
 	}
@@ -52,6 +91,7 @@ func (m *Model) beginOperationAttempt(action, message, configKey, configValue st
 	m.privilegedOperation = privileged
 	m.authorizing = false
 	m.runtimeMutation = runtimeMutation
+	m.coreMutation = coreMutation
 	if runtimeMutation {
 		m.suspendRuntimeObservers()
 	}
@@ -68,6 +108,7 @@ func (m *Model) beginOperationAttempt(action, message, configKey, configValue st
 			return operationMsg{
 				action: action, message: message, err: context.Canceled, generation: generation,
 				configKey: configKey, configValue: configValue, privileged: privileged,
+				coreMutation: coreMutation,
 			}
 		}
 		defer ticket.finish()
@@ -75,7 +116,7 @@ func (m *Model) beginOperationAttempt(action, message, configKey, configValue st
 		return operationMsg{
 			action: action, message: message, err: err, generation: generation,
 			configKey: configKey, configValue: configValue,
-			privileged: privileged, retry: fn,
+			privileged: privileged, coreMutation: coreMutation, retry: fn,
 		}
 	}
 }

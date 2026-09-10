@@ -37,6 +37,15 @@ type ApplyResult struct {
 	recoverable   bool
 }
 
+// ConfigAccess describes the only supported access policies for a managed
+// config. Owner access is always read/write; group access, when enabled, is
+// read-only. Access for other users is never granted.
+type ConfigAccess struct {
+	UID           int
+	GID           int
+	GroupReadable bool
+}
+
 type fileMetadata struct {
 	mode os.FileMode
 	uid  int
@@ -53,6 +62,7 @@ type ConfigApplier struct {
 	HealthCheck     func(context.Context) error
 	Now             func() time.Time
 	RollbackTimeout time.Duration
+	ConfigAccess    *ConfigAccess
 	// BackupRetention limits backups created for the active config. Zero uses
 	// DefaultBackupRetention; a negative value disables pruning.
 	BackupRetention int
@@ -130,14 +140,20 @@ func (a *ConfigApplier) Apply(ctx context.Context, config []byte) (ApplyResult, 
 		}
 		return ApplyResult{}, &ApplyError{Stage: stage, Cause: err}
 	}
-	result := ApplyResult{
-		BackupPath: backupPath, configPath: a.Paths.ConfigPath,
-		hadOriginal: hadOriginal, metadata: metadata, installedHash: sha256.Sum256(config),
-		installedSize: int64(len(config)),
-	}
 	secureMetadata := fileMetadata{mode: 0o600, uid: os.Geteuid(), gid: os.Getegid()}
 	if hadOriginal {
 		secureMetadata = managedConfigMetadata(metadata)
+	}
+	if a.ConfigAccess != nil {
+		secureMetadata = fileMetadata{mode: 0o600, uid: a.ConfigAccess.UID, gid: a.ConfigAccess.GID}
+		if a.ConfigAccess.GroupReadable {
+			secureMetadata.mode = 0o640
+		}
+	}
+	result := ApplyResult{
+		BackupPath: backupPath, configPath: a.Paths.ConfigPath,
+		hadOriginal: hadOriginal, metadata: secureMetadata, installedHash: sha256.Sum256(config),
+		installedSize: int64(len(config)),
 	}
 	// Commit ownership and permissions while the old config is still in place.
 	// A crash after rename can then never strand a root-only staging file where
@@ -226,6 +242,9 @@ func (a *ConfigApplier) validate() error {
 	}
 	if a.HealthCheck == nil {
 		return fmt.Errorf("config health check callback is required")
+	}
+	if a.ConfigAccess != nil && (a.ConfigAccess.UID < 0 || a.ConfigAccess.GID < 0) {
+		return fmt.Errorf("config access uid and gid must not be negative")
 	}
 	return nil
 }
@@ -643,7 +662,7 @@ func applyFileMetadata(file *os.File, metadata fileMetadata) error {
 }
 
 func managedConfigMetadata(metadata fileMetadata) fileMetadata {
-	metadata.mode = 0o400 | metadata.mode.Perm()&0o044
+	metadata.mode = 0o400 | metadata.mode.Perm()&0o040
 	if metadata.uid == os.Geteuid() {
 		metadata.mode |= 0o200
 	}

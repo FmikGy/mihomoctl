@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -176,6 +177,15 @@ func readLocalClientFile(path string) ([]byte, error) {
 		_ = file.Close()
 		return nil, errors.New("客户端状态必须是普通文件")
 	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != uint32(os.Geteuid()) {
+		_ = file.Close()
+		return nil, errors.New("客户端状态必须归当前用户所有")
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		_ = file.Close()
+		return nil, errors.New("客户端状态权限过宽，必须禁止组和其他用户访问")
+	}
 	if info.Size() > maxClientStateBytes {
 		_ = file.Close()
 		return nil, errors.New("客户端状态文件过大")
@@ -206,9 +216,13 @@ func readOwnedClientFile(plan *clientOwnerPlan) ([]byte, error) {
 		_ = unix.Close(fileFD)
 		return nil, fmt.Errorf("检查客户端状态失败: %w", err)
 	}
-	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != uint32(plan.uid) {
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != uint32(plan.uid) || stat.Gid != uint32(plan.gid) {
 		_ = unix.Close(fileFD)
-		return nil, errors.New("客户端状态必须是 sudo 用户所有的普通文件")
+		return nil, errors.New("客户端状态必须是 sudo 用户及其主组所有的普通文件")
+	}
+	if stat.Mode&0o077 != 0 {
+		_ = unix.Close(fileFD)
+		return nil, errors.New("客户端状态权限过宽，必须禁止组和其他用户访问")
 	}
 	file := os.NewFile(uintptr(fileFD), plan.filename)
 	if file == nil {
@@ -267,9 +281,13 @@ func captureOwnedClientFile(path string, plan *clientOwnerPlan) (fileCheckpoint,
 		_ = unix.Close(fileFD)
 		return fileCheckpoint{}, fmt.Errorf("检查客户端状态回滚点失败: %w", err)
 	}
-	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != uint32(plan.uid) {
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != uint32(plan.uid) || stat.Gid != uint32(plan.gid) {
 		_ = unix.Close(fileFD)
-		return fileCheckpoint{}, errors.New("客户端状态回滚点必须是 sudo 用户所有的普通文件")
+		return fileCheckpoint{}, errors.New("客户端状态回滚点必须是 sudo 用户及其主组所有的普通文件")
+	}
+	if stat.Mode&0o077 != 0 {
+		_ = unix.Close(fileFD)
+		return fileCheckpoint{}, errors.New("客户端状态回滚点权限过宽")
 	}
 	if stat.Size > maxClientStateBytes {
 		_ = unix.Close(fileFD)

@@ -25,19 +25,22 @@ type Traffic struct {
 }
 
 type RuntimeStatus struct {
-	Service         ServiceStatus `json:"service"`
-	CoreVersion     string        `json:"core_version,omitempty"`
-	ActiveProfile   string        `json:"active_profile,omitempty"`
-	ConfigAvailable bool          `json:"config_available"`
-	Mode            Mode          `json:"mode,omitempty"`
-	TUN             bool          `json:"tun"`
-	MixedPort       int           `json:"mixed_port,omitempty"`
-	AllowLAN        bool          `json:"allow_lan"`
-	IPv6            bool          `json:"ipv6"`
-	LogLevel        string        `json:"log_level,omitempty"`
-	Memory          int64         `json:"memory,omitempty"`
-	ConnectionCount int           `json:"connection_count"`
-	Traffic         Traffic       `json:"traffic"`
+	Service         ServiceStatus    `json:"service"`
+	CoreVersion     string           `json:"core_version,omitempty"`
+	ActiveProfile   string           `json:"active_profile,omitempty"`
+	ConfigAvailable bool             `json:"config_available"`
+	Mode            Mode             `json:"mode,omitempty"`
+	TUN             bool             `json:"tun"`
+	MixedPort       int              `json:"mixed_port,omitempty"`
+	AllowLAN        bool             `json:"allow_lan"`
+	IPv6            bool             `json:"ipv6"`
+	LogLevel        string           `json:"log_level,omitempty"`
+	Memory          int64            `json:"memory,omitempty"`
+	ConnectionCount int              `json:"connection_count"`
+	Traffic         Traffic          `json:"traffic"`
+	ExpectedConfig  *EffectiveConfig `json:"expected_config,omitempty"`
+	LiveConfig      *EffectiveConfig `json:"live_config,omitempty"`
+	ConfigDrift     []string         `json:"config_drift,omitempty"`
 }
 
 // EffectiveConfig is the non-sensitive subset of the active Mihomo

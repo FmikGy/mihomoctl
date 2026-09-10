@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"mihomoctl/internal/domain"
 	"mihomoctl/internal/platform"
@@ -137,13 +138,16 @@ func (a *App) Doctor(ctx context.Context, fix bool) ([]domain.DoctorCheck, error
 		a.mu.Unlock()
 		fix = false
 	}
-	checks := make([]domain.DoctorCheck, 0, 6)
+	checks := make([]domain.DoctorCheck, 0, 7)
 	installationOK := false
 	binary := "mihomo"
 	a.mu.RLock()
 	root := a.isRoot()
+	var rootState *persistedState
 	if root && a.state != nil {
 		binary = a.state.Installation.BinaryPath
+		copy := *a.state
+		rootState = &copy
 	}
 	initialized := a.client != nil
 	loadErr := a.clientLoadErr
@@ -168,6 +172,9 @@ func (a *App) Doctor(ctx context.Context, fix bool) ([]domain.DoctorCheck, error
 		}
 	} else {
 		checks = append(checks, domain.DoctorCheck{Name: "systemd 服务", OK: false, Message: systemdErr.Error()})
+	}
+	if rootState != nil && systemdErr == nil {
+		checks = append(checks, checkManagedConfigPermissions(ctx, systemd, rootState.Installation.ConfigPath))
 	}
 	stateMessage := boolMessage(initialized, "状态文件可用", "尚未初始化")
 	stateOK := initialized
@@ -233,8 +240,12 @@ func (a *App) Doctor(ctx context.Context, fix bool) ([]domain.DoctorCheck, error
 			return checks, err
 		}
 		for index := range checks {
-			if checks[index].Name == "mihomoctl 初始化" || checks[index].Name == "活动配置" {
+			if checks[index].Name == "mihomoctl 初始化" || checks[index].Name == "活动配置" || checks[index].Name == "Mihomo 配置权限" {
+				checks[index].OK = true
 				checks[index].Fixed = true
+				if checks[index].Name == "Mihomo 配置权限" {
+					checks[index].Message = "已按 Mihomo 服务用户收紧"
+				}
 			}
 		}
 	}
@@ -242,6 +253,36 @@ func (a *App) Doctor(ctx context.Context, fix bool) ([]domain.DoctorCheck, error
 		return checks, nil
 	}
 	return checks, nil
+}
+
+func checkManagedConfigPermissions(ctx context.Context, systemd *platform.Systemd, path string) domain.DoctorCheck {
+	check := domain.DoctorCheck{Name: "Mihomo 配置权限"}
+	access, err := serviceConfigAccess(ctx, systemd)
+	if err != nil {
+		check.Message = err.Error()
+		return check
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		check.Message = fmt.Sprintf("检查 %s 失败: %v", path, err)
+		return check
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	wantMode := os.FileMode(0o600)
+	if access.GroupReadable {
+		wantMode = 0o640
+	}
+	if !ok || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		check.Message = "配置路径不是普通文件"
+		return check
+	}
+	if int(stat.Uid) != access.UID || int(stat.Gid) != access.GID || info.Mode().Perm() != wantMode {
+		check.Message = fmt.Sprintf("当前 %d:%d %04o，期望 %d:%d %04o", stat.Uid, stat.Gid, info.Mode().Perm(), access.UID, access.GID, wantMode)
+		return check
+	}
+	check.OK = true
+	check.Message = fmt.Sprintf("%d:%d %04o", stat.Uid, stat.Gid, info.Mode().Perm())
+	return check
 }
 
 func hasActive(profiles []domain.Profile) bool {

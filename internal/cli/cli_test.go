@@ -363,6 +363,21 @@ func TestCommandRoutingAndFlags(t *testing.T) {
 	})
 }
 
+func TestProfileUseReportsPartialSuccessAsWarning(t *testing.T) {
+	backend := &fakeBackend{err: &appbackend.OperationWarning{Message: "部分节点未恢复"}}
+	stdout, _, err := runCommand(t, backend, "profile", "use", "daily", "--output", "json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend.usedProfile != "daily" || !strings.Contains(stdout, `"warning":"部分节点未恢复"`) {
+		t.Fatalf("profile warning output = %q, used=%q", stdout, backend.usedProfile)
+	}
+	stdout, _, err = runCommand(t, backend, "profile", "use", "daily")
+	if err != nil || !strings.Contains(stdout, "配置已激活") || !strings.Contains(stdout, "警告: 部分节点未恢复") {
+		t.Fatalf("profile table warning = %q, %v", stdout, err)
+	}
+}
+
 func TestJSONEnvelopeAndProfileRedaction(t *testing.T) {
 	secret := "https://user:password@example.test/sub?token=secret"
 	backend := &fakeBackend{profilesValue: []domain.Profile{{

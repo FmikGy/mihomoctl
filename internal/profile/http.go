@@ -14,11 +14,12 @@ import (
 )
 
 type fetchResult struct {
-	body         []byte
-	notModified  bool
-	etag         string
-	lastModified string
-	subscription domain.SubscriptionInfo
+	body                []byte
+	notModified         bool
+	etag                string
+	lastModified        string
+	subscription        domain.SubscriptionInfo
+	subscriptionPresent bool
 }
 
 func (s *Store) fetchRemote(ctx context.Context, rawURL, etag, lastModified string) (fetchResult, error) {
@@ -56,6 +57,7 @@ func (s *Store) fetchRemote(ctx context.Context, rawURL, etag, lastModified stri
 	if value := response.Header.Get("Subscription-Userinfo"); value != "" {
 		if info, parseErr := ParseSubscriptionUserInfo(value); parseErr == nil {
 			result.subscription = info
+			result.subscriptionPresent = true
 		}
 	}
 	if response.StatusCode == http.StatusNotModified {

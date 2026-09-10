@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -64,6 +65,21 @@ func (e *InvalidInputError) Error() string {
 }
 func (e *InvalidInputError) Unwrap() error { return e.Cause }
 func (e *InvalidInputError) ExitCode() int { return 2 }
+
+// OperationWarning reports a completed operation with non-fatal follow-up
+// failures. Presentation layers should show it as a warning, not a hard error.
+type OperationWarning struct {
+	Message string
+}
+
+func (e *OperationWarning) Error() string {
+	if e == nil || strings.TrimSpace(e.Message) == "" {
+		return "操作已完成，但存在警告"
+	}
+	return e.Message
+}
+
+func (e *OperationWarning) Warning() bool { return true }
 
 type App struct {
 	paths               Paths

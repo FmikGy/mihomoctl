@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -274,6 +275,9 @@ func (a *App) runElevated(ctx context.Context, args []string, input string) erro
 		Stdout: &stdout, Stderr: &stderr, Env: commandEnvironment,
 	})
 	if runErr == nil {
+		if warning := elevatedWarning(stdout.Bytes()); warning != "" {
+			return &OperationWarning{Message: warning}
+		}
 		return nil
 	}
 	if ctx != nil && ctx.Err() != nil {
@@ -305,6 +309,18 @@ func (a *App) runElevated(ctx context.Context, args []string, input string) erro
 		Cause: runErr, failure: classifyPrivilegeFailure(message, platform.NonInteractiveElevation(ctx)),
 		detail: stripSudoPrefix(message),
 	}
+}
+
+func elevatedWarning(content []byte) string {
+	var response struct {
+		Data struct {
+			Warning string `json:"warning"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(content, &response) != nil {
+		return ""
+	}
+	return strings.TrimSpace(response.Data.Warning)
 }
 
 func trustedSudoPath() (string, error) {

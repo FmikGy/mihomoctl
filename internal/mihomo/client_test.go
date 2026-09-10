@@ -250,3 +250,14 @@ func TestRequestTimeoutAndCanceledContext(t *testing.T) {
 		t.Fatalf("canceled error = %v", err)
 	}
 }
+
+func TestDefaultClientLimitsResponseHeaderWait(t *testing.T) {
+	client, err := NewClient("http://127.0.0.1:9090", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, ok := client.httpClient.Transport.(*http.Transport)
+	if !ok || transport.ResponseHeaderTimeout != defaultResponseHeaderTimeout {
+		t.Fatalf("default transport = %#v", client.httpClient.Transport)
+	}
+}

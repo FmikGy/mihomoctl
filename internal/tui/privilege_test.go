@@ -352,7 +352,10 @@ func TestProtectedAndAPIActionsUseSeparateOperationPaths(t *testing.T) {
 	}{
 		{
 			name: "service start", privileged: true,
-			prepare:  func(m *Model) { m.page = pageOverview; m.status.Service.Active = false },
+			prepare: func(m *Model) {
+				m.page = pageOverview
+				m.status.Service = domain.ServiceStatus{State: "dead"}
+			},
 			activate: func(m Model) (tea.Model, tea.Cmd) { return m.activate() },
 		},
 		{
@@ -368,7 +371,7 @@ func TestProtectedAndAPIActionsUseSeparateOperationPaths(t *testing.T) {
 			prepare: func(m *Model) {
 				m.page = pageSettings
 				m.settingCursor = settingCursorFor(t, settingStartup)
-				m.status.Service.Enabled = false
+				m.status.Service = domain.ServiceStatus{State: "dead"}
 			},
 			activate: func(m Model) (tea.Model, tea.Cmd) { return m.activateSetting() },
 		},
@@ -502,5 +505,33 @@ func TestGroupTestNeverStartsPrivilegeFlow(t *testing.T) {
 	}
 	if _, ok := cmd().(groupTestMsg); !ok {
 		t.Fatal("group test did not return its normal result message")
+	}
+}
+
+func TestCoreMutationStartsNewTrafficEpoch(t *testing.T) {
+	m := testModel()
+	m.status.Traffic = domain.Traffic{Up: 10, Down: 20, UpTotal: 300, DownTotal: 400}
+	m.trafficHistory = []trafficSample{{at: time.Now(), up: 10, down: 20}}
+	m.lastTrafficAt = time.Now()
+	m.loading = true
+	m.runtimeMutation = true
+	m.coreMutation = true
+	m.mutationGeneration = 9
+	m, _ = updateUIModel(t, m, operationMsg{message: "完成", generation: 9, coreMutation: true})
+	if m.status.Traffic != (domain.Traffic{}) || len(m.trafficHistory) != 0 || !m.lastTrafficAt.IsZero() {
+		t.Fatalf("core mutation retained traffic epoch: %#v history=%#v", m.status.Traffic, m.trafficHistory)
+	}
+}
+
+func TestMetadataMutationKeepsTrafficEpoch(t *testing.T) {
+	m := testModel()
+	want := domain.Traffic{Up: 10, Down: 20, UpTotal: 300, DownTotal: 400}
+	m.status.Traffic = want
+	m.trafficHistory = []trafficSample{{at: time.Now(), up: 10, down: 20}}
+	m.loading = true
+	m.mutationGeneration = 10
+	m, _ = updateUIModel(t, m, operationMsg{message: "完成", generation: 10})
+	if m.status.Traffic != want || len(m.trafficHistory) != 1 {
+		t.Fatalf("metadata mutation reset traffic epoch: %#v history=%#v", m.status.Traffic, m.trafficHistory)
 	}
 }

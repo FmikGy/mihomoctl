@@ -80,6 +80,23 @@ func TestSystemdStatus(t *testing.T) {
 	}
 }
 
+func TestSystemdIdentity(t *testing.T) {
+	runner := &recordingRunner{run: func(context.Context, string, ...string) (CommandResult, error) {
+		return CommandResult{Stdout: []byte("LoadState=loaded\nUser=mihomo\nGroup=proxy\nDynamicUser=yes\n")}, nil
+	}}
+	manager, err := NewSystemd(runner, "mihomo.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := manager.Identity(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.User != "mihomo" || identity.Group != "proxy" || !identity.DynamicUser {
+		t.Fatalf("identity = %#v", identity)
+	}
+}
+
 func TestSystemdActionsAreFixed(t *testing.T) {
 	runner := &recordingRunner{}
 	manager, err := NewSystemd(runner, "mihomo.service")
@@ -229,12 +246,13 @@ func TestDiscovererFindsUnitBinaryAndConfig(t *testing.T) {
 		if name != "systemctl" {
 			t.Fatalf("unexpected command %q", name)
 		}
-		if !slicesContain(args, "--property=WorkingDirectory") {
-			t.Fatalf("systemctl show did not request WorkingDirectory: %#v", args)
+		if !slicesContain(args, "--property=WorkingDirectory") || !slicesContain(args, "--property=User") || !slicesContain(args, "--property=DynamicUser") {
+			t.Fatalf("systemctl show did not request service metadata: %#v", args)
 		}
 		return CommandResult{Stdout: []byte(
 			"LoadState=loaded\n" +
 				"FragmentPath=/usr/lib/systemd/system/mihomo.service\n" +
+				"User=mihomo\nGroup=mihomo\nDynamicUser=no\n" +
 				"ExecStart={ path=" + binary + " ; argv[]=" + binary + " -d /etc/mihomo ; ignore_errors=no ; }\n",
 		)}, nil
 	}}
@@ -244,7 +262,7 @@ func TestDiscovererFindsUnitBinaryAndConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.BinaryPath != binary || got.Unit != "mihomo.service" || got.ConfigDir != "/etc/mihomo" || got.ConfigPath != "/etc/mihomo/config.yaml" {
+	if got.BinaryPath != binary || got.Unit != "mihomo.service" || got.ConfigDir != "/etc/mihomo" || got.ConfigPath != "/etc/mihomo/config.yaml" || got.ServiceUser != "mihomo" || got.ServiceGroup != "mihomo" || got.DynamicUser {
 		t.Fatalf("unexpected discovery result: %#v", got)
 	}
 }
@@ -341,7 +359,7 @@ func TestConfigApplierSuccess(t *testing.T) {
 		t.Fatalf("activation calls = %d", activationCalls)
 	}
 	assertFileContents(t, fixture.configPath, "mode: new\n")
-	assertMode(t, fixture.configPath, 0o644)
+	assertMode(t, fixture.configPath, 0o640)
 	assertFileContents(t, result.BackupPath, "mode: old\n")
 	assertMode(t, result.BackupPath, 0o600)
 	assertValidationCall(t, fixture.runner.calls, fixture.binary, fixture.configDir)
@@ -370,7 +388,7 @@ func TestConfigApplierRollsBackActivationFailure(t *testing.T) {
 		t.Fatalf("activation calls = %d", activationCalls)
 	}
 	assertFileContents(t, fixture.configPath, "mode: old\n")
-	assertMode(t, fixture.configPath, 0o644)
+	assertMode(t, fixture.configPath, 0o640)
 }
 
 func TestConfigApplierRollsBackHealthFailure(t *testing.T) {
@@ -395,7 +413,7 @@ func TestConfigApplierRollsBackHealthFailure(t *testing.T) {
 		t.Fatalf("health calls = %d", healthCalls)
 	}
 	assertFileContents(t, fixture.configPath, "mode: old\n")
-	assertMode(t, fixture.configPath, 0o644)
+	assertMode(t, fixture.configPath, 0o640)
 }
 
 func TestConfigApplierPreservesRequiredReadAccess(t *testing.T) {
@@ -410,7 +428,7 @@ func TestConfigApplierPreservesRequiredReadAccess(t *testing.T) {
 				t.Fatal(err)
 			}
 			fixture.applier.Activate = func(context.Context) error {
-				assertMode(t, fixture.configPath, mode)
+				assertMode(t, fixture.configPath, 0o640)
 				return nil
 			}
 			fixture.applier.HealthCheck = func(context.Context) error { return nil }
@@ -424,15 +442,34 @@ func TestConfigApplierPreservesRequiredReadAccess(t *testing.T) {
 			if before.Sys().(*syscall.Stat_t).Uid != after.Sys().(*syscall.Stat_t).Uid || before.Sys().(*syscall.Stat_t).Gid != after.Sys().(*syscall.Stat_t).Gid {
 				t.Fatal("config ownership changed")
 			}
-			assertMode(t, fixture.configPath, mode)
+			assertMode(t, fixture.configPath, 0o640)
 		})
 	}
 }
 
 func TestManagedConfigMetadataPreservesOnlyRequiredAccess(t *testing.T) {
 	metadata := managedConfigMetadata(fileMetadata{mode: 0o677, uid: os.Geteuid(), gid: os.Getegid()})
-	if metadata.mode.Perm() != 0o644 {
-		t.Fatalf("managed mode for current owner = %o, want 644", metadata.mode.Perm())
+	if metadata.mode.Perm() != 0o640 {
+		t.Fatalf("managed mode for current owner = %o, want 640", metadata.mode.Perm())
+	}
+}
+
+func TestConfigApplierHonorsExplicitConfigAccess(t *testing.T) {
+	for name, groupReadable := range map[string]bool{"owner only": false, "service group": true} {
+		t.Run(name, func(t *testing.T) {
+			fixture := newApplierFixture(t, []byte("mode: old\n"))
+			fixture.applier.ConfigAccess = &ConfigAccess{UID: os.Geteuid(), GID: os.Getegid(), GroupReadable: groupReadable}
+			fixture.applier.Activate = func(context.Context) error { return nil }
+			fixture.applier.HealthCheck = func(context.Context) error { return nil }
+			if _, err := fixture.applier.Apply(context.Background(), []byte("mode: new\n")); err != nil {
+				t.Fatal(err)
+			}
+			want := os.FileMode(0o600)
+			if groupReadable {
+				want = 0o640
+			}
+			assertMode(t, fixture.configPath, want)
+		})
 	}
 }
 
@@ -550,7 +587,7 @@ func TestConfigApplierCanRollbackSuccessfulApply(t *testing.T) {
 		t.Fatalf("activation calls = %d", activationCalls)
 	}
 	assertFileContents(t, fixture.configPath, "mode: old\n")
-	assertMode(t, fixture.configPath, 0o644)
+	assertMode(t, fixture.configPath, 0o640)
 }
 
 func TestConfigApplierRollbackKeepsLiveCallerDeadline(t *testing.T) {

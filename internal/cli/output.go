@@ -87,6 +87,24 @@ func (a *application) writeResult(data any, message string) error {
 	return err
 }
 
+func (a *application) writeWarningResult(data map[string]any, message, warning string) error {
+	warning = cleanCell(warning)
+	if warning != "" {
+		data["warning"] = warning
+	}
+	if a.output == "json" {
+		return writeJSON(a.stdout, data)
+	}
+	if _, err := fmt.Fprintln(a.stdout, cleanCell(message)); err != nil {
+		return err
+	}
+	if warning != "" {
+		_, err := fmt.Fprintln(a.stdout, "警告:", warning)
+		return err
+	}
+	return nil
+}
+
 func (a *application) writeStatus(status domain.RuntimeStatus) error {
 	if a.output == "json" {
 		return writeJSON(a.stdout, status)
@@ -105,29 +123,40 @@ func (a *application) writeStatus(status domain.RuntimeStatus) error {
 		{"下载速率", formatBytes(status.Traffic.Down) + "/s"},
 		{"内存", formatBytes(status.Memory)},
 	}
+	if len(status.ConfigDrift) > 0 {
+		rows = append(rows, []string{"配置偏差", strings.Join(status.ConfigDrift, ", ")})
+	}
 	return writeTable(a.stdout, []string{"项目", "状态"}, rows)
 }
 
 func (a *application) writeConfig(status domain.RuntimeStatus) error {
 	data := struct {
-		Mode      domain.Mode `json:"mode"`
-		TUN       bool        `json:"tun"`
-		MixedPort int         `json:"mixed_port"`
-		AllowLAN  bool        `json:"allow_lan"`
-		IPv6      bool        `json:"ipv6"`
-		LogLevel  string      `json:"log_level"`
-	}{status.Mode, status.TUN, status.MixedPort, status.AllowLAN, status.IPv6, status.LogLevel}
+		Mode      domain.Mode             `json:"mode"`
+		TUN       bool                    `json:"tun"`
+		MixedPort int                     `json:"mixed_port"`
+		AllowLAN  bool                    `json:"allow_lan"`
+		IPv6      bool                    `json:"ipv6"`
+		LogLevel  string                  `json:"log_level"`
+		Expected  *domain.EffectiveConfig `json:"expected,omitempty"`
+		Live      *domain.EffectiveConfig `json:"live,omitempty"`
+		Drift     []string                `json:"drift,omitempty"`
+	}{status.Mode, status.TUN, status.MixedPort, status.AllowLAN, status.IPv6, status.LogLevel,
+		status.ExpectedConfig, status.LiveConfig, status.ConfigDrift}
 	if a.output == "json" {
 		return writeJSON(a.stdout, data)
 	}
-	return writeTable(a.stdout, []string{"配置项", "值"}, [][]string{
+	rows := [][]string{
 		{"mode", string(status.Mode)},
 		{"tun", strconv.FormatBool(status.TUN)},
 		{"mixed-port", strconv.Itoa(status.MixedPort)},
 		{"allow-lan", strconv.FormatBool(status.AllowLAN)},
 		{"ipv6", strconv.FormatBool(status.IPv6)},
 		{"log-level", status.LogLevel},
-	})
+	}
+	if len(status.ConfigDrift) > 0 {
+		rows = append(rows, []string{"配置偏差", strings.Join(status.ConfigDrift, ", ")})
+	}
+	return writeTable(a.stdout, []string{"配置项", "值"}, rows)
 }
 
 func (a *application) writeGroups(groups []domain.ProxyGroup) error {

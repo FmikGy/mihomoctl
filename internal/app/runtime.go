@@ -18,6 +18,8 @@ import (
 const defaultDelayTestURL = "https://www.gstatic.com/generate_204"
 const coreVersionCacheTTL = 5 * time.Minute
 
+var trafficNoSampleTimeout = 6 * time.Second
+
 func (a *App) Status(ctx context.Context) (domain.RuntimeStatus, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -128,6 +130,10 @@ func (a *App) CoreStatus(ctx context.Context) (domain.RuntimeStatus, error) {
 	} else if status.ActiveProfile == "" {
 		status.ActiveProfile = clientActiveProfile
 	}
+	if status.ConfigAvailable {
+		expected := effectiveConfigFromStatus(status)
+		status.ExpectedConfig = &expected
+	}
 	a.mu.RLock()
 	api := a.api
 	cachedVersion := a.coreVersion
@@ -156,16 +162,10 @@ func (a *App) CoreStatus(ctx context.Context) (domain.RuntimeStatus, error) {
 	wait.Wait()
 
 	if configErr == nil {
-		liveConfig := domain.EffectiveConfig{
-			Mode: config.Mode, TUN: config.TUN.Enable, MixedPort: config.MixedPort,
-			AllowLAN: config.AllowLAN, IPv6: config.IPv6, LogLevel: config.LogLevel,
-		}
-		// Mihomo reports zero when a configured mixed port cannot be bound (for
-		// example when a legacy HTTP port uses the same number). Keep the
-		// persisted value visible so the settings screen does not revert to
-		// "未设置" immediately after a successful edit.
-		if liveConfig.MixedPort == 0 && status.ConfigAvailable && status.MixedPort > 0 {
-			liveConfig.MixedPort = status.MixedPort
+		liveConfig := effectiveConfigFromMihomo(config)
+		status.LiveConfig = &liveConfig
+		if status.ExpectedConfig != nil {
+			status.ConfigDrift = effectiveConfigDrift(*status.ExpectedConfig, liveConfig)
 		}
 		applyEffectiveConfig(&status, liveConfig)
 	}
@@ -284,6 +284,43 @@ func applyEffectiveConfig(status *domain.RuntimeStatus, config domain.EffectiveC
 	status.LogLevel = config.LogLevel
 }
 
+func effectiveConfigFromStatus(status domain.RuntimeStatus) domain.EffectiveConfig {
+	return domain.EffectiveConfig{
+		Mode: status.Mode, TUN: status.TUN, MixedPort: status.MixedPort,
+		AllowLAN: status.AllowLAN, IPv6: status.IPv6, LogLevel: status.LogLevel,
+	}
+}
+
+func effectiveConfigFromMihomo(config mihomo.Config) domain.EffectiveConfig {
+	return domain.EffectiveConfig{
+		Mode: config.Mode, TUN: config.TUN.Enable, MixedPort: config.MixedPort,
+		AllowLAN: config.AllowLAN, IPv6: config.IPv6, LogLevel: config.LogLevel,
+	}
+}
+
+func effectiveConfigDrift(expected, live domain.EffectiveConfig) []string {
+	drift := make([]string, 0, 6)
+	if expected.Mode != live.Mode {
+		drift = append(drift, "mode")
+	}
+	if expected.TUN != live.TUN {
+		drift = append(drift, "tun")
+	}
+	if expected.MixedPort != live.MixedPort {
+		drift = append(drift, "mixed-port")
+	}
+	if expected.AllowLAN != live.AllowLAN {
+		drift = append(drift, "allow-lan")
+	}
+	if expected.IPv6 != live.IPv6 {
+		drift = append(drift, "ipv6")
+	}
+	if expected.LogLevel != live.LogLevel {
+		drift = append(drift, "log-level")
+	}
+	return drift
+}
+
 func (a *App) Groups(ctx context.Context) ([]domain.ProxyGroup, error) {
 	client, err := a.checkAPI()
 	if err != nil {
@@ -372,6 +409,9 @@ func (a *App) CloseAllConnections(ctx context.Context) error {
 }
 
 func (a *App) WatchTraffic(ctx context.Context) (<-chan domain.Traffic, <-chan error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	traffic := make(chan domain.Traffic, 16)
 	errorsCh := make(chan error, 1)
 	client, err := a.checkAPI()
@@ -384,14 +424,56 @@ func (a *App) WatchTraffic(ctx context.Context) (<-chan domain.Traffic, <-chan e
 	go func() {
 		defer close(traffic)
 		defer close(errorsCh)
-		err := client.StreamTraffic(ctx, func(sample domain.Traffic) error {
+		streamCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		activity := make(chan struct{}, 1)
+		streamDone := make(chan struct{})
+		watchdogExpired := make(chan struct{}, 1)
+		go func() {
+			timer := time.NewTimer(trafficNoSampleTimeout)
+			defer timer.Stop()
+			for {
+				select {
+				case <-activity:
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					timer.Reset(trafficNoSampleTimeout)
+				case <-timer.C:
+					select {
+					case watchdogExpired <- struct{}{}:
+					default:
+					}
+					cancel()
+					return
+				case <-streamDone:
+					return
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+		err := client.StreamTraffic(streamCtx, func(sample domain.Traffic) error {
+			select {
+			case activity <- struct{}{}:
+			default:
+			}
 			select {
 			case traffic <- sample:
 				return nil
-			case <-ctx.Done():
-				return ctx.Err()
+			case <-streamCtx.Done():
+				return streamCtx.Err()
 			}
 		})
+		close(streamDone)
+		select {
+		case <-watchdogExpired:
+			err = fmt.Errorf("流量流在 %s 内没有返回数据", trafficNoSampleTimeout)
+		default:
+		}
 		if err != nil && ctx.Err() == nil {
 			select {
 			case errorsCh <- controllerError(fmt.Errorf("流量流已断开: %w", err)):
@@ -403,6 +485,9 @@ func (a *App) WatchTraffic(ctx context.Context) (<-chan domain.Traffic, <-chan e
 }
 
 func (a *App) WatchLogs(ctx context.Context, level string) (<-chan domain.LogEntry, <-chan error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	entries := make(chan domain.LogEntry, 128)
 	errorsCh := make(chan error, 1)
 	client, err := a.checkAPI()

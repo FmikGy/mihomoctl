@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=mihomoctl profile update --due --output json
+ExecStart=/usr/bin/mihomoctl profile update --due --output json
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

@@ -14,11 +14,12 @@ import (
 )
 
 const (
-	defaultRequestTimeout = 10 * time.Second
-	maxErrorBody          = 64 << 10
-	maxErrorMessageRunes  = 512
-	authErrorMessage      = "认证失败"
-	redactedCredential    = "[redacted]"
+	defaultRequestTimeout        = 10 * time.Second
+	defaultResponseHeaderTimeout = 5 * time.Second
+	maxErrorBody                 = 64 << 10
+	maxErrorMessageRunes         = 512
+	authErrorMessage             = "认证失败"
+	redactedCredential           = "[redacted]"
 )
 
 // Client is a client for Mihomo's external-controller API.
@@ -73,10 +74,12 @@ func NewClient(controller, secret string, options ...Option) (*Client, error) {
 	baseURL.Path = strings.TrimRight(baseURL.Path, "/")
 	baseURL.RawPath = strings.TrimRight(baseURL.EscapedPath(), "/")
 
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = defaultResponseHeaderTimeout
 	client := &Client{
 		baseURL:        baseURL,
 		secret:         secret,
-		httpClient:     &http.Client{},
+		httpClient:     &http.Client{Transport: transport},
 		requestTimeout: defaultRequestTimeout,
 	}
 	for _, option := range options {

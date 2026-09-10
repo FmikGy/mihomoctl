@@ -109,6 +109,20 @@ func TestOwnedClientFileReadRejectsSymlinkAndOversizedFiles(t *testing.T) {
 			t.Fatalf("oversized checkpoint error = %v", err)
 		}
 	})
+
+	t.Run("permissive mode", func(t *testing.T) {
+		plan := testClientOwnerPlan(t)
+		if err := writeOwnedClientFile(plan, []byte("secret: private\n"), 0o600, plan.uid, plan.gid); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(filepath.Join(append([]string{plan.home}, plan.directoryComponents...)...), plan.filename)
+		if err := os.Chmod(path, 0o640); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readOwnedClientFile(plan); err == nil || !strings.Contains(err.Error(), "权限过宽") {
+			t.Fatalf("permissive owned client error = %v", err)
+		}
+	})
 }
 
 func TestLocalClientFileRejectsSymlinkAndOversizedFiles(t *testing.T) {
@@ -132,6 +146,15 @@ func TestLocalClientFileRejectsSymlinkAndOversizedFiles(t *testing.T) {
 	}
 	if _, err := readLocalClientFile(path); err == nil || !strings.Contains(err.Error(), "过大") {
 		t.Fatalf("oversized local client file error = %v", err)
+	}
+	if err := os.WriteFile(path, []byte("secret: private\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readLocalClientFile(path); err == nil || !strings.Contains(err.Error(), "权限过宽") {
+		t.Fatalf("permissive local client error = %v", err)
 	}
 }
 

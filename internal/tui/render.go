@@ -642,6 +642,8 @@ func (m Model) renderLogs(height int) string {
 		state += "  服务已停止"
 	} else if m.logConnecting {
 		state += "  连接中"
+	} else if m.logReconnectPending {
+		state += "  重连中"
 	}
 	if m.logPaused {
 		state += "  已暂停"
@@ -728,9 +730,14 @@ func (m Model) settingRows() []settingViewRow {
 		ipv6 = toggleLabel(m.status.IPv6)
 		logLevel = strings.ToUpper(empty(m.status.LogLevel, "info"))
 	}
+	service, startup := "未知", "未知"
+	if m.serviceStatusKnown() {
+		service = toggleLabel(m.status.Service.Active)
+		startup = toggleLabel(m.status.Service.Enabled)
+	}
 	return []settingViewRow{
-		{id: settingService, group: "服务与运行", name: "Mihomo 服务", value: toggleLabel(m.status.Service.Active)},
-		{id: settingStartup, group: "服务与运行", name: "开机启动", value: toggleLabel(m.status.Service.Enabled)},
+		{id: settingService, group: "服务与运行", name: "Mihomo 服务", value: service},
+		{id: settingStartup, group: "服务与运行", name: "开机启动", value: startup},
 		{id: settingMode, group: "服务与运行", name: "运行模式", value: mode},
 		{id: settingTUN, group: "服务与运行", name: "TUN 透明代理", value: tun},
 		{id: settingSchedule, group: "服务与运行", name: "订阅定时更新", value: schedule},

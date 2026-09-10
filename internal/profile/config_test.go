@@ -23,6 +23,105 @@ func TestNormalizeSourcePreservesYAML(t *testing.T) {
 	}
 }
 
+func TestNormalizeSourceRejectsDuplicateKeysRecursively(t *testing.T) {
+	for name, raw := range map[string]string{
+		"top level": "mode: rule\nmode: global\n",
+		"nested":    "dns:\n  enable: true\n  enable: false\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, _, err := NormalizeSource([]byte(raw))
+			if err == nil || !strings.Contains(err.Error(), "duplicate YAML key") {
+				t.Fatalf("duplicate-key error = %v", err)
+			}
+		})
+	}
+}
+
+func TestNormalizeUntrustedSourceRemovesManagementEndpoints(t *testing.T) {
+	raw := []byte(`external-controller: 0.0.0.0:9090
+external-controller-unix: /tmp/mihomo.sock
+external-controller-cors:
+  allow-origins: ['*']
+external-controller-routing-mark: 6666
+external-doh-server: /dns-query
+external-ui: ./ui
+external-ui-name: unsafe
+external-ui-url: https://example.test/ui.zip
+secret: provider-secret
+tls:
+  certificate: provider.crt
+  private-key: provider.key
+proxies: []
+`)
+	got, converted, err := NormalizeUntrustedSource(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if converted {
+		t.Fatal("YAML source was reported as URI conversion")
+	}
+	var config map[string]any
+	if err := yaml.Unmarshal(got, &config); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{
+		"external-controller", "external-controller-unix", "external-controller-cors",
+		"external-controller-routing-mark", "external-doh-server", "external-ui",
+		"external-ui-name", "external-ui-url", "secret", "tls",
+	} {
+		if _, exists := config[key]; exists {
+			t.Errorf("sanitized config retained %q: %s", key, got)
+		}
+	}
+}
+
+func TestNormalizeUntrustedSourceRejectsAdditionalListeners(t *testing.T) {
+	for _, key := range []string{"listeners", "tunnels", "ss-config", "vmess-config", "tuic-server"} {
+		t.Run(key, func(t *testing.T) {
+			raw := []byte(key + ": 7890\nproxies: []\n")
+			_, _, err := NormalizeUntrustedSource(raw)
+			if err == nil || !strings.Contains(err.Error(), key) {
+				t.Fatalf("forbidden listener error = %v", err)
+			}
+		})
+	}
+}
+
+func TestNormalizeUntrustedSourceRemovesLegacyProxyPorts(t *testing.T) {
+	raw := []byte("port: 7890\nsocks-port: 7891\nredir-port: 7892\ntproxy-port: 7893\nproxies: []\n")
+	got, converted, err := NormalizeUntrustedSource(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if converted {
+		t.Fatal("YAML source was reported as URI conversion")
+	}
+	var config map[string]any
+	if err := yaml.Unmarshal(got, &config); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"port", "socks-port", "redir-port", "tproxy-port"} {
+		if _, exists := config[key]; exists {
+			t.Errorf("sanitized config retained %q: %s", key, got)
+		}
+	}
+}
+
+func TestNormalizeUntrustedSourceRejectsTopLevelMergeAndAliasKeys(t *testing.T) {
+	tests := map[string]string{
+		"merge":     "defaults: &defaults\n  listeners:\n    - name: hidden\n      type: socks\n      port: 1080\n<<: *defaults\nproxies: []\n",
+		"alias key": "field: &field listeners\n*field:\n  - name: hidden\n    type: socks\n    port: 1080\nproxies: []\n",
+	}
+	for name, source := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, _, err := NormalizeUntrustedSource([]byte(source))
+			if err == nil || !strings.Contains(err.Error(), "top-level YAML key") {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
 func TestNormalizeSourceURIForms(t *testing.T) {
 	direct := "trojan://first@example.com:443#First"
 	multiple := direct + "\n" + "vless://00000000-0000-0000-0000-000000000001@example.net:8443#Second"

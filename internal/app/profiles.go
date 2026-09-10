@@ -18,6 +18,8 @@ import (
 )
 
 const profileUpdateBatchSize = 4
+const profileSelectionRestoreTimeout = 6 * time.Second
+const profileSelectionRestoreWorkers = 4
 
 type preparedProfileUpdate struct {
 	target   domain.Profile
@@ -125,6 +127,17 @@ func (a *App) addProfileRoot(ctx context.Context, name, source string, interval 
 	}
 	if err != nil {
 		return a.failAndReload(ctx, rollback, err)
+	}
+	createdConfig, err := store.Config(created.ID)
+	if err == nil {
+		err = profile.ValidateManagedConfigSize(createdConfig, profile.OverlayOptions{
+			ExternalController: state.Controller,
+			Secret:             state.Secret,
+			Settings:           state.Settings,
+		}, platform.MaxManagedConfigBytes)
+	}
+	if err != nil {
+		return a.failAndReload(ctx, rollback, fmt.Errorf("配置在应用管理设置后无效: %w", err))
 	}
 	if created.Active {
 		config, configErr := store.Config(created.ID)
@@ -263,13 +276,23 @@ func (a *App) commitProfileUpdateBatch(
 	prepared []preparedProfileUpdate,
 ) ([]error, error) {
 	ids := make([]string, 0, len(prepared))
+	ready := make(map[string]bool, len(prepared))
 	var updateErrors []error
 	for _, item := range prepared {
 		if item.err != nil {
 			updateErrors = append(updateErrors, fmt.Errorf("%s: %w", item.target.Name, item.err))
 			continue
 		}
+		if validateErr := item.prepared.ValidateManagedConfig(profile.OverlayOptions{
+			ExternalController: state.Controller,
+			Secret:             state.Secret,
+			Settings:           state.Settings,
+		}, platform.MaxManagedConfigBytes); validateErr != nil {
+			updateErrors = append(updateErrors, fmt.Errorf("%s: 配置在应用管理设置后无效: %w", item.target.Name, validateErr))
+			continue
+		}
 		ids = append(ids, item.target.ID)
+		ready[item.target.ID] = true
 	}
 	if len(ids) == 0 {
 		return updateErrors, nil
@@ -289,7 +312,7 @@ func (a *App) commitProfileUpdateBatch(
 
 	committed := false
 	for _, item := range prepared {
-		if item.err != nil {
+		if item.err != nil || !ready[item.target.ID] {
 			continue
 		}
 		if err := ctx.Err(); err != nil {
@@ -363,6 +386,9 @@ func (a *App) useProfileRoot(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
+	if target.ID == current.ID {
+		return nil
+	}
 	config, err := store.Config(target.ID)
 	if err != nil {
 		return err
@@ -404,8 +430,7 @@ func (a *App) useProfileRoot(ctx context.Context, name string) error {
 	if err != nil {
 		return a.failAndReload(ctx, rollback, err)
 	}
-	a.restoreProfileSelections(ctx, targetSelections)
-	return nil
+	return a.restoreProfileSelections(ctx, targetSelections)
 }
 
 func (a *App) rememberProfileSelections(ctx context.Context, store *profile.Store, id string) error {
@@ -427,15 +452,31 @@ func (a *App) rememberProfileSelections(ctx context.Context, store *profile.Stor
 	return store.SaveSelections(id, selections)
 }
 
-func (a *App) restoreProfileSelections(ctx context.Context, selections map[string]string) {
+func (a *App) restoreProfileSelections(ctx context.Context, selections map[string]string) error {
 	if len(selections) == 0 {
-		return
+		return nil
 	}
-	requestCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	requestCtx, cancel := context.WithTimeout(ctx, profileSelectionRestoreTimeout)
 	defer cancel()
-	groups, err := a.Groups(requestCtx)
-	if err != nil {
-		return
+	var (
+		groups  []domain.ProxyGroup
+		lastErr error
+	)
+	for {
+		attemptCtx, attemptCancel := context.WithTimeout(requestCtx, 1500*time.Millisecond)
+		groups, lastErr = a.Groups(attemptCtx)
+		attemptCancel()
+		if lastErr == nil && len(groups) > 0 {
+			break
+		}
+		select {
+		case <-requestCtx.Done():
+			if lastErr == nil {
+				lastErr = errors.New("代理组尚未就绪")
+			}
+			return &OperationWarning{Message: fmt.Sprintf("配置已激活，但无法恢复节点选择: %v", lastErr)}
+		case <-time.After(250 * time.Millisecond):
+		}
 	}
 	available := make(map[string]domain.ProxyGroup, len(groups))
 	for _, group := range groups {
@@ -446,14 +487,67 @@ func (a *App) restoreProfileSelections(ctx context.Context, selections map[strin
 		names = append(names, groupName)
 	}
 	sort.Strings(names)
+	type selectionJob struct {
+		group string
+		proxy string
+	}
+	jobs := make(chan selectionJob)
+	failures := make(chan string, len(names))
+	var wait sync.WaitGroup
+	workers := min(profileSelectionRestoreWorkers, len(names))
+	for range workers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for job := range jobs {
+				if err := a.SelectProxy(requestCtx, job.group, job.proxy); err != nil {
+					failures <- fmt.Sprintf("%s: %v", job.group, err)
+				}
+			}
+		}()
+	}
 	for _, groupName := range names {
 		group, exists := available[groupName]
 		proxyName := selections[groupName]
-		if !exists || !strings.EqualFold(group.Type, "selector") || !containsName(group.All, proxyName) {
+		if !exists {
+			failures <- groupName + ": 策略组不存在"
 			continue
 		}
-		_ = a.SelectProxy(requestCtx, groupName, proxyName)
+		if !strings.EqualFold(group.Type, "selector") {
+			failures <- groupName + ": 已不再是手动选择组"
+			continue
+		}
+		if !containsName(group.All, proxyName) {
+			failures <- groupName + ": 之前选择的节点已不存在"
+			continue
+		}
+		select {
+		case jobs <- selectionJob{group: groupName, proxy: proxyName}:
+		case <-requestCtx.Done():
+			failures <- groupName + ": 恢复超时"
+		}
 	}
+	close(jobs)
+	wait.Wait()
+	close(failures)
+	items := make([]string, 0, len(names))
+	for failure := range failures {
+		items = append(items, failure)
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	sort.Strings(items)
+	const detailLimit = 6
+	detail := items
+	if len(detail) > detailLimit {
+		detail = detail[:detailLimit]
+	}
+	message := "配置已激活，但部分节点选择未恢复: " + strings.Join(detail, "；")
+	if len(items) > len(detail) {
+		message += fmt.Sprintf("；另有 %d 项", len(items)-len(detail))
+	}
+	return &OperationWarning{Message: message}
 }
 
 func containsName(names []string, wanted string) bool {

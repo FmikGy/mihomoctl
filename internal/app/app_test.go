@@ -748,7 +748,7 @@ func TestStatusLiveAPIOverridesPublicSnapshot(t *testing.T) {
 	}
 }
 
-func TestStatusKeepsConfiguredMixedPortWhenCoreReportsZero(t *testing.T) {
+func TestStatusReportsLiveMixedPortAndDriftWhenCoreReportsZero(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
@@ -786,8 +786,41 @@ func TestStatusKeepsConfiguredMixedPortWhenCoreReportsZero(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status.MixedPort != 7980 {
-		t.Fatalf("mixed port = %d, want configured value 7980", status.MixedPort)
+	if status.MixedPort != 0 {
+		t.Fatalf("mixed port = %d, want live value 0", status.MixedPort)
+	}
+	if status.ExpectedConfig == nil || status.ExpectedConfig.MixedPort != 7980 {
+		t.Fatalf("expected config = %#v", status.ExpectedConfig)
+	}
+	if status.LiveConfig == nil || status.LiveConfig.MixedPort != 0 {
+		t.Fatalf("live config = %#v", status.LiveConfig)
+	}
+	if len(status.ConfigDrift) != 1 || status.ConfigDrift[0] != "mixed-port" {
+		t.Fatalf("config drift = %#v", status.ConfigDrift)
+	}
+}
+
+func TestAppliedConfigHealthCheckRejectsRuntimeDrift(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/version":
+			_, _ = writer.Write([]byte(`{"version":"1.20.0"}`))
+		case "/configs":
+			_, _ = writer.Write([]byte(`{"mode":"rule","mixed-port":0,"log-level":"info","tun":{"enable":false}}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	client, err := mihomo.New(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := domain.EffectiveConfig{Mode: domain.ModeRule, MixedPort: 7980, LogLevel: "info"}
+	err = waitForAppliedConfig(context.Background(), client, expected, 40*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "mixed-port") {
+		t.Fatalf("drift health-check error = %v", err)
 	}
 }
 
@@ -811,6 +844,7 @@ func TestUseProfileRemembersSelectorChoicesPerProfile(t *testing.T) {
 	}
 
 	var proxySnapshots atomic.Int32
+	var configSnapshots atomic.Int32
 	var selectedMu sync.Mutex
 	selected := make([]string, 0, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -818,6 +852,12 @@ func TestUseProfileRemembersSelectorChoicesPerProfile(t *testing.T) {
 		switch {
 		case request.Method == http.MethodGet && request.URL.Path == "/version":
 			_, _ = writer.Write([]byte(`{"version":"1.19.0"}`))
+		case request.Method == http.MethodGet && request.URL.Path == "/configs":
+			port := 7891
+			if configSnapshots.Add(1) > 1 {
+				port = 7890
+			}
+			_, _ = fmt.Fprintf(writer, `{"mode":"rule","mixed-port":%d,"log-level":"info","tun":{"enable":false}}`, port)
 		case request.Method == http.MethodGet && request.URL.Path == "/proxies":
 			index := proxySnapshots.Add(1)
 			prefix := "A"
@@ -876,6 +916,49 @@ func TestUseProfileRemembersSelectorChoicesPerProfile(t *testing.T) {
 	defer selectedMu.Unlock()
 	if len(selected) != 2 || selected[0] != "B2" || selected[1] != "A2" {
 		t.Fatalf("restored selector choices = %#v", selected)
+	}
+}
+
+func TestUseAlreadyActiveProfileDoesNotRestartCore(t *testing.T) {
+	fixture := newTransactionFixture(t)
+	active, err := fixture.application.store.Active()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.runner.mu.Lock()
+	fixture.runner.calls = nil
+	fixture.runner.active = true
+	fixture.runner.mu.Unlock()
+	if err := fixture.application.UseProfile(context.Background(), active.ID); err != nil {
+		t.Fatal(err)
+	}
+	if calls := fixture.runner.snapshotCalls(); len(calls) != 0 {
+		t.Fatalf("no-op profile use called runtime: %v", calls)
+	}
+}
+
+func TestRestoreProfileSelectionsReturnsPartialSuccessWarning(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/proxies":
+			_, _ = writer.Write([]byte(`{"proxies":{"Proxies":{"name":"Proxies","type":"Selector","now":"A","all":["A"]},"A":{"name":"A","type":"AnyTLS","alive":true}}}`))
+		case request.Method == http.MethodPut && request.URL.Path == "/proxies/Proxies":
+			http.Error(writer, "not ready", http.StatusServiceUnavailable)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	api, err := mihomo.New(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	application := &App{api: api, euid: func() int { return 1000 }}
+	err = application.restoreProfileSelections(context.Background(), map[string]string{"Proxies": "A"})
+	var warning *OperationWarning
+	if !errors.As(err, &warning) || !strings.Contains(err.Error(), "配置已激活") {
+		t.Fatalf("restore warning = %T %v", err, err)
 	}
 }
 

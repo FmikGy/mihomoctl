@@ -81,6 +81,17 @@ func TestStoreURIAndLocalCRUD(t *testing.T) {
 	}
 }
 
+func TestStoreRejectsNormalizedConfigLargerThanLimit(t *testing.T) {
+	store, err := NewStore(t.TempDir(), WithMaxSourceBytes(512))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.AddURI(context.Background(), "Expanded", "trojan://private@example.com:443#Node")
+	if !errors.Is(err, ErrSourceTooLarge) {
+		t.Fatalf("expanded URI error = %v, want ErrSourceTooLarge", err)
+	}
+}
+
 func TestStoreLocalInvalidUpdateKeepsLastGood(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "profile.yaml")
@@ -196,6 +207,9 @@ func TestStoreRemoteConditionalUpdateAndRedaction(t *testing.T) {
 			_, _ = writer.Write([]byte(validYAML))
 		case "not-modified":
 			writer.WriteHeader(http.StatusNotModified)
+		case "not-modified-clear":
+			writer.Header().Set("Subscription-Userinfo", "upload=0; download=0; total=0; expire=0")
+			writer.WriteHeader(http.StatusNotModified)
 		case "changed":
 			writer.Header().Set("ETag", `"v2"`)
 			_, _ = writer.Write([]byte(strings.Replace(validYAML, "one.example", "two.example", 1)))
@@ -237,10 +251,21 @@ func TestStoreRemoteConditionalUpdateAndRedaction(t *testing.T) {
 	if !result.NotModified || result.Changed || !result.Profile.LastUpdated.Equal(fixed.Add(time.Hour)) {
 		t.Fatalf("304 result = %#v", result)
 	}
+	if result.Profile.Subscription.Total != 100 {
+		t.Fatalf("304 without quota header cleared subscription: %#v", result.Profile.Subscription)
+	}
 	mu.Lock()
 	if conditionalETag != `"v1"` || conditionalModified != "Mon, 02 Jan 2006 15:04:05 GMT" {
 		t.Errorf("conditional headers = %q, %q", conditionalETag, conditionalModified)
 	}
+	mode = "not-modified-clear"
+	mu.Unlock()
+	store.now = func() time.Time { return fixed.Add(2 * time.Hour) }
+	result, err = store.Update(ctx, profile.ID)
+	if err != nil || !result.NotModified || result.Profile.Subscription != (domain.SubscriptionInfo{}) {
+		t.Fatalf("304 explicit zero quota result = %#v, %v", result, err)
+	}
+	mu.Lock()
 	mode = "changed"
 	mu.Unlock()
 	result, err = store.Update(ctx, profile.ID)
@@ -261,6 +286,37 @@ func TestStoreRemoteConditionalUpdateAndRedaction(t *testing.T) {
 	stillGood, err := store.Config(profile.ID)
 	if err != nil || string(stillGood) != string(changed) {
 		t.Fatal("invalid remote update replaced last-known-good config")
+	}
+}
+
+func TestStoreStateReadRejectsSymlinkAndOversizedFile(t *testing.T) {
+	root := t.TempDir()
+	store, err := NewStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "state.yaml")
+	if err := os.WriteFile(target, []byte("version: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(store.statePath()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, store.statePath()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.List(); err == nil {
+		t.Fatal("symlinked profile state was accepted")
+	}
+	if err := os.Remove(store.statePath()); err != nil {
+		t.Fatal(err)
+	}
+	oversized := []byte(strings.Repeat("x", maxProfileStateBytes+1))
+	if err := os.WriteFile(store.statePath(), oversized, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.List(); err == nil || !strings.Contains(err.Error(), "size limit") {
+		t.Fatalf("oversized profile state error = %v", err)
 	}
 }
 

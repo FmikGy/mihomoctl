@@ -23,6 +23,7 @@ import (
 
 const (
 	stateVersion                 = 1
+	maxProfileStateBytes         = 16 << 20
 	maxRememberedSelectionGroups = 512
 	maxRememberedSelectionName   = 4096
 )
@@ -151,9 +152,18 @@ func (s *Store) Add(ctx context.Context, request AddRequest) (domain.Profile, er
 		raw = []byte(request.Source)
 		profile.Source = "[redacted URI subscription]"
 	}
-	config, _, err := NormalizeSource(raw)
+	var config []byte
+	var err error
+	if request.Kind == domain.ProfileRemote {
+		config, _, err = NormalizeUntrustedSource(raw)
+	} else {
+		config, _, err = NormalizeSource(raw)
+	}
 	if err != nil {
 		return domain.Profile{}, err
+	}
+	if int64(len(config)) > s.maxSourceBytes {
+		return domain.Profile{}, ErrSourceTooLarge
 	}
 	if err := ctx.Err(); err != nil {
 		return domain.Profile{}, err
@@ -182,6 +192,9 @@ func (s *Store) AddSnapshot(name string, raw []byte) (domain.Profile, error) {
 	config, _, err := NormalizeSource(raw)
 	if err != nil {
 		return domain.Profile{}, err
+	}
+	if int64(len(config)) > s.maxSourceBytes {
+		return domain.Profile{}, ErrSourceTooLarge
 	}
 	profile := domain.Profile{
 		Name:           name,
@@ -455,9 +468,16 @@ func (s *Store) PrepareUpdate(ctx context.Context, id string) (PreparedUpdate, e
 		if baseline.profile.Kind == domain.ProfileRemote {
 			raw = fetched.body
 		}
-		prepared.config, _, err = NormalizeSource(raw)
+		if baseline.profile.Kind == domain.ProfileRemote {
+			prepared.config, _, err = NormalizeUntrustedSource(raw)
+		} else {
+			prepared.config, _, err = NormalizeSource(raw)
+		}
 		if err != nil {
 			return PreparedUpdate{}, err
+		}
+		if int64(len(prepared.config)) > s.maxSourceBytes {
+			return PreparedUpdate{}, ErrSourceTooLarge
 		}
 		prepared.raw = raw
 	}
@@ -573,7 +593,7 @@ func (s *Store) CommitUpdate(prepared PreparedUpdate) (UpdateResult, error) {
 		if prepared.fetched.lastModified != "" {
 			profile.LastModified = prepared.fetched.lastModified
 		}
-		if prepared.fetched.subscription != (domain.SubscriptionInfo{}) {
+		if prepared.fetched.subscriptionPresent {
 			profile.Subscription = prepared.fetched.subscription
 		}
 		state.Profiles[index] = profile
@@ -684,14 +704,11 @@ func (s *Store) Config(id string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, _, err := findProfile(state, id); err != nil {
+	profile, _, err := findProfile(state, id)
+	if err != nil {
 		return nil, err
 	}
-	content, err := os.ReadFile(filepath.Join(s.profileDir(id), "config.yaml"))
-	if err != nil {
-		return nil, fmt.Errorf("read profile config: %w", err)
-	}
-	return content, nil
+	return s.profileConfigUnlocked(profile)
 }
 
 func (s *Store) ActiveConfig() ([]byte, error) {
@@ -704,12 +721,23 @@ func (s *Store) ActiveConfig() ([]byte, error) {
 	if state.ActiveID == "" {
 		return nil, ErrNoActive
 	}
-	if _, _, err := findProfile(state, state.ActiveID); err != nil {
+	profile, _, err := findProfile(state, state.ActiveID)
+	if err != nil {
 		return nil, fmt.Errorf("active profile is invalid: %w", err)
 	}
-	content, err := os.ReadFile(filepath.Join(s.profileDir(state.ActiveID), "config.yaml"))
+	return s.profileConfigUnlocked(profile)
+}
+
+func (s *Store) profileConfigUnlocked(profile domain.Profile) ([]byte, error) {
+	content, err := os.ReadFile(filepath.Join(s.profileDir(profile.ID), "config.yaml"))
 	if err != nil {
-		return nil, fmt.Errorf("read active profile config: %w", err)
+		return nil, fmt.Errorf("read profile config: %w", err)
+	}
+	if profile.Kind == domain.ProfileRemote {
+		content, _, err = NormalizeUntrustedSource(content)
+		if err != nil {
+			return nil, fmt.Errorf("validate stored remote profile: %w", err)
+		}
 	}
 	return content, nil
 }
@@ -737,7 +765,7 @@ func (s *Store) profilesRoot() string        { return filepath.Join(s.root, "pro
 func (s *Store) profileDir(id string) string { return filepath.Join(s.profilesRoot(), id) }
 
 func (s *Store) loadStateUnlocked() (persistedState, error) {
-	content, err := os.ReadFile(s.statePath())
+	content, err := readStoreState(s.statePath())
 	if errors.Is(err, os.ErrNotExist) {
 		return persistedState{Version: stateVersion}, nil
 	}
@@ -745,6 +773,33 @@ func (s *Store) loadStateUnlocked() (persistedState, error) {
 		return persistedState{}, fmt.Errorf("read profile state: %w", err)
 	}
 	return decodeState(content)
+}
+
+func readStoreState(path string) ([]byte, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return nil, errors.Join(err, unix.Close(fd))
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
+		return nil, errors.Join(errors.New("profile state must be a regular file"), unix.Close(fd))
+	}
+	if stat.Size > maxProfileStateBytes {
+		return nil, errors.Join(errors.New("profile state exceeds size limit"), unix.Close(fd))
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		return nil, errors.Join(errors.New("open profile state file descriptor"), unix.Close(fd))
+	}
+	content, readErr := readLimited(file, maxProfileStateBytes)
+	closeErr := file.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return nil, err
+	}
+	return content, nil
 }
 
 func decodeState(content []byte) (persistedState, error) {
@@ -861,9 +916,14 @@ func atomicWrite(path string, content []byte, mode os.FileMode) error {
 		return fmt.Errorf("replace %s: %w", filepath.Base(path), err)
 	}
 	ok = true
-	if directoryHandle, err := os.Open(directory); err == nil {
-		_ = directoryHandle.Sync()
-		_ = directoryHandle.Close()
+	directoryHandle, err := os.Open(directory)
+	if err != nil {
+		return fmt.Errorf("open parent directory after replacing %s: %w", filepath.Base(path), err)
+	}
+	syncErr := directoryHandle.Sync()
+	closeErr := directoryHandle.Close()
+	if err := errors.Join(syncErr, closeErr); err != nil {
+		return fmt.Errorf("sync parent directory after replacing %s: %w", filepath.Base(path), err)
 	}
 	return nil
 }

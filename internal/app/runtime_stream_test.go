@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -122,5 +123,59 @@ func TestWatchTrafficWrapsStreamFailure(t *testing.T) {
 	var unavailable *UnavailableError
 	if !errors.As(streamErr, &unavailable) {
 		t.Fatalf("stream error = %T, want UnavailableError", streamErr)
+	}
+}
+
+func TestWatchTrafficTimesOutWhenStreamHasNoSamples(t *testing.T) {
+	original := trafficNoSampleTimeout
+	trafficNoSampleTimeout = 40 * time.Millisecond
+	t.Cleanup(func() { trafficNoSampleTimeout = original })
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusOK)
+		writer.(http.Flusher).Flush()
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+	api, err := mihomo.New(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	application := &App{api: api, euid: func() int { return 1000 }}
+	samples, errs := application.WatchTraffic(context.Background())
+	for range samples {
+	}
+	streamErr := <-errs
+	if streamErr == nil || !strings.Contains(streamErr.Error(), "没有返回数据") {
+		t.Fatalf("no-sample stream error = %v", streamErr)
+	}
+}
+
+func TestWatchTrafficWatchdogUnblocksFullConsumerBuffer(t *testing.T) {
+	original := trafficNoSampleTimeout
+	trafficNoSampleTimeout = 40 * time.Millisecond
+	t.Cleanup(func() { trafficNoSampleTimeout = original })
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		for index := 0; index < 32; index++ {
+			_, _ = fmt.Fprintf(writer, "{\"up\":%d,\"down\":%d}\n", index, index)
+		}
+		writer.(http.Flusher).Flush()
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+	api, err := mihomo.New(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	application := &App{api: api, euid: func() int { return 1000 }}
+	_, errs := application.WatchTraffic(context.Background())
+	select {
+	case streamErr := <-errs:
+		if streamErr == nil || !strings.Contains(streamErr.Error(), "没有返回数据") {
+			t.Fatalf("full-buffer stream error = %v", streamErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("full consumer buffer prevented watchdog cancellation")
 	}
 }

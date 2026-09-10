@@ -23,6 +23,7 @@ type recordingPrivilegeExecutor struct {
 	command   PrivilegeCommand
 	exitCode  int
 	err       error
+	stdout    string
 	stderr    string
 	readStdin bool
 	stdin     string
@@ -39,6 +40,9 @@ func (e *recordingPrivilegeExecutor) Run(_ context.Context, command PrivilegeCom
 	}
 	if e.stderr != "" && command.Stderr != nil {
 		_, _ = io.WriteString(command.Stderr, e.stderr)
+	}
+	if e.stdout != "" && command.Stdout != nil {
+		_, _ = io.WriteString(command.Stdout, e.stdout)
 	}
 	return e.exitCode, e.err
 }
@@ -415,6 +419,16 @@ func TestRunElevatedPreservesElevatedChildExitCode(t *testing.T) {
 	var privilegeErr *PrivilegeError
 	if err == nil || !errors.As(err, &coded) || coded.ExitCode() != 2 || errors.As(err, &privilegeErr) || err.Error() != "配置值无效" {
 		t.Fatalf("child error = %T %v", err, err)
+	}
+}
+
+func TestRunElevatedReturnsSuccessfulChildWarning(t *testing.T) {
+	executor := &recordingPrivilegeExecutor{stdout: `{"schema_version":1,"data":{"action":"use","warning":"部分节点未恢复"}}`}
+	application := privilegeTestApp(executor, 1000)
+	err := application.runElevated(context.Background(), []string{"profile", "use"}, "")
+	var warning interface{ Warning() bool }
+	if !errors.As(err, &warning) || !warning.Warning() || err.Error() != "部分节点未恢复" {
+		t.Fatalf("elevated warning = %T %v", err, err)
 	}
 }
 
