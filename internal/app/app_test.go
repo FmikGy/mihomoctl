@@ -621,9 +621,16 @@ func TestEffectiveConfigDefaultsAndLegacyPublicState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := domain.EffectiveConfig{Mode: domain.ModeRule, LogLevel: "info"}
+	want := domain.EffectiveConfig{Mode: domain.ModeRule, IPv6: true, LogLevel: "info"}
 	if settings != want {
 		t.Fatalf("default settings = %#v, want %#v", settings, want)
+	}
+	explicitIPv6Off, err := effectiveConfigFromYAML([]byte("ipv6: false\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if explicitIPv6Off.IPv6 {
+		t.Fatal("explicit ipv6: false was replaced by the default")
 	}
 
 	paths := testPaths(t.TempDir())
@@ -857,7 +864,7 @@ func TestUseProfileRemembersSelectorChoicesPerProfile(t *testing.T) {
 			if configSnapshots.Add(1) > 1 {
 				port = 7890
 			}
-			_, _ = fmt.Fprintf(writer, `{"mode":"rule","mixed-port":%d,"log-level":"info","tun":{"enable":false}}`, port)
+			_, _ = fmt.Fprintf(writer, `{"mode":"rule","mixed-port":%d,"ipv6":true,"log-level":"info","tun":{"enable":false}}`, port)
 		case request.Method == http.MethodGet && request.URL.Path == "/proxies":
 			index := proxySnapshots.Add(1)
 			prefix := "A"

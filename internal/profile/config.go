@@ -264,6 +264,11 @@ func ApplyManagedOverlay(doc *yaml.Node, options OverlayOptions) error {
 		setMapValue(root, "mode", scalarString(string(settings.Mode)))
 	}
 	if settings.MixedPort != nil {
+		// A mixed listener already serves both HTTP and SOCKS. Keeping legacy
+		// listeners can make Mihomo silently disable mixed-port when they share
+		// the same address, leaving the configured value visible only on disk.
+		deleteMapValue(root, "port")
+		deleteMapValue(root, "socks-port")
 		setMapValue(root, "mixed-port", scalarInt(*settings.MixedPort))
 	}
 	if settings.AllowLAN != nil {

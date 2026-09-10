@@ -469,11 +469,12 @@ func (a *App) readPublicState() (publicState, error) {
 }
 
 func effectiveConfigFromYAML(content []byte) (domain.EffectiveConfig, error) {
+	ipv6 := true
 	var source struct {
 		Mode      domain.Mode `yaml:"mode"`
 		MixedPort int         `yaml:"mixed-port"`
 		AllowLAN  bool        `yaml:"allow-lan"`
-		IPv6      bool        `yaml:"ipv6"`
+		IPv6      *bool       `yaml:"ipv6"`
 		LogLevel  string      `yaml:"log-level"`
 		TUN       struct {
 			Enable bool `yaml:"enable"`
@@ -495,9 +496,12 @@ func effectiveConfigFromYAML(content []byte) (domain.EffectiveConfig, error) {
 	if source.MixedPort < 1 || source.MixedPort > 65535 {
 		source.MixedPort = 0
 	}
+	if source.IPv6 != nil {
+		ipv6 = *source.IPv6
+	}
 	return domain.EffectiveConfig{
 		Mode: source.Mode, TUN: source.TUN.Enable, MixedPort: source.MixedPort,
-		AllowLAN: source.AllowLAN, IPv6: source.IPv6, LogLevel: source.LogLevel,
+		AllowLAN: source.AllowLAN, IPv6: ipv6, LogLevel: source.LogLevel,
 	}, nil
 }
 

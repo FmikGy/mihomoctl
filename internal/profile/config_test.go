@@ -324,6 +324,32 @@ mixed-port: 7890
 	}
 }
 
+func TestMergeManagedConfigReplacesLegacyHTTPAndSOCKSListeners(t *testing.T) {
+	mixedPort := 7980
+	raw := []byte("port: 7890\nsocks-port: 7891\nredir-port: 7892\ntproxy-port: 7893\nproxies: []\n")
+	got, err := MergeManagedConfig(raw, OverlayOptions{
+		Settings: domain.ManagedSettings{MixedPort: &mixedPort},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config map[string]any
+	if err := yaml.Unmarshal(got, &config); err != nil {
+		t.Fatal(err)
+	}
+	if config["mixed-port"] != 7980 {
+		t.Fatalf("mixed-port = %#v", config["mixed-port"])
+	}
+	for _, key := range []string{"port", "socks-port"} {
+		if _, exists := config[key]; exists {
+			t.Errorf("managed config retained legacy %q: %s", key, got)
+		}
+	}
+	if config["redir-port"] != 7892 || config["tproxy-port"] != 7893 {
+		t.Fatalf("advanced transparent listeners were changed: %s", got)
+	}
+}
+
 func TestMergeManagedConfigTUNOffDoesNotAddDefaults(t *testing.T) {
 	storeSelected := false
 	got, err := MergeManagedConfig([]byte("proxies: []\n"), OverlayOptions{StoreSelected: &storeSelected})
