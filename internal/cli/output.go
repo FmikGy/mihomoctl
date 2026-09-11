@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"mihomoctl/internal/domain"
+	"mihomoctl/internal/i18n"
 )
 
 type envelope struct {
@@ -83,7 +84,7 @@ func (a *application) writeResult(data any, message string) error {
 	if a.output == "json" {
 		return writeJSON(a.stdout, data)
 	}
-	_, err := fmt.Fprintln(a.stdout, cleanCell(message))
+	_, err := fmt.Fprintln(a.stdout, cleanCell(a.tr(message)))
 	return err
 }
 
@@ -95,11 +96,11 @@ func (a *application) writeWarningResult(data map[string]any, message, warning s
 	if a.output == "json" {
 		return writeJSON(a.stdout, data)
 	}
-	if _, err := fmt.Fprintln(a.stdout, cleanCell(message)); err != nil {
+	if _, err := fmt.Fprintln(a.stdout, cleanCell(a.tr(message))); err != nil {
 		return err
 	}
 	if warning != "" {
-		_, err := fmt.Fprintln(a.stdout, "警告:", warning)
+		_, err := fmt.Fprintln(a.stdout, a.tr("警告:"), warning)
 		return err
 	}
 	return nil
@@ -110,23 +111,23 @@ func (a *application) writeStatus(status domain.RuntimeStatus) error {
 		return writeJSON(a.stdout, status)
 	}
 	rows := [][]string{
-		{"服务", status.Service.State},
-		{"运行", yesNo(status.Service.Active)},
-		{"开机启动", yesNo(status.Service.Enabled)},
-		{"核心版本", empty(status.CoreVersion, "-")},
-		{"活动配置", empty(status.ActiveProfile, "-")},
-		{"模式", empty(string(status.Mode), "-")},
+		{a.tr("服务"), status.Service.State},
+		{a.tr("运行"), a.yesNo(status.Service.Active)},
+		{a.tr("开机启动"), a.yesNo(status.Service.Enabled)},
+		{a.tr("核心版本"), empty(status.CoreVersion, "-")},
+		{a.tr("活动配置"), empty(status.ActiveProfile, "-")},
+		{a.tr("模式"), empty(string(status.Mode), "-")},
 		{"TUN", onOff(status.TUN)},
 		{"Mixed Port", intOrDash(status.MixedPort)},
-		{"连接", strconv.Itoa(status.ConnectionCount)},
-		{"上传速率", formatBytes(status.Traffic.Up) + "/s"},
-		{"下载速率", formatBytes(status.Traffic.Down) + "/s"},
-		{"内存", formatBytes(status.Memory)},
+		{a.tr("连接"), strconv.Itoa(status.ConnectionCount)},
+		{a.tr("上传速率"), formatBytes(status.Traffic.Up) + "/s"},
+		{a.tr("下载速率"), formatBytes(status.Traffic.Down) + "/s"},
+		{a.tr("内存"), formatBytes(status.Memory)},
 	}
 	if len(status.ConfigDrift) > 0 {
-		rows = append(rows, []string{"配置偏差", strings.Join(status.ConfigDrift, ", ")})
+		rows = append(rows, []string{a.tr("配置偏差"), strings.Join(status.ConfigDrift, ", ")})
 	}
-	return writeTable(a.stdout, []string{"项目", "状态"}, rows)
+	return writeTable(a.stdout, []string{a.tr("项目"), a.tr("状态")}, rows)
 }
 
 func (a *application) writeConfig(status domain.RuntimeStatus) error {
@@ -154,9 +155,9 @@ func (a *application) writeConfig(status domain.RuntimeStatus) error {
 		{"log-level", status.LogLevel},
 	}
 	if len(status.ConfigDrift) > 0 {
-		rows = append(rows, []string{"配置偏差", strings.Join(status.ConfigDrift, ", ")})
+		rows = append(rows, []string{a.tr("配置偏差"), strings.Join(status.ConfigDrift, ", ")})
 	}
-	return writeTable(a.stdout, []string{"配置项", "值"}, rows)
+	return writeTable(a.stdout, []string{a.tr("配置项"), a.tr("值")}, rows)
 }
 
 func (a *application) writeGroups(groups []domain.ProxyGroup) error {
@@ -174,10 +175,10 @@ func (a *application) writeGroups(groups []domain.ProxyGroup) error {
 			if proxy.Delay > 0 {
 				delay = strconv.Itoa(int(proxy.Delay)) + " ms"
 			}
-			rows = append(rows, []string{group.Name, selected, proxy.Name, proxy.Type, yesNo(proxy.Alive), delay})
+			rows = append(rows, []string{group.Name, selected, proxy.Name, proxy.Type, a.yesNo(proxy.Alive), delay})
 		}
 	}
-	return writeTable(a.stdout, []string{"策略组", "", "节点", "类型", "可用", "延迟"}, rows)
+	return writeTable(a.stdout, []string{a.tr("策略组"), "", a.tr("节点"), a.tr("类型"), a.tr("可用"), a.tr("延迟")}, rows)
 }
 
 func (a *application) writeDelays(group string, delays map[string]uint16) error {
@@ -191,13 +192,13 @@ func (a *application) writeDelays(group string, delays map[string]uint16) error 
 	rows := make([][]string, 0, len(delays))
 	for _, name := range sortedKeys(delays) {
 		delay := delays[name]
-		value := "超时"
+		value := a.tr("超时")
 		if delay > 0 {
 			value = strconv.Itoa(int(delay)) + " ms"
 		}
 		rows = append(rows, []string{name, value})
 	}
-	return writeTable(a.stdout, []string{"节点", "延迟"}, rows)
+	return writeTable(a.stdout, []string{a.tr("节点"), a.tr("延迟")}, rows)
 }
 
 func (a *application) writeProfiles(profiles []domain.Profile) error {
@@ -228,7 +229,7 @@ func (a *application) writeProfiles(profiles []domain.Profile) error {
 		}
 		rows = append(rows, []string{active, profile.Name, string(profile.Kind), profile.UpdateInterval.String(), updated})
 	}
-	return writeTable(a.stdout, []string{"", "名称", "类型", "更新间隔", "上次更新"}, rows)
+	return writeTable(a.stdout, []string{"", a.tr("名称"), a.tr("类型"), a.tr("更新间隔"), a.tr("上次更新")}, rows)
 }
 
 type profileView struct {
@@ -256,7 +257,7 @@ func (a *application) writeConnections(connections []domain.Connection) error {
 			empty(connection.Rule, "-"), formatBytes(connection.Upload), formatBytes(connection.Download),
 		})
 	}
-	return writeTable(a.stdout, []string{"ID", "进程", "目标", "规则", "上传", "下载"}, rows)
+	return writeTable(a.stdout, []string{"ID", a.tr("进程"), a.tr("目标"), a.tr("规则"), a.tr("上传"), a.tr("下载")}, rows)
 }
 
 func (a *application) writeLog(entry domain.LogEntry) error {
@@ -270,32 +271,46 @@ func (a *application) writeScheduleStatus(status domain.ScheduleStatus) error {
 	if a.output == "json" {
 		return writeJSON(a.stdout, status)
 	}
-	return writeTable(a.stdout, []string{"启用", "状态"}, [][]string{{yesNo(status.Enabled), status.State}})
+	return writeTable(a.stdout, []string{a.tr("启用"), a.tr("状态")}, [][]string{{a.yesNo(status.Enabled), status.State}})
 }
 
 func (a *application) writeDoctor(checks []domain.DoctorCheck) error {
-	if a.output == "json" {
-		return writeJSON(a.stdout, checks)
+	localized := make([]domain.DoctorCheck, len(checks))
+	for index, check := range checks {
+		check.Name = a.tr(check.Name)
+		switch {
+		case check.MessageError != nil:
+			check.Message = i18n.Error(a.language, check.MessageError)
+		case check.MessageKey != "":
+			check.Message = i18n.T(a.language, check.MessageKey, check.MessageArgs...)
+		}
+		check.MessageKey = ""
+		check.MessageArgs = nil
+		check.MessageError = nil
+		localized[index] = check
 	}
-	rows := make([][]string, 0, len(checks))
-	for _, check := range checks {
-		state := "失败"
+	if a.output == "json" {
+		return writeJSON(a.stdout, localized)
+	}
+	rows := make([][]string, 0, len(localized))
+	for _, check := range localized {
+		state := a.tr("失败")
 		if check.OK {
-			state = "正常"
+			state = a.tr("正常")
 		}
 		if check.Fixed {
-			state = "已修复"
+			state = a.tr("已修复")
 		}
 		rows = append(rows, []string{check.Name, state, check.Message})
 	}
-	return writeTable(a.stdout, []string{"检查", "结果", "详情"}, rows)
+	return writeTable(a.stdout, []string{a.tr("检查"), a.tr("结果"), a.tr("详情")}, rows)
 }
 
-func yesNo(value bool) string {
+func (a *application) yesNo(value bool) string {
 	if value {
-		return "是"
+		return a.tr("是")
 	}
-	return "否"
+	return a.tr("否")
 }
 
 func onOff(value bool) string {

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/url"
 	"os"
@@ -19,8 +18,11 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"mihomoctl/internal/i18n"
 	"mihomoctl/internal/platform"
 )
+
+const elevatedResultSchemaVersion = 1
 
 type privilegeFailure uint8
 
@@ -67,6 +69,12 @@ func (e *PrivilegeError) Error() string {
 
 func (e *PrivilegeError) Unwrap() error { return e.Cause }
 func (e *PrivilegeError) ExitCode() int { return 3 }
+func (e *PrivilegeError) Localized(language i18n.Language) string {
+	if e == nil || e.failure != privilegeFailureUnknown || e.detail == "" {
+		return i18n.T(language, e.Error())
+	}
+	return i18n.T(language, "sudo 提权失败：%s", e.detail)
+}
 
 // AuthorizationRequired lets the TUI detect the single failure that is safe
 // to retry after releasing its terminal. Other sudo failures are final.
@@ -155,10 +163,10 @@ func elevatedEnvironment(paths Paths) ([]string, []string, error) {
 			continue
 		}
 		if override.name != clientConfigEnvironment {
-			return nil, nil, fmt.Errorf("普通用户提权操作不支持覆盖 %s；请使用默认受管路径，或由管理员直接以 root 运行自定义部署", override.name)
+			return nil, nil, i18n.Errorf("普通用户提权操作不支持覆盖 %s；请使用默认受管路径，或由管理员直接以 root 运行自定义部署", override.name)
 		}
 		if err := validateCallerClientPath(value); err != nil {
-			return nil, nil, fmt.Errorf("环境变量 %s 不安全: %w", override.name, err)
+			return nil, nil, i18n.Errorf("环境变量 %s 不安全: %w", override.name, err)
 		}
 		environment = append(environment, override.name+"="+value)
 		preserve = append(preserve, override.name)
@@ -169,11 +177,11 @@ func elevatedEnvironment(paths Paths) ([]string, []string, error) {
 func validateElevatedEnvironmentOverride(override supportedEnvironmentOverride) (string, error) {
 	value := override.value
 	if value == "" || value != strings.TrimSpace(value) || !utf8.ValidString(value) || strings.ContainsRune(value, '\x00') {
-		return "", fmt.Errorf("环境变量 %s 的值无效", override.name)
+		return "", i18n.Errorf("环境变量 %s 的值无效", override.name)
 	}
 	for _, character := range value {
 		if unicode.IsControl(character) {
-			return "", fmt.Errorf("环境变量 %s 的值包含控制字符", override.name)
+			return "", i18n.Errorf("环境变量 %s 的值包含控制字符", override.name)
 		}
 	}
 	if override.unitSuffix != "" {
@@ -182,13 +190,13 @@ func validateElevatedEnvironmentOverride(override supportedEnvironmentOverride) 
 			unit = normalizeUnit(value, override.unitSuffix)
 		}
 		if _, err := platform.NewSystemd(platform.ExecRunner{}, unit); err != nil {
-			return "", fmt.Errorf("环境变量 %s 的 systemd unit 无效", override.name)
+			return "", i18n.Errorf("环境变量 %s 的 systemd unit 无效", override.name)
 		}
 		return value, nil
 	}
 	clean := filepath.Clean(value)
 	if !filepath.IsAbs(value) || clean != value || value == string(filepath.Separator) {
-		return "", fmt.Errorf("环境变量 %s 必须是非根目录的绝对路径", override.name)
+		return "", i18n.Errorf("环境变量 %s 必须是非根目录的绝对路径", override.name)
 	}
 	return value, nil
 }
@@ -208,7 +216,7 @@ func validateCallerClientPath(path string) error {
 	}
 	account, err := user.LookupId(uid)
 	if err != nil || account.HomeDir == "" {
-		return errors.New("无法确定当前用户主目录")
+		return i18n.Errorf("无法确定当前用户主目录")
 	}
 	home, err := filepath.Abs(account.HomeDir)
 	if err != nil {
@@ -220,7 +228,7 @@ func validateCallerClientPath(path string) error {
 	}
 	relative, err := filepath.Rel(home, target)
 	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return errors.New("客户端状态文件必须位于当前用户主目录中")
+		return i18n.Errorf("客户端状态文件必须位于当前用户主目录中")
 	}
 	return nil
 }
@@ -228,26 +236,31 @@ func validateCallerClientPath(path string) error {
 // runElevated re-executes only argv constructed by App methods. No shell is
 // involved. Sensitive profile source text is carried on stdin, never argv.
 func (a *App) runElevated(ctx context.Context, args []string, input string) error {
+	_, err := a.runElevatedOutput(ctx, args, input)
+	return err
+}
+
+func (a *App) runElevatedOutput(ctx context.Context, args []string, input string) ([]byte, error) {
 	if a.isRoot() {
-		return errors.New("内部错误：root 进程不应再次提权")
+		return nil, i18n.Errorf("内部错误：root 进程不应再次提权")
 	}
 	executable, err := executablePath(a.executable)
 	if err != nil {
-		return &PrivilegeError{Cause: err, detail: sanitizeElevatedError(err.Error())}
+		return nil, &PrivilegeError{Cause: err, detail: sanitizeElevatedError(err.Error())}
 	}
 	executable, err = a.executableValidator(executable)
 	if err != nil {
-		return &PrivilegeError{Cause: err, failure: privilegeFailureUntrustedExecutable}
+		return nil, &PrivilegeError{Cause: err, failure: privilegeFailureUntrustedExecutable}
 	}
 	sudoPath, err := a.sudoPath()
 	if err != nil {
-		return &PrivilegeError{Cause: err, failure: privilegeFailureUnavailable}
+		return nil, &PrivilegeError{Cause: err, failure: privilegeFailureUnavailable}
 	}
 	commandEnvironment, preserveEnvironment, err := elevatedEnvironment(a.paths)
 	if err != nil {
-		return &InvalidInputError{Cause: err}
+		return nil, &InvalidInputError{Cause: err}
 	}
-	commandArgs := make([]string, 0, len(args)+4)
+	commandArgs := make([]string, 0, len(args)+6)
 	if platform.NonInteractiveElevation(ctx) {
 		commandArgs = append(commandArgs, "-n")
 	}
@@ -255,6 +268,7 @@ func (a *App) runElevated(ctx context.Context, args []string, input string) erro
 		commandArgs = append(commandArgs, "--preserve-env="+strings.Join(preserveEnvironment, ","))
 	}
 	commandArgs = append(commandArgs, "--", executable)
+	commandArgs = append(commandArgs, "--lang", string(i18n.FromContext(ctx)))
 	commandArgs = append(commandArgs, args...)
 
 	var stdin io.Reader
@@ -276,15 +290,15 @@ func (a *App) runElevated(ctx context.Context, args []string, input string) erro
 	})
 	if runErr == nil {
 		if warning := elevatedWarning(stdout.Bytes()); warning != "" {
-			return &OperationWarning{Message: warning}
+			return nil, &OperationWarning{Message: warning}
 		}
-		return nil
+		return append([]byte(nil), stdout.Bytes()...), nil
 	}
 	if ctx != nil && ctx.Err() != nil {
-		return ctx.Err()
+		return nil, ctx.Err()
 	}
 	if errors.Is(runErr, exec.ErrNotFound) || errors.Is(runErr, os.ErrNotExist) {
-		return &PrivilegeError{Cause: runErr, failure: privilegeFailureUnavailable}
+		return nil, &PrivilegeError{Cause: runErr, failure: privilegeFailureUnavailable}
 	}
 
 	rawStderr := stderr.String()
@@ -292,23 +306,40 @@ func (a *App) runElevated(ctx context.Context, args []string, input string) erro
 	message := sanitizeElevatedError(redactElevatedInput(rawStderr, input))
 	failure := classifyPrivilegeFailure(rawStderr, platform.NonInteractiveElevation(ctx))
 	if !looksLikeMihomoError(diagnosticMessage) && (looksLikeSudoError(rawStderr) || failure != privilegeFailureUnknown) {
-		return &PrivilegeError{Cause: runErr, failure: failure, detail: stripSudoPrefix(message)}
+		return nil, &PrivilegeError{Cause: runErr, failure: failure, detail: stripSudoPrefix(message)}
 	}
 	var exitErr *exec.ExitError
 	if exitCode >= 0 || errors.As(runErr, &exitErr) {
 		if message == "" {
-			message = "提权后的 mihomoctl 操作失败"
+			message = i18n.T(i18n.FromContext(ctx), "提权后的 mihomoctl 操作失败")
 		}
 		message = strings.TrimPrefix(message, "mihomoctl: ")
 		if exitCode < 1 || exitCode > 4 {
 			exitCode = 1
 		}
-		return &elevatedCommandError{code: exitCode, message: message}
+		return nil, &elevatedCommandError{code: exitCode, message: message}
 	}
-	return &PrivilegeError{
+	return nil, &PrivilegeError{
 		Cause: runErr, failure: classifyPrivilegeFailure(message, platform.NonInteractiveElevation(ctx)),
 		detail: stripSudoPrefix(message),
 	}
+}
+
+func decodeElevatedData(content []byte, target any) error {
+	var response struct {
+		SchemaVersion int             `json:"schema_version"`
+		Data          json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(content, &response); err != nil {
+		return i18n.Errorf("提权后的 mihomoctl 返回无效 JSON: %w", err)
+	}
+	if response.SchemaVersion != elevatedResultSchemaVersion || len(response.Data) == 0 {
+		return i18n.Errorf("提权后的 mihomoctl 返回不兼容结果")
+	}
+	if err := json.Unmarshal(response.Data, target); err != nil {
+		return i18n.Errorf("提权后的 mihomoctl 返回无效数据: %w", err)
+	}
+	return nil
 }
 
 func elevatedWarning(content []byte) string {
@@ -338,7 +369,7 @@ func trustedSudoPath() (string, error) {
 
 func validateTrustedExecutable(path string) (string, error) {
 	if !filepath.IsAbs(path) {
-		return "", errors.New("sudo 路径不是绝对路径")
+		return "", i18n.Errorf("sudo 路径不是绝对路径")
 	}
 	resolved, err := filepath.EvalSymlinks(filepath.Clean(path))
 	if err != nil {
@@ -349,7 +380,7 @@ func validateTrustedExecutable(path string) (string, error) {
 		return "", err
 	}
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
-		return "", fmt.Errorf("%s 不是可执行的普通文件", resolved)
+		return "", i18n.Errorf("%s 不是可执行的普通文件", resolved)
 	}
 	if err := validateRootOwnedPath(info, resolved); err != nil {
 		return "", err
@@ -372,10 +403,10 @@ func validateTrustedExecutable(path string) (string, error) {
 func validateRootOwnedPath(info os.FileInfo, path string) error {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || stat.Uid != 0 {
-		return fmt.Errorf("%s 不属于 root", path)
+		return i18n.Errorf("%s 不属于 root", path)
 	}
 	if info.Mode().Perm()&0o022 != 0 {
-		return fmt.Errorf("%s 可被非 root 用户写入", path)
+		return i18n.Errorf("%s 可被非 root 用户写入", path)
 	}
 	return nil
 }
@@ -483,7 +514,7 @@ func stdinString(reader io.Reader, limit int64) (string, error) {
 		return "", err
 	}
 	if int64(len(content)) > limit {
-		return "", errors.New("输入超过大小限制")
+		return "", i18n.Errorf("输入超过大小限制")
 	}
 	return string(content), nil
 }

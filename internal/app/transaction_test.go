@@ -82,7 +82,7 @@ func TestUseProfileRollbackAfterClientStateFailure(t *testing.T) {
 	if err := os.WriteFile(secondPath, second, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.application.AddProfile(context.Background(), "第二配置", secondPath, 0); err != nil {
+	if _, err := fixture.application.AddProfile(context.Background(), "第二配置", secondPath, 0); err != nil {
 		t.Fatal(err)
 	}
 	tracked := []string{fixture.configPath, fixture.paths.PublicFile, fixture.paths.ClientFile}
@@ -239,7 +239,7 @@ func TestFirstAddedProfileInEmptyStoreIsAppliedAndPublished(t *testing.T) {
 	if err := os.WriteFile(newPath, newConfig, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.application.AddProfile(context.Background(), "首个配置", newPath, 0); err != nil {
+	if _, err := fixture.application.AddProfile(context.Background(), "首个配置", newPath, 0); err != nil {
 		t.Fatal(err)
 	}
 	applied, err := os.ReadFile(fixture.configPath)
@@ -374,7 +374,7 @@ func TestRootServiceUsesUnitFromManagedInstallation(t *testing.T) {
 func TestElevatedLocalProfileEnvelopeCreatesImmutableSnapshot(t *testing.T) {
 	fixture := newTransactionFixture(t)
 	content := "mixed-port: 7890\nmode: rule\ncustom-field: caller-snapshot\nproxies: []\nproxy-groups: []\nrules:\n  - MATCH,DIRECT\n"
-	if err := fixture.application.AddProfile(context.Background(), "调用者快照", profile.InlineSnapshotPrefix+content, time.Hour); err != nil {
+	if _, err := fixture.application.AddProfile(context.Background(), "调用者快照", profile.InlineSnapshotPrefix+content, time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	profiles, err := fixture.application.Profiles(context.Background())
@@ -393,14 +393,14 @@ func TestElevatedLocalProfileEnvelopeCreatesImmutableSnapshot(t *testing.T) {
 	t.Fatal("elevated local snapshot was not stored")
 }
 
-func TestRootCoreStatusPrefersStoreWhenPublicStateLags(t *testing.T) {
+func TestRootCoreStatusPrefersManagedSettingsWhenPublicStateLags(t *testing.T) {
 	fixture := newTransactionFixture(t)
 	secondPath := filepath.Join(filepath.Dir(fixture.configPath), "new-active.yaml")
 	secondConfig := []byte("mixed-port: 7890\nallow-lan: true\nmode: rule\ncustom-field: new-active\nproxies: []\nproxy-groups: []\nrules:\n  - MATCH,DIRECT\n")
 	if err := os.WriteFile(secondPath, secondConfig, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.application.AddProfile(context.Background(), "新活动配置", secondPath, time.Hour); err != nil {
+	if _, err := fixture.application.AddProfile(context.Background(), "新活动配置", secondPath, time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	fixture.application.mu.RLock()
@@ -424,8 +424,8 @@ func TestRootCoreStatusPrefersStoreWhenPublicStateLags(t *testing.T) {
 	if status.ActiveProfile != "新活动配置" {
 		t.Fatalf("root CoreStatus active profile = %q, want store value", status.ActiveProfile)
 	}
-	if !status.AllowLAN {
-		t.Fatalf("root CoreStatus retained stale public settings: %#v", status)
+	if status.AllowLAN {
+		t.Fatalf("root CoreStatus trusted profile allow-lan over managed settings: %#v", status)
 	}
 }
 

@@ -142,7 +142,9 @@ func sanitizeUntrustedConfig(raw []byte) ([]byte, error) {
 		return nil, fmt.Errorf("remote profile contains forbidden listener fields: %s", strings.Join(present, ", "))
 	}
 	for _, key := range []string{
-		"port", "redir-port", "socks-port", "tproxy-port",
+		"mixed-port", "port", "redir-port", "socks-port", "tproxy-port",
+		"allow-lan", "bind-address", "authentication", "skip-auth-prefixes",
+		"lan-allowed-ips", "lan-disallowed-ips",
 		"external-controller", "external-controller-cors", "external-controller-pipe",
 		"external-controller-routing-mark", "external-controller-tls", "external-controller-unix",
 		"external-doh-server", "external-ui", "external-ui-name", "external-ui-url", "secret", "tls",

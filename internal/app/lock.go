@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -11,6 +10,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"mihomoctl/internal/i18n"
 	"mihomoctl/internal/profile"
 )
 
@@ -28,33 +28,33 @@ func acquireOperationLock(ctx context.Context, path string) (*operationLock, err
 		return nil, err
 	}
 	if path == "" || !filepath.IsAbs(path) {
-		return nil, errors.New("操作锁路径必须是绝对路径")
+		return nil, i18n.Errorf("操作锁路径必须是绝对路径")
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("创建操作锁目录失败: %w", err)
+		return nil, i18n.Errorf("创建操作锁目录失败: %w", err)
 	}
 	fd, err := unix.Open(path, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("打开操作锁失败: %w", err)
+		return nil, i18n.Errorf("打开操作锁失败: %w", err)
 	}
 	file := os.NewFile(uintptr(fd), path)
 	if file == nil {
 		_ = unix.Close(fd)
-		return nil, errors.New("打开操作锁失败")
+		return nil, i18n.Errorf("打开操作锁失败")
 	}
 	closeWithError := func(cause error) (*operationLock, error) {
 		return nil, errors.Join(cause, file.Close())
 	}
 	info, err := file.Stat()
 	if err != nil {
-		return closeWithError(fmt.Errorf("检查操作锁失败: %w", err))
+		return closeWithError(i18n.Errorf("检查操作锁失败: %w", err))
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || !info.Mode().IsRegular() || stat.Uid != uint32(os.Geteuid()) || stat.Nlink != 1 {
-		return closeWithError(errors.New("操作锁必须是当前用户所有的普通文件"))
+		return closeWithError(i18n.Errorf("操作锁必须是当前用户所有的普通文件"))
 	}
 	if err := file.Chmod(0o600); err != nil {
-		return closeWithError(fmt.Errorf("设置操作锁权限失败: %w", err))
+		return closeWithError(i18n.Errorf("设置操作锁权限失败: %w", err))
 	}
 
 	ticker := time.NewTicker(operationLockPollInterval)
@@ -72,7 +72,7 @@ func acquireOperationLock(ctx context.Context, path string) (*operationLock, err
 			return &operationLock{file: file}, nil
 		}
 		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
-			return closeWithError(fmt.Errorf("获取操作锁失败: %w", err))
+			return closeWithError(i18n.Errorf("获取操作锁失败: %w", err))
 		}
 		select {
 		case <-ctx.Done():
@@ -99,7 +99,7 @@ func (a *App) withMutation(ctx context.Context, operation func() error) (resultE
 	}
 	if os.Geteuid() == 0 {
 		if err := ensureRootApplicationDirectories(a.paths); err != nil {
-			return &InvalidInputError{Cause: fmt.Errorf("验证 root 受管目录失败: %w", err)}
+			return &InvalidInputError{Cause: i18n.Errorf("验证 root 受管目录失败: %w", err)}
 		}
 	}
 	lock, err := acquireOperationLock(ctx, a.paths.OperationLock)

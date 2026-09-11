@@ -1,36 +1,24 @@
 # mihomoctl
 
-`mihomoctl` 是面向 Linux 的 Mihomo 命令行前端，提供紧凑的中文 TUI 和适合脚本调用的 CLI。它复用系统中已有的 Mihomo 与 systemd 服务，不安装、不升级 Mihomo 内核。
+面向 Linux 的简洁 Mihomo 控制前端，提供中英文终端界面（TUI）和命令行（CLI）。
 
 ## 功能
 
-- 总览、节点、配置、连接、日志、设置六个 TUI 页面。
-- Mihomo 服务、开机启动、运行模式、TUN 和监听网络设置管理。
-- 策略组切换、节点测速、连接查看与关闭、实时日志。
-- 远程 Clash/Mihomo YAML、本地 YAML 快照、节点 URI 和 Base64 URI 订阅。
-- 支持 `ss`、`vmess`、`vless`、`trojan`、`hysteria2`/`hy2`、`tuic` 节点 URI。
-- 订阅条件更新、流量信息、24 小时默认更新周期和可选 systemd timer。
-- 配置应用前执行 `mihomo -t`；原子替换、健康检查和失败回滚。
-- 表格与稳定的 JSON/JSON Lines 输出，支持 Shell 补全和 `NO_COLOR`。
-
-## 系统要求
-
-- 使用 systemd 的 Linux，系统已安装并配置 Mihomo `1.19.x` 或更新版本。
-- 已有可探测的 Mihomo service，默认名称为 `mihomo.service`。
-- 发布包支持 Linux `amd64` 和 `arm64`，二进制不依赖 CGO。
-- TUI 终端至少为 `60x16`；不要求 Nerd Font。
-- 从源码构建需要 Go 1.27。
+- 查看实时流量图表、连接和日志。
+- 添加、更新和切换订阅或本地配置。
+- 切换策略组和节点，测试节点延迟。
+- 管理 Mihomo 服务、运行模式、TUN 和监听网络设置。
 
 ## 安装
 
 ### 1. 先安装 Mihomo
 
-`mihomoctl` 只是 Mihomo 的管理前端，不包含也不会自动安装 Mihomo 内核。安装 `mihomoctl` 前，请先安装 Mihomo，并将其配置为可由 systemd 管理的服务（默认服务名为 `mihomo.service`）。
+mihomoctl 不包含 Mihomo 内核。请先在使用 systemd 的 Linux 上安装并配置 Mihomo，准备好 `mihomo.service` 服务。
 
-- Mihomo 仓库：[MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo/tree/Meta)
-- Mihomo 预编译版本：[Releases](https://github.com/MetaCubeX/mihomo/releases/latest)
+- Mihomo 官方仓库：[MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo/tree/Meta)
+- Mihomo 内核下载：[Releases](https://github.com/MetaCubeX/mihomo/releases/latest)
 
-安装完成后先确认命令和服务可用：
+确认内核与服务可用：
 
 ```bash
 mihomo -v
@@ -39,248 +27,41 @@ systemctl status mihomo.service
 
 ### 2. 安装 mihomoctl
 
-发布页提供 tar.gz、deb、rpm、SHA256 校验文件和 SBOM。安装软件包不会自动启用或启动订阅更新 timer。
+从 [mihomoctl Releases](https://github.com/FmikGy/mihomoctl/releases/latest) 下载对应系统和架构的安装包：x86_64 选择 `amd64`，aarch64 选择 `arm64`。
 
-Debian/Ubuntu：
-
-```bash
-sudo apt install ./mihomoctl_0.1.0_linux_amd64.deb
-```
-
-Fedora/RHEL：
+在下载目录执行对应命令；通配符应只匹配本次要安装的一个文件：
 
 ```bash
-sudo dnf install ./mihomoctl_0.1.0_linux_amd64.rpm
+# Debian / Ubuntu
+sudo apt install ./mihomoctl_*.deb
+
+# Fedora / RHEL
+sudo dnf install ./mihomoctl_*.rpm
 ```
 
-tar.gz：
+tar.gz 安装和源码构建见[详细使用指南](GUIDE.md#安装)。
 
-```bash
-tar -xzf mihomoctl_0.1.0_linux_amd64.tar.gz
-sudo install -d -m 0755 /usr/local/bin /usr/local/lib/systemd/system
-sudo install -m 0755 mihomoctl /usr/local/bin/mihomoctl
-sudo install -m 0644 packaging/systemd/mihomoctl-update.{service,timer} /usr/local/lib/systemd/system/
-sudo systemctl daemon-reload
-```
+## 快速开始
 
-使用 `arm64` 机器时，将文件名中的架构替换为 `arm64`。安装后可用 `mihomoctl version` 检查版本。
-
-## 首次初始化
-
-先确认 Mihomo 可以由 systemd 管理：
-
-```bash
-mihomo -v
-systemctl status mihomo.service
-mihomoctl doctor
-```
-
-然后接管现有配置：
+首次使用先初始化，再启动终端界面：
 
 ```bash
 mihomoctl init
-```
-
-`init` 会按需调用 `sudo`，探测 Mihomo 二进制、service 和 `ExecStart` 中的 `-d`/`-f` 路径，将现有配置导入为不可变的“系统原配置”恢复快照，并默认创建仅监听 `127.0.0.1:9090` 的带密钥控制器。该快照不会被 `profile update --all` 或定时更新覆盖。应用配置前会先校验；运行中的 Mihomo 会被重启并接受健康检查，失败时恢复备份。配置备份默认保留最近 20 份。
-
-探测结果不符合实际环境时，需由管理员在独立的 root 登录环境中明确指定。普通用户的自动提权流程不会接受自定义 service 或 root 配置路径；若管理员通过完整的 `sudo -i` root shell 操作，应先清除继承的调用者标记：
-
-```bash
-sudo -i
-unset SUDO_UID SUDO_GID
-mihomoctl init \
-  --service mihomo.service \
-  --config /etc/mihomo/config.yaml \
-  --controller 127.0.0.1:9090
-exit
-mihomoctl config sync-client
-```
-
-最后一条命令应以日常使用 mihomoctl 的普通用户执行。它只把已初始化的控制器地址和密钥安全同步到该用户自己的客户端配置，不会重新应用 Mihomo 配置。
-
-`--controller` 只接受回环地址。`--force` 用于重新初始化现有 mihomoctl 状态，使用前应先检查备份。
-
-## 常用操作
-
-日常交互使用及 TUI 建议始终以普通用户启动，不要使用 `sudo mihomoctl`。在交互式终端中不带参数启动 TUI；stdin/stdout 被重定向时会显示帮助而不会占用全屏：
-
-```bash
 mihomoctl
 ```
 
-常用 CLI：
+初始化会备份并接管现有 Mihomo 配置；服务运行时会重启并检查配置，失败自动回滚。日常以普通用户运行，管理操作会按需调用 `sudo`。
 
-```bash
-mihomoctl status
-mihomoctl service restart
-mihomoctl service enable --now
-mihomoctl mode rule
-mihomoctl tun on
+`Tab` 切换页面，`?` 查看帮助，`q` 退出。
 
-mihomoctl proxy list
-mihomoctl proxy select PROXY "节点名称"
-mihomoctl proxy test PROXY
+默认使用简体中文。可在 TUI 的“设置 → 语言”中切换，或执行 `mihomoctl language en` 持久切换为英文；`--lang en` 仅覆盖当前一次运行。
 
-mihomoctl profile list
-mihomoctl profile add https://example.com/subscription --name 主订阅
-mihomoctl profile add ./config.yaml --name 本地配置
-mihomoctl profile update --all
-mihomoctl profile use 主订阅
+## 详细文档
 
-mihomoctl connections list
-mihomoctl connections close --all
-mihomoctl logs --follow --level info
-```
+[完整使用指南](GUIDE.md)包含安装、订阅、节点、设置、权限、备份恢复和开发说明。
 
-普通用户添加本地 YAML 时，mihomoctl 会先以当前用户权限读取文件，再将内容作为不可变快照交给 root 保存；文件路径不会越过提权边界，之后修改原文件也不会自动同步。需要更新时请删除后重新添加。远程订阅和节点 URI 仍按设置的间隔更新。管理员在真正的 root 会话中添加受信任的本地文件时，仍可保留按路径更新的行为。
-
-自动更新默认关闭。显式启用后，timer 每 15 分钟检查一次到期订阅，并增加最多 5 分钟的随机延迟：
-
-```bash
-mihomoctl schedule enable
-mihomoctl schedule status
-```
-
-定时任务使用加固后的 systemd 沙箱，因此 mihomoctl 自身必须使用默认的 `/etc/mihomoctl`、`/var/lib/mihomoctl` 受管路径，活动 Mihomo 配置也不能位于 `/home`、`/root`、`/usr` 或临时目录。若自动探测到这些位置，启用时会给出明确错误；仍可使用 `profile update` 手动更新。
-
-状态、配置、节点、连接等非流式业务命令可使用 `--output json`；日志的 JSON 模式按行输出独立 JSON 对象：
-
-```bash
-mihomoctl status --output json
-mihomoctl logs --follow --output json
-```
-
-脚本可依赖退出码：`0` 成功、`1` 操作失败、`2` 输入无效、`3` 权限失败、`4` Mihomo 或控制器不可用。
-
-受管配置只允许修改以下项目：
-
-```bash
-mihomoctl config set mixed-port 7890
-mihomoctl config set allow-lan off
-mihomoctl config set ipv6 off
-mihomoctl config set log-level info
-```
-
-生成补全脚本：
-
-```bash
-mihomoctl completion bash
-mihomoctl completion zsh
-mihomoctl completion fish
-```
-
-## TUI 快捷键
-
-| 按键 | 操作 |
-| --- | --- |
-| `Tab` / `Shift+Tab`、`h` / `l` | 切换页面 |
-| `j` / `k`、上下方向键 | 移动选择或逐行浏览日志 |
-| `Home` / `End`、`PgUp` / `PgDn` | 跳到首尾或整页翻动长列表与日志 |
-| 节点页左右方向键、`[` / `]` | 切换策略组 |
-| `Enter` | 执行当前操作 |
-| `/` | 筛选节点、连接或日志 |
-| `t` | 测试当前策略组 |
-| `a` / `u` / `d` | 添加、更新、删除配置 |
-| `Space` | 暂停或继续日志自动滚动；暂停期间仍保留新日志 |
-| `r` | 刷新 |
-| `?` | 显示帮助 |
-| `q` / `Ctrl+C` | 退出 |
-
-删除配置、关闭连接、关闭全部连接和停止服务会要求确认。
-
-### 设置页
-
-设置页包含服务、开机启动、运行模式、TUN、定时更新、混合端口、允许局域网、IPv6 和日志级别九项。使用上下方向键选择，按 `Enter` 修改；长列表会自动滚动并保持当前项可见。
-
-- 混合端口使用预填输入框，只接受 `1` 到 `65535`；无效输入会留在输入框中并显示错误。
-- 日志级别通过单选列表设置，可选 `debug`、`info`、`warning`、`error` 和 `silent`。
-- 开启“允许局域网”前必须再次确认，因为代理端口会对同一局域网开放；Mihomo 控制器始终只监听回环地址，不会随之暴露。
-- 每项在确认后立即保存。Mihomo 正在运行时，配置会先通过内核校验，再重启服务并执行健康检查；失败会恢复上一份可用配置。服务已停止时只保存设置，不会自行启动服务。
-
-## 权限与敏感信息
-
-- 状态、节点、测速、连接和日志通过本地 Mihomo API 完成，正常情况下不需要提权。
-- 初始化、配置/订阅变更、TUN、systemd 服务和 timer 操作会按需调用 `sudo`；TUI 会显示系统原生密码提示，提权命令不会经过 shell。
-- 多个 CLI、TUI 或 timer 同时修改配置时会自动排队；等待期间按 `Ctrl+C` 可以取消尚未开始的操作。
-- 管理员操作只会重启安装在 root 管理目录、普通用户不可写的 mihomoctl；直接运行源码目录中的构建产物时，请先完成系统安装。
-- 普通用户自动提权只使用默认的 root 状态、数据、systemd unit 和 Mihomo 探测结果；自定义系统路径与 `init --service/--config` 只允许独立 root 会话使用。用户侧 `MIHOMOCTL_CLIENT_CONFIG`/`XDG_CONFIG_HOME` 仍可使用，但必须位于调用者主目录内，且既有父目录必须属于调用者。
-- 以 root 读取或应用配置时，Mihomo 二进制、活动配置以及配置、数据和备份目录必须由 root 管理，路径中不能包含符号链接或普通用户可写的目录；`/tmp` 这类 root 所有的 sticky 目录只能作为上级目录。活动配置必须是普通文件且不超过 10 MiB，FIFO 等特殊文件会被拒绝。
-- `sudo` 凭据仍在系统缓存期内，或当前用户已配置 `NOPASSWD` 时，操作会直接继续。缓存超时由系统 `sudoers` 决定；mihomoctl 不会主动刷新或延长缓存，超时后的下一次提权操作会重新提示。
-- 认证失败会终止当前操作并返回 TUI；在密码提示完成前按 `Ctrl+C` 会安全退出程序。这两种情况都不会启动提权后的配置或服务操作。
-- 若密码提示不可用或持续认证失败，可先退出 TUI 执行 `sudo -v` 验证并缓存凭据，再以普通用户重新运行 `mihomoctl`；没有相应 sudo 权限时仍需由系统管理员授权。
-- `/etc/mihomoctl` 权限为 `0700`。`/var/lib/mihomoctl` 为可穿越的 `0755`，其中只在根目录放置脱敏的 `0644 public.json`；`store/`、`backups/` 和敏感 YAML 仍限制为 `0700`/`0600`。
-- `~/.config/mihomoctl/client.yaml` 权限为 `0600`，其中含本地控制器密钥。不要共享该文件，也不要加入版本控制。
-- mihomoctl 自身产生的订阅错误与配置列表会隐藏 URL token、节点密码、UUID 和控制器密钥。
-- TUI 添加配置时会遮蔽输入的订阅 URL、节点 URI 或本地路径；筛选输入仍正常显示。
-- `logs` 内容来自 Mihomo 内核，可能包含目标地址或进程等运行信息；对外分享前仍应检查并脱敏。
-- 带 token 的订阅 URL 直接写在命令行中可能进入 Shell 历史。可使用 `mihomoctl profile add - --name 私有订阅`，从标准输入粘贴内容后按 `Ctrl+D`。
-- 下载超时默认为 30 秒，单份订阅上限为 10 MiB；无效更新不会替换最后可用配置。
-- 提权读取或应用时，现有活动配置必须由 root 持有且不能由 group/other 写入；非 root Mihomo 服务应通过属组或 other 读取位访问。替换会保留原属组及 group/other 读取位，但不会复制自定义 POSIX ACL 或 xattr。
-- `allow-lan` 只控制 Mihomo 代理端口是否对局域网开放；控制器仍被强制绑定到回环地址。
-
-主要状态路径：
-
-| 路径 | 内容 |
-| --- | --- |
-| `/etc/mihomoctl/config.yaml` | root-only 管理状态与控制器密钥 |
-| `/var/lib/mihomoctl/public.json` | 不含来源、验证器和密钥的配置元数据及当前监听网络设置，供普通用户读取 |
-| `/var/lib/mihomoctl/store` | 配置和订阅快照 |
-| `/var/lib/mihomoctl/backups` | 应用前的 Mihomo 配置备份 |
-| `~/.config/mihomoctl/client.yaml` | 当前用户访问本地控制器所需的信息 |
-
-升级安装会尽力从当前活动配置同步 `public.json` 中的设置快照，因此 Mihomo 停止时 TUI 仍可显示最近一次成功应用的值。旧版快照在同步完成前会显示“未知”；后续成功修改、切换或更新配置时也会自动补齐。公开快照不会写入订阅地址、节点凭据或控制器密钥。
-
-## 安全卸载
-
-卸载前先停用自动更新；软件包的卸载脚本也会在真正删除软件包时执行此操作：
-
-```bash
-mihomoctl schedule disable
-sudo apt remove mihomoctl       # Debian/Ubuntu
-# 或：sudo dnf remove mihomoctl # Fedora/RHEL
-```
-
-源码安装默认位于 `/usr`，可这样移除程序和 timer：
-
-```bash
-sudo systemctl disable --now mihomoctl-update.timer
-sudo systemctl stop mihomoctl-update.service
-sudo rm -f /usr/bin/mihomoctl
-sudo rm -f /usr/lib/systemd/system/mihomoctl-update.service
-sudo rm -f /usr/lib/systemd/system/mihomoctl-update.timer
-sudo rm -f /usr/share/doc/mihomoctl/LICENSE
-sudo rm -f /usr/share/doc/mihomoctl/README.md
-sudo rmdir /usr/share/doc/mihomoctl 2>/dev/null || true
-sudo systemctl daemon-reload
-```
-
-使用 `--prefix /usr/local` 安装时，将上述 `/usr` 替换为 `/usr/local`。卸载默认保留 `/etc/mihomoctl`、`/var/lib/mihomoctl`、用户 client 文件和 Mihomo 配置；确认 Mihomo 已能独立运行且备份不再需要后，再手动清理这些数据。删除数据不可恢复。
-
-## 从源码构建
-
-```bash
-make test
-make build
-./dist/mihomoctl version
-```
-
-安装当前源码：
-
-```bash
-./scripts/install.sh
-```
-
-脚本先以当前用户构建，再只对安装步骤使用 `sudo`。可使用 `--prefix /usr/local`，或使用 `--no-units` 只安装二进制。`DESTDIR` 可供打包和无副作用的安装测试使用。
-
-开发检查与本地发行快照：
-
-```bash
-make check
-make test-race
-make snapshot
-```
-
-`make snapshot` 需要 GoReleaser v2.10 或更新版本及 Syft，产物写入 `dist/`。
+- [配置订阅](GUIDE.md#配置与订阅) · [选择节点](GUIDE.md#节点选择与测速) · [网络设置](GUIDE.md#模式与网络设置)
+- [全部快捷键](GUIDE.md#tui-快捷键) · [升级与卸载](GUIDE.md#升级与卸载) · [源码构建](GUIDE.md#源码构建与开发)
 
 ## 许可证
 

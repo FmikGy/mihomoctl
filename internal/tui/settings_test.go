@@ -10,7 +10,27 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"mihomoctl/internal/domain"
+	"mihomoctl/internal/i18n"
 )
+
+type testLanguagePreferences struct {
+	language i18n.Language
+	saves    int
+	err      error
+}
+
+func (preferences *testLanguagePreferences) LoadLanguage() (i18n.Language, error) {
+	return preferences.language, preferences.err
+}
+
+func (preferences *testLanguagePreferences) SaveLanguage(language i18n.Language) error {
+	if preferences.err != nil {
+		return preferences.err
+	}
+	preferences.language = language
+	preferences.saves++
+	return nil
+}
 
 func settingCursorFor(t *testing.T, target settingID) int {
 	t.Helper()
@@ -76,6 +96,92 @@ func TestMixedPortInputValidation(t *testing.T) {
 				t.Fatalf("config calls=%d key=%q value=%q", backend.configCalls, backend.configKey, backend.configValue)
 			}
 		})
+	}
+}
+
+func TestMixedPortInputValidationUsesSelectedLanguage(t *testing.T) {
+	m := testModel()
+	m.language = i18n.English
+	m, _ = openSetting(t, m, settingMixedPort)
+	m.input.SetValue("invalid")
+	m, _ = updateUIModel(t, m, keyPress(tea.KeyEnter, ""))
+	if m.inputError != "Port must be between 1 and 65535" {
+		t.Fatalf("input error = %q", m.inputError)
+	}
+}
+
+func TestLanguagePickerPersistsAndRedrawsWithoutBackendMutation(t *testing.T) {
+	preferences := &testLanguagePreferences{language: i18n.Chinese}
+	m := testModel()
+	m.ctx = i18n.WithPreferences(m.ctx, preferences)
+	backend := m.backend.(*fakeBackend)
+
+	m, cmd := openSetting(t, m, settingLanguage)
+	if cmd != nil || m.picker != pickerLanguage || m.pickerCursor != 0 {
+		t.Fatalf("language picker state: cmd=%v picker=%v cursor=%d", cmd != nil, m.picker, m.pickerCursor)
+	}
+	m, _ = updateUIModel(t, m, keyPress(tea.KeyDown, ""))
+	m, cmd = updateUIModel(t, m, keyPress(tea.KeyEnter, ""))
+	if cmd == nil || !m.loading {
+		t.Fatalf("language selection did not start save: cmd=%v loading=%v", cmd != nil, m.loading)
+	}
+	m, _ = updateUIModel(t, m, cmd())
+	if m.language != i18n.English || preferences.language != i18n.English || preferences.saves != 1 {
+		t.Fatalf("language state = %q preference=%q saves=%d", m.language, preferences.language, preferences.saves)
+	}
+	plain := ansi.Strip(m.render())
+	for _, expected := range []string{"Settings", "Interface", "Language", "English", "Language saved"} {
+		if !strings.Contains(plain, expected) {
+			t.Fatalf("English redraw missing %q:\n%s", expected, plain)
+		}
+	}
+	if backend.configCalls != 0 || backend.action != "" || backend.schedule != nil {
+		t.Fatalf("language change mutated Mihomo backend: %#v", backend)
+	}
+}
+
+func TestLanguageSaveCompletesPendingQuit(t *testing.T) {
+	preferences := &testLanguagePreferences{language: i18n.Chinese}
+	m := testModel()
+	m.ctx = i18n.WithPreferences(m.ctx, preferences)
+	m, _ = openSetting(t, m, settingLanguage)
+	m, _ = updateUIModel(t, m, keyPress(tea.KeyDown, ""))
+	m, saveCmd := updateUIModel(t, m, keyPress(tea.KeyEnter, ""))
+	if saveCmd == nil || !m.languageSaving || !m.loading {
+		t.Fatalf("language save did not start: cmd=%v saving=%v loading=%v", saveCmd != nil, m.languageSaving, m.loading)
+	}
+	m, quitCmd := updateUIModel(t, m, keyPress('q', "q"))
+	if quitCmd != nil || !m.quitPending {
+		t.Fatalf("quit was not deferred: cmd=%v pending=%v", quitCmd != nil, m.quitPending)
+	}
+	m, quitCmd = updateUIModel(t, m, saveCmd())
+	if quitCmd == nil || m.loading || m.languageSaving || m.language != i18n.English {
+		t.Fatalf("completed save did not quit: cmd=%v loading=%v saving=%v language=%q", quitCmd != nil, m.loading, m.languageSaving, m.language)
+	}
+}
+
+func TestLanguageSaveIgnoresStaleCompletion(t *testing.T) {
+	m := testModel()
+	m.loading = true
+	m.languageSaving = true
+	m.languageGeneration = 2
+	updated, cmd := m.Update(languageMsg{language: i18n.English, generation: 1})
+	m = updated.(Model)
+	if cmd != nil || !m.loading || !m.languageSaving || m.language != i18n.Chinese {
+		t.Fatalf("stale completion changed state: cmd=%v loading=%v saving=%v language=%q", cmd != nil, m.loading, m.languageSaving, m.language)
+	}
+}
+
+func TestLanguagePickerKeepsCurrentLanguageWhenSaveFails(t *testing.T) {
+	preferences := &testLanguagePreferences{language: i18n.Chinese, err: errors.New("disk full")}
+	m := testModel()
+	m.ctx = i18n.WithPreferences(m.ctx, preferences)
+	m, _ = openSetting(t, m, settingLanguage)
+	m, _ = updateUIModel(t, m, keyPress(tea.KeyDown, ""))
+	m, cmd := updateUIModel(t, m, keyPress(tea.KeyEnter, ""))
+	m, _ = updateUIModel(t, m, cmd())
+	if m.language != i18n.Chinese || !strings.Contains(m.err, "disk full") {
+		t.Fatalf("failed save changed language or hid error: language=%q error=%q", m.language, m.err)
 	}
 }
 
@@ -226,7 +332,7 @@ func TestSettingsUnknownValuesAndNarrowViewport(t *testing.T) {
 	if !selectedItemVisible(view, "日志级别") {
 		t.Fatalf("last setting is not highlighted in narrow viewport:\n%s", ansi.Strip(view))
 	}
-	if plain := ansi.Strip(view); !strings.Contains(plain, "9/9") || !strings.Contains(plain, "监听与网络") || !strings.Contains(plain, "日志") {
+	if plain := ansi.Strip(view); !strings.Contains(plain, "10/10") || !strings.Contains(plain, "监听与网络") || !strings.Contains(plain, "日志") {
 		t.Fatalf("grouped setting viewport is incomplete:\n%s", plain)
 	}
 	for lineNumber, line := range strings.Split(view, "\n") {

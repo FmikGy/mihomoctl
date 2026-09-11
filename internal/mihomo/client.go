@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"mihomoctl/internal/i18n"
 )
 
 const (
@@ -55,7 +57,7 @@ func WithRequestTimeout(timeout time.Duration) Option {
 func NewClient(controller, secret string, options ...Option) (*Client, error) {
 	controller = strings.TrimSpace(controller)
 	if controller == "" {
-		return nil, errors.New("Mihomo 控制器地址不能为空")
+		return nil, i18n.Errorf("Mihomo 控制器地址不能为空")
 	}
 	if !strings.Contains(controller, "://") {
 		controller = "http://" + controller
@@ -63,19 +65,18 @@ func NewClient(controller, secret string, options ...Option) (*Client, error) {
 
 	baseURL, err := url.Parse(controller)
 	if err != nil {
-		return nil, fmt.Errorf("Mihomo 控制器地址无效: %w", err)
+		return nil, i18n.Errorf("Mihomo 控制器地址无效: %w", err)
 	}
 	if (baseURL.Scheme != "http" && baseURL.Scheme != "https") || baseURL.Host == "" {
-		return nil, errors.New("Mihomo 控制器地址必须是有效的 HTTP 或 HTTPS 地址")
+		return nil, i18n.Errorf("Mihomo 控制器地址必须是有效的 HTTP 或 HTTPS 地址")
 	}
 	if baseURL.User != nil || baseURL.RawQuery != "" || baseURL.Fragment != "" {
-		return nil, errors.New("Mihomo 控制器地址不能包含用户信息、查询参数或片段")
+		return nil, i18n.Errorf("Mihomo 控制器地址不能包含用户信息、查询参数或片段")
 	}
 	baseURL.Path = strings.TrimRight(baseURL.Path, "/")
 	baseURL.RawPath = strings.TrimRight(baseURL.EscapedPath(), "/")
 
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.ResponseHeaderTimeout = defaultResponseHeaderTimeout
+	transport := clientTransport(http.DefaultTransport)
 	client := &Client{
 		baseURL:        baseURL,
 		secret:         secret,
@@ -88,12 +89,24 @@ func NewClient(controller, secret string, options ...Option) (*Client, error) {
 		}
 	}
 	if client.httpClient == nil {
-		return nil, errors.New("Mihomo HTTP 客户端不能为空")
+		return nil, i18n.Errorf("Mihomo HTTP 客户端不能为空")
 	}
 	if client.requestTimeout < 0 {
-		return nil, errors.New("Mihomo 请求超时不能为负数")
+		return nil, i18n.Errorf("Mihomo 请求超时不能为负数")
 	}
 	return client, nil
+}
+
+func clientTransport(base http.RoundTripper) http.RoundTripper {
+	if transport, ok := base.(*http.Transport); ok && transport != nil {
+		clone := transport.Clone()
+		clone.ResponseHeaderTimeout = defaultResponseHeaderTimeout
+		return clone
+	}
+	if base != nil {
+		return base
+	}
+	return &http.Transport{Proxy: http.ProxyFromEnvironment, ResponseHeaderTimeout: defaultResponseHeaderTimeout}
 }
 
 // New is a short alias for NewClient.
@@ -114,6 +127,17 @@ func (e *APIError) Error() string {
 		return fmt.Sprintf("Mihomo API 请求失败（HTTP %d）", e.StatusCode)
 	}
 	return fmt.Sprintf("Mihomo API 请求失败（HTTP %d）：%s", e.StatusCode, e.Message)
+}
+
+func (e *APIError) Localized(language i18n.Language) string {
+	if e.Message == "" {
+		return i18n.T(language, "Mihomo API 请求失败（HTTP %d）", e.StatusCode)
+	}
+	message := e.Message
+	if message == authErrorMessage {
+		message = i18n.T(language, authErrorMessage)
+	}
+	return i18n.T(language, "Mihomo API 请求失败（HTTP %d）：%s", e.StatusCode, message)
 }
 
 func (c *Client) endpoint(parts ...string) *url.URL {
@@ -140,14 +164,14 @@ func (c *Client) request(
 	stream bool,
 ) (*http.Response, context.CancelFunc, error) {
 	if ctx == nil {
-		return nil, nil, errors.New("Mihomo API 请求 context 不能为空")
+		return nil, nil, i18n.Errorf("Mihomo API 请求 context 不能为空")
 	}
 
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
 		if err != nil {
-			return nil, nil, fmt.Errorf("Mihomo API 请求数据编码失败: %w", err)
+			return nil, nil, i18n.Errorf("Mihomo API 请求数据编码失败: %w", err)
 		}
 		reader = bytes.NewReader(encoded)
 	}
@@ -163,7 +187,7 @@ func (c *Client) request(
 	req, err := http.NewRequestWithContext(requestCtx, method, endpoint.String(), reader)
 	if err != nil {
 		cancel()
-		return nil, nil, fmt.Errorf("Mihomo API 请求创建失败: %w", err)
+		return nil, nil, i18n.Errorf("Mihomo API 请求创建失败: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
@@ -178,9 +202,9 @@ func (c *Client) request(
 	if err != nil {
 		cancel()
 		if requestCtx.Err() != nil {
-			return nil, nil, fmt.Errorf("Mihomo API 请求已取消或超时: %w", requestCtx.Err())
+			return nil, nil, i18n.Errorf("Mihomo API 请求已取消或超时: %w", requestCtx.Err())
 		}
-		return nil, nil, fmt.Errorf("无法连接 Mihomo API: %w", err)
+		return nil, nil, i18n.Errorf("无法连接 Mihomo API: %w", err)
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		apiErr := readAPIError(req, resp)
@@ -261,13 +285,13 @@ func decodeOne[Wire any, Result any](
 	var wire Wire
 	if err := json.NewDecoder(resp.Body).Decode(&wire); err != nil {
 		if resp.Request.Context().Err() != nil {
-			return zero, fmt.Errorf("Mihomo API 请求已取消或超时: %w", resp.Request.Context().Err())
+			return zero, i18n.Errorf("Mihomo API 请求已取消或超时: %w", resp.Request.Context().Err())
 		}
-		return zero, fmt.Errorf("Mihomo API 响应解析失败: %w", err)
+		return zero, i18n.Errorf("Mihomo API 响应解析失败: %w", err)
 	}
 	result, err := convert(wire)
 	if err != nil {
-		return zero, fmt.Errorf("Mihomo API 响应无效: %w", err)
+		return zero, i18n.Errorf("Mihomo API 响应无效: %w", err)
 	}
 	return result, nil
 }
@@ -289,9 +313,9 @@ func doNoContent(
 	_, err = io.Copy(io.Discard, resp.Body)
 	if err != nil {
 		if resp.Request.Context().Err() != nil {
-			return fmt.Errorf("Mihomo API 请求已取消或超时: %w", resp.Request.Context().Err())
+			return i18n.Errorf("Mihomo API 请求已取消或超时: %w", resp.Request.Context().Err())
 		}
-		return fmt.Errorf("Mihomo API 响应读取失败: %w", err)
+		return i18n.Errorf("Mihomo API 响应读取失败: %w", err)
 	}
 	return nil
 }
@@ -305,7 +329,7 @@ func decodeStream[Wire any, Result any](
 	consume func(Result) error,
 ) error {
 	if consume == nil {
-		return errors.New("Mihomo 流式响应回调不能为空")
+		return i18n.Errorf("Mihomo 流式响应回调不能为空")
 	}
 	resp, cancel, err := c.request(ctx, http.MethodGet, parts, query, nil, true)
 	if err != nil {
@@ -320,16 +344,16 @@ func decodeStream[Wire any, Result any](
 		err := decoder.Decode(&wire)
 		if err != nil {
 			if resp.Request.Context().Err() != nil {
-				return fmt.Errorf("Mihomo API 流已取消: %w", resp.Request.Context().Err())
+				return i18n.Errorf("Mihomo API 流已取消: %w", resp.Request.Context().Err())
 			}
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
-			return fmt.Errorf("Mihomo API 流式响应解析失败: %w", err)
+			return i18n.Errorf("Mihomo API 流式响应解析失败: %w", err)
 		}
 		result, err := convert(wire)
 		if err != nil {
-			return fmt.Errorf("Mihomo API 流式响应无效: %w", err)
+			return i18n.Errorf("Mihomo API 流式响应无效: %w", err)
 		}
 		if err := consume(result); err != nil {
 			return err

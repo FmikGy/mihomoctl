@@ -2,7 +2,6 @@ package mihomo
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	"mihomoctl/internal/domain"
+	"mihomoctl/internal/i18n"
 )
 
 type proxyResponse struct {
@@ -132,14 +132,14 @@ func (c *Client) Groups(ctx context.Context) (map[string]domain.ProxyGroup, erro
 
 func (c *Client) SelectProxy(ctx context.Context, group, proxy string) error {
 	if group == "" || proxy == "" {
-		return errors.New("策略组和代理名称不能为空")
+		return i18n.Errorf("策略组和代理名称不能为空")
 	}
 	return doNoContent(ctx, c, http.MethodPut, []string{"proxies", group}, url.Values{}, map[string]string{"name": proxy})
 }
 
 func delayQuery(testURL string, timeout time.Duration) (url.Values, error) {
 	if timeout < 0 {
-		return nil, errors.New("测速超时不能为负数")
+		return nil, i18n.Errorf("测速超时不能为负数")
 	}
 	if timeout == 0 {
 		timeout = 5 * time.Second
@@ -157,7 +157,7 @@ func delayQuery(testURL string, timeout time.Duration) (url.Values, error) {
 
 func (c *Client) TestProxy(ctx context.Context, name, testURL string, timeout time.Duration) (uint16, error) {
 	if name == "" {
-		return 0, errors.New("代理名称不能为空")
+		return 0, i18n.Errorf("代理名称不能为空")
 	}
 	query, err := delayQuery(testURL, timeout)
 	if err != nil {
@@ -173,7 +173,7 @@ func (c *Client) TestProxy(ctx context.Context, name, testURL string, timeout ti
 
 func (c *Client) TestGroup(ctx context.Context, name, testURL string, timeout time.Duration) (map[string]uint16, error) {
 	if name == "" {
-		return nil, errors.New("策略组名称不能为空")
+		return nil, i18n.Errorf("策略组名称不能为空")
 	}
 	query, err := delayQuery(testURL, timeout)
 	if err != nil {

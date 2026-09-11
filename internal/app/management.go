@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"net"
 	"os"
 	osuser "os/user"
@@ -17,6 +16,7 @@ import (
 	"go.yaml.in/yaml/v3"
 
 	"mihomoctl/internal/domain"
+	"mihomoctl/internal/i18n"
 	"mihomoctl/internal/mihomo"
 	"mihomoctl/internal/platform"
 	"mihomoctl/internal/profile"
@@ -62,7 +62,7 @@ func (a *App) initializeRoot(ctx context.Context, options domain.InitOptions) er
 		return loadErr
 	}
 	if existing != nil && !options.Force {
-		return errors.New("mihomoctl 已初始化；如需修复请使用 doctor --fix")
+		return i18n.Errorf("mihomoctl 已初始化；如需修复请使用 doctor --fix")
 	}
 	discoverer := platform.NewDiscoverer(a.runner)
 	if options.Service != "" {
@@ -95,7 +95,7 @@ func (a *App) initializeRoot(ctx context.Context, options domain.InitOptions) er
 	}
 	raw, err := platform.ReadManagedConfig(installation.ConfigPath, platform.MaxManagedConfigBytes)
 	if err != nil {
-		return fmt.Errorf("读取现有 Mihomo 配置失败: %w", err)
+		return i18n.Errorf("读取现有 Mihomo 配置失败: %w", err)
 	}
 	settings := inferSettings(raw)
 	secret, err := randomSecret()
@@ -136,7 +136,7 @@ func (a *App) initializeRoot(ctx context.Context, options domain.InitOptions) er
 	}
 	if len(profiles) == 0 {
 		if _, err := store.AddSnapshot("系统原配置", raw); err != nil {
-			return a.failAndReload(ctx, rollback, fmt.Errorf("导入现有配置失败: %w", err))
+			return a.failAndReload(ctx, rollback, i18n.Errorf("导入现有配置失败: %w", err))
 		}
 	}
 	config, err := store.ActiveConfig()
@@ -185,10 +185,10 @@ func validateInitOverrides(root, sudoChild bool, options domain.InitOptions) err
 		return nil
 	}
 	if !root {
-		return &InvalidInputError{Cause: errors.New("普通用户自动提权初始化只支持自动探测；--service 和 --config 仅可由管理员在真正的 root 会话中使用")}
+		return &InvalidInputError{Cause: i18n.Errorf("普通用户自动提权初始化只支持自动探测；--service 和 --config 仅可由管理员在真正的 root 会话中使用")}
 	}
 	if sudoChild {
-		return &InvalidInputError{Cause: errors.New("sudo 子进程拒绝 --service 或 --config；自定义安装位置必须由管理员在真正的 root 会话中配置")}
+		return &InvalidInputError{Cause: i18n.Errorf("sudo 子进程拒绝 --service 或 --config；自定义安装位置必须由管理员在真正的 root 会话中配置")}
 	}
 	return nil
 }
@@ -212,11 +212,11 @@ func (a *App) applyProfileConfig(ctx context.Context, state persistedState, raw 
 		Settings:           state.Settings,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("生成活动配置失败: %w", err)
+		return nil, i18n.Errorf("生成活动配置失败: %w", err)
 	}
 	expected, err := effectiveConfigFromYAML(managed)
 	if err != nil {
-		return nil, fmt.Errorf("读取活动配置失败: %w", err)
+		return nil, i18n.Errorf("读取活动配置失败: %w", err)
 	}
 	systemd, err := platform.NewSystemd(a.runner, state.Installation.Unit)
 	if err != nil {
@@ -260,14 +260,14 @@ func (a *App) applyProfileConfig(ctx context.Context, state persistedState, raw 
 				if statusErr == nil && status.Active {
 					return nil
 				}
-				return errors.Join(statusErr, errors.New("恢复后的 Mihomo 服务未运行"))
+				return errors.Join(statusErr, i18n.Errorf("恢复后的 Mihomo 服务未运行"))
 			}
 			return waitForAppliedConfig(healthCtx, client, expected, 8*time.Second)
 		},
 	}
 	result, err := applier.Apply(ctx, managed)
 	if err != nil {
-		return nil, fmt.Errorf("应用 Mihomo 配置失败: %w", err)
+		return nil, i18n.Errorf("应用 Mihomo 配置失败: %w", err)
 	}
 	return &appliedProfileConfig{applier: applier, result: result}, nil
 }
@@ -275,7 +275,7 @@ func (a *App) applyProfileConfig(ctx context.Context, state persistedState, raw 
 func serviceConfigAccess(ctx context.Context, systemd *platform.Systemd) (*platform.ConfigAccess, error) {
 	identity, err := systemd.Identity(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("读取 Mihomo 服务用户失败: %w", err)
+		return nil, i18n.Errorf("读取 Mihomo 服务用户失败: %w", err)
 	}
 	serviceUser := strings.TrimSpace(identity.User)
 	if !identity.DynamicUser && (serviceUser == "" || serviceUser == "root" || serviceUser == "0") {
@@ -285,21 +285,21 @@ func serviceConfigAccess(ctx context.Context, systemd *platform.Systemd) (*platf
 	groupName := strings.TrimSpace(identity.Group)
 	if groupName == "" {
 		if identity.DynamicUser {
-			return nil, errors.New("Mihomo 使用 DynamicUser 但没有固定 Group；请在服务中配置可解析的静态 Group 后重试")
+			return nil, i18n.Errorf("Mihomo 使用 DynamicUser 但没有固定 Group；请在服务中配置可解析的静态 Group 后重试")
 		}
 		account, lookupErr := lookupUser(serviceUser)
 		if lookupErr != nil {
-			return nil, fmt.Errorf("无法解析 Mihomo 服务用户 %q；请为服务配置可解析的 User 和 Group: %w", serviceUser, lookupErr)
+			return nil, i18n.Errorf("无法解析 Mihomo 服务用户 %q；请为服务配置可解析的 User 和 Group: %w", serviceUser, lookupErr)
 		}
 		groupName = account.Gid
 	}
 	group, err := lookupGroup(groupName)
 	if err != nil {
-		return nil, fmt.Errorf("无法解析 Mihomo 服务组 %q；请在 systemd 服务中配置现有的 Group: %w", groupName, err)
+		return nil, i18n.Errorf("无法解析 Mihomo 服务组 %q；请在 systemd 服务中配置现有的 Group: %w", groupName, err)
 	}
 	gid, err := strconv.Atoi(group.Gid)
 	if err != nil || gid < 0 {
-		return nil, fmt.Errorf("Mihomo 服务组 %q 的 GID 无效", groupName)
+		return nil, i18n.Errorf("Mihomo 服务组 %q 的 GID 无效", groupName)
 	}
 	return &platform.ConfigAccess{UID: 0, GID: gid, GroupReadable: true}, nil
 }
@@ -332,10 +332,10 @@ func waitForAppliedConfig(ctx context.Context, client *mihomo.Client, expected d
 			if len(drift) == 0 {
 				return nil
 			}
-			lastErr = fmt.Errorf("运行配置与期望值不一致: %s", strings.Join(drift, "、"))
+			lastErr = i18n.Errorf("运行配置与期望值不一致: %s", strings.Join(drift, ", "))
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("Mihomo 配置生效检查超时: %w", lastErr)
+			return i18n.Errorf("Mihomo 配置生效检查超时: %w", lastErr)
 		}
 		wait := min(200*time.Millisecond, time.Until(deadline))
 		select {
@@ -351,7 +351,7 @@ func (a *App) Service(ctx context.Context, action string) error {
 	switch action {
 	case "start", "stop", "restart", "enable", "disable", "enable-now":
 	default:
-		return fmt.Errorf("不支持的服务操作 %q", action)
+		return i18n.Errorf("不支持的服务操作 %q", action)
 	}
 	if !a.isRoot() {
 		if err := a.requireManagedInstallation(); err != nil {
@@ -393,7 +393,7 @@ func (a *App) Service(ctx context.Context, action string) error {
 
 func (a *App) SetMode(ctx context.Context, mode domain.Mode) error {
 	if mode != domain.ModeRule && mode != domain.ModeGlobal && mode != domain.ModeDirect {
-		return fmt.Errorf("无效运行模式 %q", mode)
+		return i18n.Errorf("无效运行模式 %q", mode)
 	}
 	if !a.isRoot() {
 		if err := a.requireManagedInstallation(); err != nil {
@@ -525,7 +525,7 @@ func (a *App) ValidateConfigValue(key, value string) error {
 	case "mixed-port":
 		port, err := strconv.Atoi(strings.TrimSpace(value))
 		if err != nil || port < 1 || port > 65535 {
-			return errors.New("mixed-port 必须是 1 到 65535")
+			return i18n.Errorf("mixed-port 必须是 1 到 65535")
 		}
 	case "allow-lan", "ipv6":
 		if _, err := parseToggle(value); err != nil {
@@ -535,10 +535,10 @@ func (a *App) ValidateConfigValue(key, value string) error {
 		switch strings.ToLower(strings.TrimSpace(value)) {
 		case "debug", "info", "warning", "error", "silent":
 		default:
-			return errors.New("log-level 必须是 debug、info、warning、error 或 silent")
+			return i18n.Errorf("log-level 必须是 debug、info、warning、error 或 silent")
 		}
 	default:
-		return fmt.Errorf("不支持设置 %q", key)
+		return i18n.Errorf("不支持设置 %q", key)
 	}
 	return nil
 }
@@ -556,7 +556,7 @@ func (a *App) changeSettingsRoot(ctx context.Context, mutate func(*domain.Manage
 	}
 	mutate(&state.Settings)
 	if state.Settings.MixedPort != nil && (*state.Settings.MixedPort < 1 || *state.Settings.MixedPort > 65535) {
-		return errors.New("mixed-port 必须是 1 到 65535")
+		return i18n.Errorf("mixed-port 必须是 1 到 65535")
 	}
 	config, err := store.ActiveConfig()
 	if err != nil {
@@ -604,6 +604,7 @@ func inferSettings(raw []byte) domain.ManagedSettings {
 	var source struct {
 		Mode      domain.Mode `yaml:"mode"`
 		MixedPort *int        `yaml:"mixed-port"`
+		Port      *int        `yaml:"port"`
 		AllowLAN  *bool       `yaml:"allow-lan"`
 		IPv6      *bool       `yaml:"ipv6"`
 		LogLevel  string      `yaml:"log-level"`
@@ -612,37 +613,52 @@ func inferSettings(raw []byte) domain.ManagedSettings {
 		} `yaml:"tun"`
 	}
 	_ = yaml.Unmarshal(raw, &source)
-	return domain.ManagedSettings{
+	if source.MixedPort == nil {
+		source.MixedPort = source.Port
+	}
+	return normalizeManagedSettings(domain.ManagedSettings{
 		Mode: source.Mode, TUN: source.TUN.Enable, MixedPort: source.MixedPort,
 		AllowLAN: source.AllowLAN, IPv6: source.IPv6, LogLevel: source.LogLevel,
+	})
+}
+
+func normalizeManagedSettings(settings domain.ManagedSettings) domain.ManagedSettings {
+	if settings.MixedPort == nil {
+		port := 7890
+		settings.MixedPort = &port
 	}
+	if settings.AllowLAN == nil {
+		allowLAN := false
+		settings.AllowLAN = &allowLAN
+	}
+	return settings
 }
 
 func randomSecret() (string, error) {
 	value := make([]byte, 32)
 	if _, err := rand.Read(value); err != nil {
-		return "", fmt.Errorf("生成控制器密钥失败: %w", err)
+		return "", i18n.Errorf("生成控制器密钥失败: %w", err)
 	}
 	return base64.RawURLEncoding.EncodeToString(value), nil
 }
 
 func validateLocalController(value string) error {
 	if strings.Contains(value, "://") {
-		return errors.New("控制器地址应使用 host:port 格式")
+		return i18n.Errorf("控制器地址应使用 host:port 格式")
 	}
 	host, portText, err := net.SplitHostPort(value)
 	if err != nil {
-		return fmt.Errorf("控制器地址无效: %w", err)
+		return i18n.Errorf("控制器地址无效: %w", err)
 	}
 	if host != "localhost" {
 		ip := net.ParseIP(host)
 		if ip == nil || !ip.IsLoopback() {
-			return errors.New("控制器只能监听回环地址")
+			return i18n.Errorf("控制器只能监听回环地址")
 		}
 	}
 	port, err := strconv.Atoi(portText)
 	if err != nil || port < 1 || port > 65535 {
-		return errors.New("控制器端口必须是 1 到 65535")
+		return i18n.Errorf("控制器端口必须是 1 到 65535")
 	}
 	return nil
 }
@@ -654,7 +670,7 @@ func parseToggle(value string) (bool, error) {
 	case "off", "false", "0", "no", "关闭":
 		return false, nil
 	default:
-		return false, fmt.Errorf("%q 不是有效开关值", value)
+		return false, i18n.Errorf("%q 不是有效开关值", value)
 	}
 }
 

@@ -3,7 +3,6 @@ package tui
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -12,6 +11,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"mihomoctl/internal/domain"
+	"mihomoctl/internal/i18n"
 )
 
 type page int
@@ -48,6 +48,7 @@ const (
 	settingAllowLAN  settingID = "allow-lan"
 	settingIPv6      settingID = "ipv6"
 	settingLogLevel  settingID = "log-level"
+	settingLanguage  settingID = "language"
 )
 
 var settingOrder = []settingID{
@@ -59,6 +60,7 @@ var settingOrder = []settingID{
 	settingMixedPort,
 	settingAllowLAN,
 	settingIPv6,
+	settingLanguage,
 	settingLogLevel,
 }
 
@@ -70,6 +72,7 @@ const (
 	pickerAllowLAN
 	pickerIPv6
 	pickerLogLevel
+	pickerLanguage
 )
 
 type pickerOption struct {
@@ -152,6 +155,7 @@ const (
 
 type sourceError struct {
 	message  string
+	err      error
 	sequence uint64
 }
 
@@ -178,6 +182,7 @@ type Model struct {
 	cancel     context.CancelFunc
 	backend    Backend
 	operations *operationTracker
+	language   i18n.Language
 
 	width  int
 	height int
@@ -277,6 +282,8 @@ type Model struct {
 	confirm              confirmMode
 	confirmTarget        confirmTarget
 	mutationGeneration   uint64
+	languageGeneration   uint64
+	languageSaving       bool
 	privilegedOperation  bool
 	authorizing          bool
 	runtimeMutation      bool
@@ -380,6 +387,11 @@ type trafficChannelsMsg struct {
 	generation uint64
 }
 type trafficReconnectMsg struct{ generation uint64 }
+type languageMsg struct {
+	language   i18n.Language
+	err        error
+	generation uint64
+}
 
 func New(ctx context.Context, backend Backend) Model {
 	if ctx == nil {
@@ -395,11 +407,23 @@ func New(ctx context.Context, backend Backend) Model {
 		cancel:          cancel,
 		backend:         backend,
 		operations:      newOperationTracker(),
+		language:        i18n.FromContext(ctx),
 		logLevel:        "info",
 		input:           input,
 		errors:          make(map[errorSource]sourceError),
 		proxyTestStates: make(map[string]map[string]proxyTestResult),
 	}
+}
+
+func (m Model) tr(key string, args ...any) string {
+	return i18n.T(m.language, key, args...)
+}
+
+func (m Model) languageName() string {
+	if m.language == i18n.English {
+		return "English"
+	}
+	return m.tr("简体中文")
 }
 
 var runTeaProgram = func(ctx context.Context, model Model) error {
@@ -919,7 +943,7 @@ func (m *Model) setSourceError(source errorSource, err error) {
 		m.errors = make(map[errorSource]sourceError)
 	}
 	m.errorSequence++
-	m.errors[source] = sourceError{message: err.Error(), sequence: m.errorSequence}
+	m.errors[source] = sourceError{message: err.Error(), err: err, sequence: m.errorSequence}
 	m.syncVisibleError()
 }
 
@@ -967,7 +991,7 @@ func (m *Model) syncVisibleError() {
 		}
 		if item.sequence >= latest {
 			latest = item.sequence
-			m.err = item.message
+			m.err = m.localizedSourceError(item)
 		}
 	}
 	if m.err != "" {
@@ -976,9 +1000,16 @@ func (m *Model) syncVisibleError() {
 	for _, item := range m.errors {
 		if item.sequence >= latest {
 			latest = item.sequence
-			m.err = item.message
+			m.err = m.localizedSourceError(item)
 		}
 	}
+}
+
+func (m Model) localizedSourceError(item sourceError) string {
+	if item.err != nil {
+		return i18n.Error(m.language, item.err)
+	}
+	return m.tr(item.message)
 }
 
 func foregroundErrorSource(source errorSource) bool {
@@ -995,13 +1026,37 @@ func (m *Model) showToast(message string, warning bool, now time.Time) {
 	if now.IsZero() {
 		now = time.Now()
 	}
-	m.toast = message
+	m.toast = m.tr(message)
 	m.toastWarning = warning
 	m.toastExpires = now.Add(toastLifetime)
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case languageMsg:
+		if msg.generation != m.languageGeneration {
+			return m, nil
+		}
+		m.loading = false
+		m.languageSaving = false
+		if msg.err != nil {
+			m.setSourceError(errorOperation, i18n.Errorf("保存语言偏好失败: %w", msg.err))
+			if m.quitPending {
+				return m, tea.Quit
+			}
+			return m, nil
+		}
+		m.language = msg.language
+		m.ctx = i18n.WithLanguage(m.ctx, msg.language)
+		m.inputError = ""
+		m.toast = ""
+		m.clearSourceError(errorOperation)
+		m.syncVisibleError()
+		m.showToast("语言已保存", false, time.Now())
+		if m.quitPending {
+			return m, tea.Quit
+		}
+		return m, nil
 	case bootstrapMsg:
 		now := time.Now()
 		return m, tea.Batch(
@@ -1239,7 +1294,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.confirmTarget = confirmTarget{}
 		warning := ""
 		if isOperationWarning(msg.err) {
-			warning = msg.err.Error()
+			warning = i18n.Error(m.language, msg.err)
 			msg.err = nil
 		}
 		if coreMutation {
@@ -1269,7 +1324,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.clearSourceError(errorOperation)
 		toast := msg.message
 		if warning != "" {
-			toast += "；" + warning
+			separator := "；"
+			if m.language == i18n.English {
+				separator = "; "
+			}
+			toast += separator + warning
 		}
 		m.showToast(toast, warning != "", time.Now())
 		if m.quitPending {
@@ -1302,7 +1361,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.clearSourceError(errorGroupTest)
 		stats := m.applyGroupDelaysAt(msg.group, msg.delays, completedAt)
-		message := stats.notice()
+		message := m.groupDelayNotice(stats)
 		if stats.total == 0 {
 			message = "测速完成，未找到策略组"
 		}
@@ -1320,7 +1379,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.logRetry = 0
 		m.clearSourceError(errorLogs)
 		if m.logCh == nil && m.logErrCh == nil {
-			return m, m.disconnectLogs(msg.generation, fmt.Errorf("日志流未返回数据通道"))
+			return m, m.disconnectLogs(msg.generation, i18n.Errorf("日志流未返回数据通道"))
 		}
 		var entryCmd, errorCmd tea.Cmd
 		if m.logCh != nil {
@@ -1375,7 +1434,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.trafficConnecting = false
 		m.trafficCh, m.trafficErrCh, m.trafficDone = msg.traffic, msg.errs, msg.done
 		if m.trafficCh == nil && m.trafficErrCh == nil {
-			return m, m.disconnectTraffic(msg.generation, fmt.Errorf("流量流未返回数据通道"))
+			return m, m.disconnectTraffic(msg.generation, i18n.Errorf("流量流未返回数据通道"))
 		}
 		var trafficCmd, errorCmd tea.Cmd
 		if m.trafficCh != nil {
@@ -1481,6 +1540,14 @@ func nonNegativeTraffic(value int64) int64 {
 
 func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
+	if m.languageSaving {
+		switch key {
+		case "ctrl+c", "q":
+			return m, m.requestQuit()
+		default:
+			return m, nil
+		}
+	}
 	if m.privilegedOperation {
 		switch key {
 		case "ctrl+c", "q":
@@ -1568,7 +1635,7 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.beginStatusRefresh(now, true), m.beginPageRefresh(m.page, now, true))
 	case "/":
 		if m.page == pageProxies || m.page == pageConnections || m.page == pageLogs {
-			return m, m.focusInput(inputFilter, "筛选", m.filter)
+			return m, m.focusInput(inputFilter, m.tr("筛选"), m.filter)
 		}
 	case "enter":
 		return m.activate()
@@ -1580,7 +1647,7 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	case "a":
 		if m.page == pageProfiles {
-			return m, m.focusInput(inputProfile, "订阅 URL、本地路径或节点 URI", "")
+			return m, m.focusInput(inputProfile, m.tr("订阅 URL、本地路径或节点 URI"), "")
 		}
 	case "u":
 		if m.page == pageProfiles && len(m.profiles) > 0 {
@@ -1590,7 +1657,7 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			if target.Active {
 				begin = m.beginPrivilegedCoreOperation
 			}
-			return m, begin("更新配置 "+name, "配置已更新", func(ctx context.Context) error {
+			return m, begin(m.tr("更新配置 %s", name), "配置已更新", func(ctx context.Context) error {
 				return m.backend.UpdateProfile(ctx, name)
 			})
 		}
@@ -1669,7 +1736,7 @@ func (m Model) updateInput(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if mode == inputMixedPort {
 				normalized, err := normalizeMixedPort(value)
 				if err != nil {
-					m.inputError = err.Error()
+					m.inputError = i18n.Error(m.language, err)
 					return m, nil
 				}
 				m.resetInput()
@@ -1684,7 +1751,8 @@ func (m Model) updateInput(msg tea.Msg) (tea.Model, tea.Cmd) {
 				begin = m.beginPrivilegedCoreOperation
 			}
 			return m, begin("添加配置", "配置已添加，请选中后按 Enter 激活", func(ctx context.Context) error {
-				return m.backend.AddProfile(ctx, "", value, 24*time.Hour)
+				_, err := m.backend.AddProfile(ctx, "", value, 24*time.Hour)
+				return err
 			})
 		}
 	}
@@ -1757,6 +1825,18 @@ func (m Model) updatePicker(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, m.beginPrivilegedConfigOperation("修改 IPv6 设置", "IPv6 设置已更新", string(settingIPv6), value)
 		case pickerLogLevel:
 			return m, m.beginPrivilegedConfigOperation("修改日志级别", "日志级别已更新", string(settingLogLevel), value)
+		case pickerLanguage:
+			language, err := i18n.Parse(value)
+			if err != nil {
+				return m, func() tea.Msg { return languageMsg{err: err, generation: m.languageGeneration} }
+			}
+			if language == m.language {
+				return m, nil
+			}
+			m.loading = true
+			m.languageSaving = true
+			m.languageGeneration++
+			return m, m.saveLanguage(language, m.languageGeneration)
 		}
 	}
 	return m, nil
@@ -1781,7 +1861,7 @@ func (m *Model) closePicker() {
 func (m Model) pickerOptions() []pickerOption {
 	switch m.picker {
 	case pickerTUN, pickerAllowLAN, pickerIPv6:
-		return []pickerOption{{label: "关闭", value: "off"}, {label: "开启", value: "on"}}
+		return []pickerOption{{label: m.tr("关闭"), value: "off"}, {label: m.tr("开启"), value: "on"}}
 	case pickerLogLevel:
 		return []pickerOption{
 			{label: "DEBUG", value: "debug"},
@@ -1790,8 +1870,23 @@ func (m Model) pickerOptions() []pickerOption {
 			{label: "ERROR", value: "error"},
 			{label: "SILENT", value: "silent"},
 		}
+	case pickerLanguage:
+		return []pickerOption{
+			{label: m.tr("简体中文"), value: string(i18n.Chinese)},
+			{label: "English", value: string(i18n.English)},
+		}
 	default:
 		return nil
+	}
+}
+
+func (m Model) saveLanguage(language i18n.Language, generation uint64) tea.Cmd {
+	preferences := i18n.PreferencesFromContext(m.ctx)
+	return func() tea.Msg {
+		if preferences == nil {
+			return languageMsg{err: i18n.Errorf("语言偏好不可用"), generation: generation}
+		}
+		return languageMsg{language: language, err: preferences.SaveLanguage(language), generation: generation}
 	}
 }
 
@@ -1894,7 +1989,7 @@ func (m *Model) syncInputWidth() {
 func normalizeMixedPort(value string) (string, error) {
 	port, err := strconv.Atoi(strings.TrimSpace(value))
 	if err != nil || port < 1 || port > 65535 {
-		return "", fmt.Errorf("端口必须是 1 到 65535")
+		return "", i18n.Errorf("端口必须是 1 到 65535")
 	}
 	return strconv.Itoa(port), nil
 }
@@ -1926,7 +2021,7 @@ func (m Model) activate() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		node := group.Proxies[nodes[min(m.proxyCursor, len(nodes)-1)].proxyIndex].Name
-		return m, m.beginOperation("已切换到 "+node, func(ctx context.Context) error {
+		return m, m.beginOperation(m.tr("已切换到 %s", node), func(ctx context.Context) error {
 			return m.backend.SelectProxy(ctx, group.Name, node)
 		})
 	case pageProfiles:
@@ -1936,7 +2031,7 @@ func (m Model) activate() (tea.Model, tea.Cmd) {
 			if profile.Active {
 				return m, nil
 			}
-			return m, m.beginPrivilegedCoreOperation("激活配置 "+name, "已启用 "+name, func(ctx context.Context) error {
+			return m, m.beginPrivilegedCoreOperation(m.tr("激活配置 %s", name), m.tr("已启用 %s", name), func(ctx context.Context) error {
 				return m.backend.UseProfile(ctx, name)
 			})
 		}
@@ -2037,6 +2132,9 @@ func (m Model) activateSetting() (tea.Model, tea.Cmd) {
 		}
 		m.openPicker(pickerLogLevel, current)
 		return m, nil
+	case settingLanguage:
+		m.openPicker(pickerLanguage, string(m.language))
+		return m, nil
 	}
 	return m, nil
 }
@@ -2057,7 +2155,7 @@ func (m Model) runConfirmed() (tea.Model, tea.Cmd) {
 		if target.name == "" {
 			return m, nil
 		}
-		return m, m.beginPrivilegedMetadataOperation("删除配置 "+target.name, "配置已删除", func(ctx context.Context) error { return m.backend.RemoveProfile(ctx, target.name) })
+		return m, m.beginPrivilegedMetadataOperation(m.tr("删除配置 %s", target.name), "配置已删除", func(ctx context.Context) error { return m.backend.RemoveProfile(ctx, target.name) })
 	case confirmCloseConnection:
 		if target.id == "" {
 			return m, nil
@@ -2545,12 +2643,12 @@ type groupDelayStats struct {
 	unknownSucceeded int
 }
 
-func (s groupDelayStats) notice() string {
-	kinds := fmt.Sprintf("叶%d/组%d/内置%d", s.leafSucceeded, s.groupSucceeded, s.builtinSucceeded)
+func (m Model) groupDelayNotice(s groupDelayStats) string {
+	kinds := m.tr("叶%d/组%d/内置%d", s.leafSucceeded, s.groupSucceeded, s.builtinSucceeded)
 	if s.unknownSucceeded > 0 {
-		kinds += fmt.Sprintf("/未知%d", s.unknownSucceeded)
+		kinds += m.tr("/未知%d", s.unknownSucceeded)
 	}
-	return fmt.Sprintf("测速：成功%d（%s）超时%d", s.succeeded, kinds, s.timedOut)
+	return m.tr("测速：成功%d（%s）超时%d", s.succeeded, kinds, s.timedOut)
 }
 
 func (m *Model) applyGroupDelays(group string, delays map[string]uint16) groupDelayStats {
@@ -2877,4 +2975,8 @@ func modeLabel(mode domain.Mode) string {
 		}
 		return string(mode)
 	}
+}
+
+func (m Model) modeLabel(mode domain.Mode) string {
+	return m.tr(modeLabel(mode))
 }

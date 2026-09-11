@@ -3,7 +3,6 @@ package app
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -14,6 +13,7 @@ import (
 	"go.yaml.in/yaml/v3"
 
 	"mihomoctl/internal/domain"
+	"mihomoctl/internal/i18n"
 	"mihomoctl/internal/platform"
 )
 
@@ -187,7 +187,7 @@ func loadYAML[T any](path string) (T, error) {
 		return value, err
 	}
 	if err := yaml.Unmarshal(content, &value); err != nil {
-		return value, &InvalidStateError{Cause: fmt.Errorf("读取 %s 失败: %w", path, err)}
+		return value, &InvalidStateError{Cause: i18n.Errorf("读取 %s 失败: %w", path, err)}
 	}
 	return value, nil
 }
@@ -195,14 +195,14 @@ func loadYAML[T any](path string) (T, error) {
 func writeYAML(path string, value any, mode os.FileMode) error {
 	content, err := yaml.Marshal(value)
 	if err != nil {
-		return fmt.Errorf("编码状态失败: %w", err)
+		return i18n.Errorf("编码状态失败: %w", err)
 	}
 	return atomicWrite(path, content, mode)
 }
 
 func atomicWrite(path string, content []byte, mode os.FileMode) error {
 	if int64(len(content)) > maxApplicationStateBytes {
-		return fmt.Errorf("写入 %s 失败: 状态文件超过 %d 字节上限", path, maxApplicationStateBytes)
+		return i18n.Errorf("写入 %s 失败: 状态文件超过 %d 字节上限", path, maxApplicationStateBytes)
 	}
 	return atomicWriteOwned(path, content, mode, -1, -1)
 }
@@ -210,7 +210,7 @@ func atomicWrite(path string, content []byte, mode os.FileMode) error {
 func atomicWriteOwned(path string, content []byte, mode os.FileMode, uid, gid int) error {
 	directory := filepath.Dir(path)
 	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return fmt.Errorf("创建目录 %s 失败: %w", directory, err)
+		return i18n.Errorf("创建目录 %s 失败: %w", directory, err)
 	}
 	temp, err := os.CreateTemp(directory, ".mihomoctl-*")
 	if err != nil {
@@ -260,7 +260,7 @@ func (a *App) loadState() error {
 		if err == nil {
 			err = yaml.Unmarshal(content, &state)
 			if err != nil {
-				err = &InvalidStateError{Cause: fmt.Errorf("读取 %s 失败: %w", a.paths.ConfigFile, err)}
+				err = &InvalidStateError{Cause: i18n.Errorf("读取 %s 失败: %w", a.paths.ConfigFile, err)}
 			}
 		}
 	} else {
@@ -270,8 +270,9 @@ func (a *App) loadState() error {
 		return err
 	}
 	if state.Version != stateVersion {
-		return &InvalidStateError{Cause: fmt.Errorf("不支持的 mihomoctl 状态版本 %d", state.Version)}
+		return &InvalidStateError{Cause: i18n.Errorf("不支持的 mihomoctl 状态版本 %d", state.Version)}
 	}
+	state.Settings = normalizeManagedSettings(state.Settings)
 	a.state = &state
 	a.stateLoadErr = nil
 	return nil
@@ -279,6 +280,7 @@ func (a *App) loadState() error {
 
 func (a *App) saveState(state persistedState) error {
 	state.Version = stateVersion
+	state.Settings = normalizeManagedSettings(state.Settings)
 	if err := writeYAML(a.paths.ConfigFile, state, 0o600); err != nil {
 		return err
 	}
@@ -288,7 +290,7 @@ func (a *App) saveState(state persistedState) error {
 }
 
 func (a *App) loadClient() error {
-	owner, err := planClientOwnership(a.paths.ClientFile)
+	owner, err := planClientOwnershipForEUID(a.paths.ClientFile, a.euid())
 	if err != nil {
 		return err
 	}
@@ -303,10 +305,10 @@ func (a *App) loadClient() error {
 	}
 	var client clientState
 	if err := yaml.Unmarshal(content, &client); err != nil {
-		return &InvalidStateError{Cause: fmt.Errorf("读取 %s 失败: %w", a.paths.ClientFile, err)}
+		return &InvalidStateError{Cause: i18n.Errorf("读取 %s 失败: %w", a.paths.ClientFile, err)}
 	}
 	if client.Version != stateVersion {
-		return &InvalidStateError{Cause: fmt.Errorf("不支持的客户端状态版本 %d", client.Version)}
+		return &InvalidStateError{Cause: i18n.Errorf("不支持的客户端状态版本 %d", client.Version)}
 	}
 	a.client = &client
 	a.clientLoadErr = nil
@@ -321,13 +323,13 @@ func (a *App) saveClient(state persistedState, activeProfile string) error {
 		Service:       state.Installation.Unit,
 		ActiveProfile: activeProfile,
 	}
-	owner, err := planClientOwnership(a.paths.ClientFile)
+	owner, err := planClientOwnershipForEUID(a.paths.ClientFile, a.euid())
 	if err != nil {
 		return err
 	}
 	content, err := yaml.Marshal(client)
 	if err != nil {
-		return fmt.Errorf("编码状态失败: %w", err)
+		return i18n.Errorf("编码状态失败: %w", err)
 	}
 	if owner == nil {
 		err = atomicWrite(a.paths.ClientFile, content, 0o600)
@@ -343,6 +345,13 @@ func (a *App) saveClient(state persistedState, activeProfile string) error {
 }
 
 func planClientOwnership(path string) (*clientOwnerPlan, error) {
+	return planClientOwnershipForEUID(path, os.Geteuid())
+}
+
+func planClientOwnershipForEUID(path string, euid int) (*clientOwnerPlan, error) {
+	if euid != 0 {
+		return nil, nil
+	}
 	uidText := strings.TrimSpace(os.Getenv("SUDO_UID"))
 	if uidText == "" {
 		return nil, nil
@@ -350,11 +359,11 @@ func planClientOwnership(path string) (*clientOwnerPlan, error) {
 	uid, uidErr := strconv.Atoi(uidText)
 	gid, gidErr := strconv.Atoi(strings.TrimSpace(os.Getenv("SUDO_GID")))
 	if uidErr != nil || gidErr != nil || uid < 0 || gid < 0 {
-		return nil, errors.New("sudo 用户身份无效")
+		return nil, i18n.Errorf("sudo 用户身份无效")
 	}
 	account, err := user.LookupId(uidText)
 	if err != nil {
-		return nil, fmt.Errorf("查找 sudo 用户失败: %w", err)
+		return nil, i18n.Errorf("查找 sudo 用户失败: %w", err)
 	}
 	home, err := filepath.Abs(account.HomeDir)
 	if err != nil {
@@ -362,7 +371,7 @@ func planClientOwnership(path string) (*clientOwnerPlan, error) {
 	}
 	resolvedHome, err := filepath.EvalSymlinks(home)
 	if err != nil {
-		return nil, fmt.Errorf("解析 sudo 用户主目录失败: %w", err)
+		return nil, i18n.Errorf("解析 sudo 用户主目录失败: %w", err)
 	}
 	target, err := filepath.Abs(path)
 	if err != nil {
@@ -370,7 +379,7 @@ func planClientOwnership(path string) (*clientOwnerPlan, error) {
 	}
 	relative, err := filepath.Rel(home, target)
 	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return nil, errors.New("客户端状态文件必须位于 sudo 用户主目录中")
+		return nil, i18n.Errorf("客户端状态文件必须位于 sudo 用户主目录中")
 	}
 	directory := filepath.Dir(relative)
 	components := []string(nil)
@@ -378,13 +387,13 @@ func planClientOwnership(path string) (*clientOwnerPlan, error) {
 		components = strings.Split(directory, string(filepath.Separator))
 		for _, component := range components {
 			if component == "" || component == "." || component == ".." {
-				return nil, errors.New("客户端状态路径无效")
+				return nil, i18n.Errorf("客户端状态路径无效")
 			}
 		}
 	}
 	filename := filepath.Base(relative)
 	if filename == "" || filename == "." || filename == ".." {
-		return nil, errors.New("客户端状态文件名无效")
+		return nil, i18n.Errorf("客户端状态文件名无效")
 	}
 	return &clientOwnerPlan{
 		uid: uid, gid: gid, home: resolvedHome,
@@ -394,10 +403,10 @@ func planClientOwnership(path string) (*clientOwnerPlan, error) {
 
 func (a *App) writePublicProfiles(profiles []domain.Profile) error {
 	if err := os.MkdirAll(a.paths.DataDir, 0o755); err != nil {
-		return fmt.Errorf("创建公开状态目录失败: %w", err)
+		return i18n.Errorf("创建公开状态目录失败: %w", err)
 	}
 	if err := os.Chmod(a.paths.DataDir, 0o755); err != nil {
-		return fmt.Errorf("设置公开状态目录权限失败: %w", err)
+		return i18n.Errorf("设置公开状态目录权限失败: %w", err)
 	}
 	public := make([]publicProfile, 0, len(profiles))
 	for _, item := range profiles {
@@ -411,11 +420,11 @@ func (a *App) writePublicProfiles(profiles []domain.Profile) error {
 	if a.state != nil && a.state.Installation.ConfigPath != "" {
 		content, err := platform.ReadManagedConfig(a.state.Installation.ConfigPath, platform.MaxManagedConfigBytes)
 		if err != nil {
-			return fmt.Errorf("读取活动 Mihomo 配置失败: %w", err)
+			return i18n.Errorf("读取活动 Mihomo 配置失败: %w", err)
 		}
 		settings, err := effectiveConfigFromYAML(content)
 		if err != nil {
-			return fmt.Errorf("读取活动 Mihomo 设置失败: %w", err)
+			return i18n.Errorf("读取活动 Mihomo 设置失败: %w", err)
 		}
 		state.Settings = &settings
 	}
@@ -460,10 +469,10 @@ func (a *App) readPublicState() (publicState, error) {
 	}
 	var state publicState
 	if err := json.Unmarshal(content, &state); err != nil {
-		return publicState{}, &InvalidStateError{Cause: fmt.Errorf("读取公开状态失败: %w", err)}
+		return publicState{}, &InvalidStateError{Cause: i18n.Errorf("读取公开状态失败: %w", err)}
 	}
 	if state.SchemaVersion != stateVersion {
-		return publicState{}, &InvalidStateError{Cause: fmt.Errorf("不支持的公开状态版本 %d", state.SchemaVersion)}
+		return publicState{}, &InvalidStateError{Cause: i18n.Errorf("不支持的公开状态版本 %d", state.SchemaVersion)}
 	}
 	return state, nil
 }

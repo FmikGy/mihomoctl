@@ -8,6 +8,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
+	"mihomoctl/internal/i18n"
 	"mihomoctl/internal/platform"
 )
 
@@ -124,18 +125,18 @@ func (m *Model) beginOperationAttemptWithCore(action, message, configKey, config
 func (m Model) retryPrivilegedOperation(msg operationMsg) tea.Cmd {
 	if msg.retry == nil {
 		return func() tea.Msg {
-			msg.err = errors.New("无法重试管理员操作")
+			msg.err = i18n.Errorf("无法重试管理员操作")
 			msg.interactive = true
 			return msg
 		}
 	}
 	command := &interactiveOperationCommand{
-		ctx: m.ctx, action: msg.action, run: msg.retry,
+		ctx: m.ctx, action: msg.action, language: m.language, run: msg.retry,
 		ticket: reserveOperation(m.operations),
 	}
 	return execInteractiveOperation(command, func(err error) tea.Msg {
 		if err != nil && !command.started {
-			err = fmt.Errorf("无法打开 sudo 授权终端: %w", err)
+			err = i18n.Errorf("无法打开 sudo 授权终端: %w", err)
 		}
 		msg.err = err
 		msg.interactive = true
@@ -148,14 +149,15 @@ func (m Model) retryPrivilegedOperation(msg operationMsg) tea.Cmd {
 // operation asks sudo for a password. Bubble Tea's input is forwarded to the
 // nested operation; sudo itself reads passwords from the controlling terminal.
 type interactiveOperationCommand struct {
-	ctx     context.Context
-	action  string
-	run     func(context.Context) error
-	stdin   io.Reader
-	stdout  io.Writer
-	stderr  io.Writer
-	started bool
-	ticket  operationTicket
+	ctx      context.Context
+	action   string
+	language i18n.Language
+	run      func(context.Context) error
+	stdin    io.Reader
+	stdout   io.Writer
+	stderr   io.Writer
+	started  bool
+	ticket   operationTicket
 }
 
 func (c *interactiveOperationCommand) Run() error {
@@ -169,7 +171,7 @@ func (c *interactiveOperationCommand) Run() error {
 		writer = c.stderr
 	}
 	if writer != nil {
-		_, _ = fmt.Fprintln(writer, authorizationPrompt(c.action))
+		_, _ = fmt.Fprintln(writer, authorizationPromptForLanguage(c.language, c.action))
 	}
 	ctx := platform.WithInteractiveElevation(c.ctx)
 	ctx = platform.WithElevationInput(ctx, c.stdin)
@@ -181,9 +183,13 @@ func (c *interactiveOperationCommand) SetStdout(stdout io.Writer) { c.stdout = s
 func (c *interactiveOperationCommand) SetStderr(stderr io.Writer) { c.stderr = stderr }
 
 func authorizationPrompt(action string) string {
-	action = truncate(action, 20)
+	return authorizationPromptForLanguage(i18n.Chinese, action)
+}
+
+func authorizationPromptForLanguage(language i18n.Language, action string) string {
+	action = truncate(i18n.T(language, action), 20)
 	if action == "" {
-		action = "执行此操作"
+		action = i18n.T(language, "执行此操作")
 	}
-	return fmt.Sprintf("mihomoctl：sudo 验证后自动继续：“%s”", action)
+	return i18n.T(language, "mihomoctl：sudo 验证后自动继续：“%s”", action)
 }

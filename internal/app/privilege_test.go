@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"mihomoctl/internal/domain"
+	"mihomoctl/internal/i18n"
 	"mihomoctl/internal/platform"
 	"mihomoctl/internal/profile"
 )
@@ -60,14 +61,14 @@ func privilegeTestApp(executor PrivilegeExecutor, euid int) *App {
 }
 
 func expectedPrivilegeArgs(nonInteractive bool, preserve []string, args ...string) []string {
-	result := make([]string, 0, len(args)+4)
+	result := make([]string, 0, len(args)+6)
 	if nonInteractive {
 		result = append(result, "-n")
 	}
 	if len(preserve) > 0 {
 		result = append(result, "--preserve-env="+strings.Join(preserve, ","))
 	}
-	result = append(result, "--", "/usr/bin/mihomoctl")
+	result = append(result, "--", "/usr/bin/mihomoctl", "--lang", "zh")
 	return append(result, args...)
 }
 
@@ -96,6 +97,18 @@ func TestRunElevatedUsesNonInteractiveSudoForTUIAttempt(t *testing.T) {
 	}
 	if !reflect.DeepEqual(executor.command.Env, wantEnv) {
 		t.Fatalf("command environment = %#v, want %#v", executor.command.Env, wantEnv)
+	}
+}
+
+func TestRunElevatedPropagatesInvocationLanguage(t *testing.T) {
+	executor := &recordingPrivilegeExecutor{}
+	application := privilegeTestApp(executor, 1000)
+	ctx := platform.WithNonInteractiveElevation(i18n.WithLanguage(context.Background(), i18n.English))
+	if err := application.runElevated(ctx, []string{"service", "start"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := executor.command.Args; len(got) < 6 || got[3] != "--lang" || got[4] != "en" {
+		t.Fatalf("elevated arguments did not propagate English: %#v", got)
 	}
 }
 
@@ -174,7 +187,8 @@ func TestProtectedApplicationMethodsUseExpectedElevatedArguments(t *testing.T) {
 		{name: "profile use", run: func(a *App, ctx context.Context) error { return a.UseProfile(ctx, "daily") }, want: []string{"--output", "json", "profile", "use", "--", "daily"}},
 		{name: "profile remove", run: func(a *App, ctx context.Context) error { return a.RemoveProfile(ctx, "old") }, want: []string{"--output", "json", "profile", "remove", "--", "old"}},
 		{name: "profile add", run: func(a *App, ctx context.Context) error {
-			return a.AddProfile(ctx, "daily", "https://example.test/sub", time.Hour)
+			_, err := a.AddProfile(ctx, "daily", "https://example.test/sub", time.Hour)
+			return err
 		}, want: []string{"profile", "add", "-", "--interval", "1h0m0s", "--output", "json", "--name", "daily"}},
 		{name: "initialize", run: func(a *App, ctx context.Context) error {
 			return a.Initialize(ctx, domain.InitOptions{
@@ -196,6 +210,9 @@ func TestProtectedApplicationMethodsUseExpectedElevatedArguments(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			executor := &recordingPrivilegeExecutor{}
+			if test.name == "profile add" {
+				executor.stdout = `{"schema_version":1,"data":{"id":"profile-id","name":"daily","kind":"remote","active":false,"update_interval":"1h0m0s"}}`
+			}
 			application := privilegeTestApp(executor, 1000)
 			application.client = &clientState{}
 			application.runner = &fakeRunner{}
@@ -290,12 +307,19 @@ func TestAddLocalProfileSnapshotsBeforeElevation(t *testing.T) {
 	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	executor := &recordingPrivilegeExecutor{readStdin: true}
+	executor := &recordingPrivilegeExecutor{
+		readStdin: true,
+		stdout:    `{"schema_version":1,"data":{"id":"profile-id","name":"local-profile","kind":"local","active":false,"update_interval":"0s"}}`,
+	}
 	application := privilegeTestApp(executor, 1000)
 	application.client = &clientState{}
 
-	if err := application.AddProfile(context.Background(), "", path, time.Hour); err != nil {
+	created, err := application.AddProfile(context.Background(), "", path, time.Hour)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if created.Name != "local-profile" || created.Kind != domain.ProfileLocal || created.UpdateInterval != 0 {
+		t.Fatalf("elevated profile result = %#v", created)
 	}
 	if executor.calls != 1 || !strings.HasPrefix(executor.stdin, profile.InlineSnapshotPrefix) {
 		t.Fatalf("local profile was not sent as a snapshot: calls=%d stdin prefix=%t", executor.calls, strings.HasPrefix(executor.stdin, profile.InlineSnapshotPrefix))

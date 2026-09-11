@@ -15,7 +15,27 @@ import (
 
 	appbackend "mihomoctl/internal/app"
 	"mihomoctl/internal/domain"
+	"mihomoctl/internal/i18n"
 )
+
+type languagePreferences struct {
+	language i18n.Language
+	saves    int
+	err      error
+}
+
+func (preferences *languagePreferences) LoadLanguage() (i18n.Language, error) {
+	return preferences.language, preferences.err
+}
+
+func (preferences *languagePreferences) SaveLanguage(language i18n.Language) error {
+	if preferences.err != nil {
+		return preferences.err
+	}
+	preferences.language = language
+	preferences.saves++
+	return nil
+}
 
 type cliPrivilegeExecutor struct {
 	command appbackend.PrivilegeCommand
@@ -133,9 +153,13 @@ func (f *fakeBackend) TestGroup(context.Context, string) (map[string]uint16, err
 	return f.delaysValue, f.err
 }
 
-func (f *fakeBackend) AddProfile(_ context.Context, name, source string, interval time.Duration) error {
+func (f *fakeBackend) AddProfile(_ context.Context, name, source string, interval time.Duration) (domain.Profile, error) {
 	f.add = addCall{name: name, source: source, interval: interval}
-	return f.err
+	createdName := name
+	if createdName == "" {
+		createdName = "generated-profile"
+	}
+	return domain.Profile{Name: createdName, Kind: domain.ProfileRemote, UpdateInterval: interval}, f.err
 }
 
 func (f *fakeBackend) UpdateProfile(context.Context, string) error { return f.err }
@@ -218,6 +242,110 @@ func runCommandWithInput(t *testing.T, backend Backend, input string, args ...st
 	command.SetArgs(args)
 	err := command.ExecuteContext(context.Background())
 	return stdout.String(), stderr.String(), err
+}
+
+func TestLanguageFlagLocalizesHelpTablesAndValidation(t *testing.T) {
+	backend := &fakeBackend{statusValue: domain.RuntimeStatus{
+		Service: domain.ServiceStatus{State: "running", Active: true},
+		Mode:    domain.ModeRule, MixedPort: 7890,
+	}}
+
+	stdout, _, err := runCommand(t, backend, "--lang", "en", "--help")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"A concise command-line controller", "Show runtime status", "Language for this invocation", "Usage:", "Available Commands:", "Show help for this command"} {
+		if !strings.Contains(stdout, expected) {
+			t.Fatalf("English help missing %q:\n%s", expected, stdout)
+		}
+	}
+	if strings.Contains(stdout, "显示运行状态") || strings.Contains(stdout, "用法:") {
+		t.Fatalf("English help retained Chinese command text:\n%s", stdout)
+	}
+
+	stdout, _, err = runCommand(t, backend, "--lang=en", "status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout, "Item") || !strings.Contains(stdout, "Core version") || !strings.Contains(stdout, "Yes") {
+		t.Fatalf("English status table = %q", stdout)
+	}
+
+	var output bytes.Buffer
+	command, application := newCommand(backend, &output, io.Discard, i18n.English, nil)
+	command.SetArgs([]string{"mode", "invalid"})
+	err = command.ExecuteContext(context.Background())
+	if got := i18n.Error(application.language, err); !strings.Contains(got, "unknown mode") || strings.Contains(got, "未知模式") {
+		t.Fatalf("English validation error = %q", got)
+	}
+
+	command, application = newCommand(backend, io.Discard, io.Discard, i18n.English, nil)
+	command.SetArgs([]string{"proxy", "select", " ", "node"})
+	err = command.ExecuteContext(context.Background())
+	if got := i18n.Error(application.language, err); got != "Group cannot be empty" {
+		t.Fatalf("English blank argument error = %q", got)
+	}
+
+	backend.err = i18n.Errorf("配置名称 %q 已存在", "Daily")
+	command, application = newCommand(backend, io.Discard, io.Discard, i18n.English, nil)
+	command.SetArgs([]string{"profile", "add", "https://example.com/subscription"})
+	err = command.ExecuteContext(context.Background())
+	if got := i18n.Error(application.language, err); got != `profile name "Daily" already exists` {
+		t.Fatalf("English backend error = %q", got)
+	}
+}
+
+func TestLanguageCommandPersistsWithoutMutatingBackend(t *testing.T) {
+	backend := &fakeBackend{}
+	preferences := &languagePreferences{language: i18n.Chinese}
+	var stdout bytes.Buffer
+	command, _ := newCommand(backend, &stdout, io.Discard, i18n.Chinese, preferences)
+	command.SetArgs([]string{"language", "en", "--output", "json"})
+	if err := command.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if preferences.language != i18n.English || preferences.saves != 1 {
+		t.Fatalf("saved preference = %q, saves=%d", preferences.language, preferences.saves)
+	}
+	if !strings.Contains(stdout.String(), `"language":"en"`) {
+		t.Fatalf("language JSON = %q", stdout.String())
+	}
+	if backend.initCalls != 0 || len(backend.serviceActions) != 0 || backend.config != (configCall{}) {
+		t.Fatalf("language command mutated backend: %#v", backend)
+	}
+
+	preferences.saves = 0
+	stdout.Reset()
+	command, _ = newCommand(backend, &stdout, io.Discard, i18n.Chinese, preferences)
+	command.SetArgs([]string{"--lang", "en", "language"})
+	if err := command.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if preferences.saves != 0 || strings.TrimSpace(stdout.String()) != "English" {
+		t.Fatalf("invocation override persisted or rendered incorrectly: saves=%d output=%q", preferences.saves, stdout.String())
+	}
+}
+
+func TestDoctorLocalizesOnlyStructuredMessages(t *testing.T) {
+	backend := &fakeBackend{doctorValue: []domain.DoctorCheck{
+		{Name: "活动配置", OK: true, Message: "规则"},
+		{Name: "mihomoctl 初始化", Message: "尚未初始化", MessageKey: "尚未初始化"},
+		{Name: "控制器 API", Message: "规则", MessageError: errors.New("规则")},
+	}}
+	stdout, _, err := runCommand(t, backend, "--lang", "en", "doctor", "--output", "json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Data []domain.DoctorCheck `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Data) != 3 || result.Data[0].Name != "Active profile" || result.Data[0].Message != "规则" ||
+		result.Data[1].Message != "Not initialized" || result.Data[2].Message != "规则" {
+		t.Fatalf("localized doctor output = %#v", result.Data)
+	}
 }
 
 func TestCommandRoutingAndFlags(t *testing.T) {
@@ -324,6 +452,25 @@ func TestCommandRoutingAndFlags(t *testing.T) {
 		}
 		if backend.add.name != "stdin" || backend.add.source != source {
 			t.Fatalf("add call = %#v", backend.add)
+		}
+	})
+
+	t.Run("generated profile name is returned", func(t *testing.T) {
+		backend := &fakeBackend{}
+		stdout, _, err := runCommand(t, backend, "profile", "add", "https://example.test/subscription", "--output", "json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result struct {
+			Data struct {
+				Name string `json:"name"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+			t.Fatal(err)
+		}
+		if result.Data.Name != "generated-profile" {
+			t.Fatalf("generated profile name = %q", result.Data.Name)
 		}
 	})
 
@@ -614,7 +761,7 @@ func TestRootWithoutTTYShowsHelp(t *testing.T) {
 	if backend.tuiRuns != 0 {
 		t.Fatalf("RunTUI calls = %d", backend.tuiRuns)
 	}
-	if !strings.Contains(stdout, "Usage:") || !strings.Contains(stdout, "mihomoctl") {
+	if !strings.Contains(stdout, "用法:") || strings.Contains(stdout, "Usage:") || !strings.Contains(stdout, "mihomoctl") {
 		t.Fatalf("help output = %q", stdout)
 	}
 }
@@ -643,7 +790,7 @@ func TestRootRequiresBothInputAndOutputTTY(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if checks != 2 || backend.tuiRuns != 0 || !strings.Contains(stdout, "Usage:") {
+	if checks != 2 || backend.tuiRuns != 0 || !strings.Contains(stdout, "用法:") {
 		t.Fatalf("checks=%d tuiRuns=%d output=%q", checks, backend.tuiRuns, stdout)
 	}
 }

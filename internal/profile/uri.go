@@ -505,8 +505,24 @@ func applyURLTransport(config map[string]any, q url.Values) error {
 		config["ws-opts"] = opts
 	case "grpc":
 		config["grpc-opts"] = map[string]any{"grpc-service-name": queryFirst(q, "serviceName", "servicename")}
-	case "http", "h2":
-		config["http-opts"] = map[string]any{"path": []string{q.Get("path")}, "headers": map[string]any{"Host": []string{q.Get("host")}}}
+	case "http":
+		opts := map[string]any{}
+		if path := q.Get("path"); path != "" {
+			opts["path"] = []string{path}
+		}
+		if hosts := splitCSV(q.Get("host")); len(hosts) > 0 {
+			opts["headers"] = map[string]any{"Host": hosts}
+		}
+		config["http-opts"] = opts
+	case "h2":
+		opts := map[string]any{}
+		if path := q.Get("path"); path != "" {
+			opts["path"] = path
+		}
+		if hosts := splitCSV(q.Get("host")); len(hosts) > 0 {
+			opts["host"] = hosts
+		}
+		config["h2-opts"] = opts
 	default:
 		return fmt.Errorf("unsupported transport %q", network)
 	}

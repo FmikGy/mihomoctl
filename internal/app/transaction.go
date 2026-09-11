@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,6 +10,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"mihomoctl/internal/i18n"
 )
 
 const operationRollbackTimeout = 30 * time.Second
@@ -43,7 +44,7 @@ func (a *App) captureFiles(paths ...string) ([]fileCheckpoint, error) {
 			if plan != nil {
 				checkpoint, err := captureOwnedClientFile(path, plan)
 				if err != nil {
-					return nil, fmt.Errorf("保存 %s 的回滚点失败: %w", path, err)
+					return nil, i18n.Errorf("保存 %s 的回滚点失败: %w", path, err)
 				}
 				checkpoints = append(checkpoints, checkpoint)
 				continue
@@ -55,11 +56,11 @@ func (a *App) captureFiles(paths ...string) ([]fileCheckpoint, error) {
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("保存 %s 的回滚点失败: %w", path, err)
+			return nil, i18n.Errorf("保存 %s 的回滚点失败: %w", path, err)
 		}
 		stat, ok := info.Sys().(*syscall.Stat_t)
 		if !ok {
-			return nil, fmt.Errorf("无法读取 %s 的所有权", path)
+			return nil, i18n.Errorf("无法读取 %s 的所有权", path)
 		}
 		checkpoints = append(checkpoints, fileCheckpoint{
 			path: path, exists: true, data: data, mode: info.Mode().Perm(),
@@ -71,7 +72,7 @@ func (a *App) captureFiles(paths ...string) ([]fileCheckpoint, error) {
 
 func readRegularFileNoFollow(path string, limit int64) ([]byte, os.FileInfo, error) {
 	if limit < 0 {
-		return nil, nil, errors.New("文件大小上限无效")
+		return nil, nil, i18n.Errorf("文件大小上限无效")
 	}
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -80,17 +81,17 @@ func readRegularFileNoFollow(path string, limit int64) ([]byte, os.FileInfo, err
 	file := os.NewFile(uintptr(fd), path)
 	if file == nil {
 		_ = unix.Close(fd)
-		return nil, nil, errors.New("打开文件描述符失败")
+		return nil, nil, i18n.Errorf("打开文件描述符失败")
 	}
 	info, err := file.Stat()
 	if err != nil {
 		return nil, nil, errors.Join(err, file.Close())
 	}
 	if !info.Mode().IsRegular() {
-		return nil, nil, errors.Join(errors.New("文件必须是普通文件"), file.Close())
+		return nil, nil, errors.Join(i18n.Errorf("文件必须是普通文件"), file.Close())
 	}
 	if info.Size() > limit {
-		return nil, nil, errors.Join(errors.New("文件超过大小上限"), file.Close())
+		return nil, nil, errors.Join(i18n.Errorf("文件超过大小上限"), file.Close())
 	}
 	content, readErr := io.ReadAll(io.LimitReader(file, limit+1))
 	closeErr := file.Close()
@@ -98,7 +99,7 @@ func readRegularFileNoFollow(path string, limit int64) ([]byte, os.FileInfo, err
 		return nil, nil, err
 	}
 	if int64(len(content)) > limit {
-		return nil, nil, errors.New("文件超过大小上限")
+		return nil, nil, i18n.Errorf("文件超过大小上限")
 	}
 	return content, info, nil
 }
@@ -108,22 +109,22 @@ func restoreFiles(checkpoints []fileCheckpoint) error {
 	for _, checkpoint := range checkpoints {
 		if checkpoint.clientPlan != nil {
 			if err := restoreOwnedClientFile(checkpoint); err != nil {
-				restoreErrors = append(restoreErrors, fmt.Errorf("恢复 %s 失败: %w", checkpoint.path, err))
+				restoreErrors = append(restoreErrors, i18n.Errorf("恢复 %s 失败: %w", checkpoint.path, err))
 			}
 			continue
 		}
 		if checkpoint.exists {
 			if err := atomicWriteOwned(checkpoint.path, checkpoint.data, checkpoint.mode, checkpoint.uid, checkpoint.gid); err != nil {
-				restoreErrors = append(restoreErrors, fmt.Errorf("恢复 %s 失败: %w", checkpoint.path, err))
+				restoreErrors = append(restoreErrors, i18n.Errorf("恢复 %s 失败: %w", checkpoint.path, err))
 			}
 			continue
 		}
 		if err := os.Remove(checkpoint.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			restoreErrors = append(restoreErrors, fmt.Errorf("移除 %s 失败: %w", checkpoint.path, err))
+			restoreErrors = append(restoreErrors, i18n.Errorf("移除 %s 失败: %w", checkpoint.path, err))
 			continue
 		}
 		if err := syncParentDirectory(checkpoint.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			restoreErrors = append(restoreErrors, fmt.Errorf("同步 %s 失败: %w", filepath.Dir(checkpoint.path), err))
+			restoreErrors = append(restoreErrors, i18n.Errorf("同步 %s 失败: %w", filepath.Dir(checkpoint.path), err))
 		}
 	}
 	return errors.Join(restoreErrors...)
@@ -183,7 +184,7 @@ func (stack *rollbackStack) fail(ctx context.Context, cause error) error {
 	for index := len(stack.steps) - 1; index >= 0; index-- {
 		step := stack.steps[index]
 		if err := step.run(rollbackCtx); err != nil {
-			errs = append(errs, fmt.Errorf("%s回滚失败: %w", step.name, err))
+			errs = append(errs, i18n.Errorf("%s回滚失败: %w", i18n.M(step.name), err))
 		}
 	}
 	return errors.Join(errs...)

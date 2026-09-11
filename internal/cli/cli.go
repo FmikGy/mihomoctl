@@ -16,8 +16,10 @@ import (
 
 	"github.com/charmbracelet/x/term"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"mihomoctl/internal/domain"
+	"mihomoctl/internal/i18n"
 	"mihomoctl/internal/profile"
 	"mihomoctl/internal/tui"
 )
@@ -37,6 +39,52 @@ var logSampleTimeout = 2 * time.Second
 var isTerminalStream = func(stream any) bool {
 	file, ok := stream.(interface{ Fd() uintptr })
 	return ok && term.IsTerminal(file.Fd())
+}
+
+const cliHelpTemplate = `{{with (or .Long .Short)}}{{. | trimTrailingWhitespaces}}
+
+{{end}}{{if or .Runnable .HasSubCommands}}{{.UsageString}}{{end}}`
+
+const cliUsageTemplateEnglish = `Usage:{{if .Runnable}}
+  {{.UseLine}}{{end}}{{if .HasAvailableSubCommands}}
+  {{.CommandPath}} [command]{{end}}{{if gt (len .Aliases) 0}}
+
+Aliases:
+  {{.NameAndAliases}}{{end}}{{if .HasExample}}
+
+Examples:
+{{.Example}}{{end}}{{if .HasAvailableSubCommands}}{{$cmds := .Commands}}
+
+Available Commands:{{range $cmds}}{{if (or .IsAvailableCommand (eq .Name "help"))}}
+  {{rpad .Name .NamePadding }} {{.Short}}{{end}}{{end}}{{end}}{{if .HasAvailableLocalFlags}}
+
+Flags:
+{{.LocalFlags.FlagUsages | trimTrailingWhitespaces}}{{end}}{{if .HasAvailableInheritedFlags}}
+
+Global Flags:
+{{.InheritedFlags.FlagUsages | trimTrailingWhitespaces}}{{end}}{{if .HasHelpSubCommands}}
+
+Additional help topics:{{range .Commands}}{{if .IsAdditionalHelpTopicCommand}}
+  {{rpad .CommandPath .CommandPathPadding}} {{.Short}}{{end}}{{end}}{{end}}{{if .HasAvailableSubCommands}}
+
+Use "{{.CommandPath}} [command] --help" for more information about a command.{{end}}
+`
+
+func cliUsageTemplate(language i18n.Language) string {
+	if language == i18n.English {
+		return cliUsageTemplateEnglish
+	}
+	return strings.NewReplacer(
+		"Usage:", "用法:",
+		"Aliases:", "别名:",
+		"Examples:", "示例:",
+		"Available Commands:", "可用命令:",
+		"Global Flags:", "全局选项:",
+		"Flags:", "选项:",
+		"Additional help topics:", "其他帮助主题:",
+		`Use "{{.CommandPath}} [command] --help" for more information about a command.`,
+		`使用 "{{.CommandPath}} [command] --help" 查看命令详情。`,
+	).Replace(cliUsageTemplateEnglish)
 }
 
 // Backend contains application operations without any CLI presentation concerns.
@@ -104,22 +152,61 @@ func onlyWarnings(err error) bool {
 }
 
 type application struct {
-	backend Backend
-	stdout  io.Writer
-	stderr  io.Writer
-	output  string
-	noColor bool
+	backend      Backend
+	stdout       io.Writer
+	stderr       io.Writer
+	output       string
+	noColor      bool
+	language     i18n.Language
+	preferences  i18n.Preferences
+	root         *cobra.Command
+	commandTexts map[*cobra.Command]commandText
+	flagTexts    map[string]string
 }
+
+type commandText struct {
+	short   string
+	long    string
+	example string
+}
+
+type languageValue struct{ application *application }
+
+func (value languageValue) String() string {
+	if value.application == nil {
+		return string(i18n.Chinese)
+	}
+	return string(value.application.language)
+}
+
+func (value languageValue) Set(raw string) error {
+	language, err := i18n.Parse(raw)
+	if err != nil {
+		return errors.New(i18n.Error(value.application.language, err))
+	}
+	value.application.setLanguage(language)
+	return nil
+}
+
+func (languageValue) Type() string { return "language" }
 
 // New constructs the full mihomoctl command tree.
 func New(backend Backend, stdout, stderr io.Writer) *cobra.Command {
+	root, _ := newCommand(backend, stdout, stderr, i18n.Chinese, nil)
+	return root
+}
+
+func newCommand(backend Backend, stdout, stderr io.Writer, language i18n.Language, preferences i18n.Preferences) (*cobra.Command, *application) {
 	if stdout == nil {
 		stdout = io.Discard
 	}
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	a := &application{backend: backend, stdout: stdout, stderr: stderr, output: "table"}
+	a := &application{
+		backend: backend, stdout: stdout, stderr: stderr, output: "table",
+		language: language, preferences: preferences,
+	}
 
 	root := &cobra.Command{
 		Use:           "mihomoctl",
@@ -146,7 +233,11 @@ func New(backend Backend, stdout, stderr io.Writer) *cobra.Command {
 			}
 			return cmd.Help()
 		},
-		PersistentPreRunE: func(_ *cobra.Command, _ []string) error {
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			cmd.SetContext(i18n.WithLanguage(cmd.Context(), a.language))
+			if a.preferences != nil {
+				cmd.SetContext(i18n.WithPreferences(cmd.Context(), a.preferences))
+			}
 			switch a.output {
 			case "table", "json":
 				return nil
@@ -162,6 +253,7 @@ func New(backend Backend, stdout, stderr io.Writer) *cobra.Command {
 	})
 	root.PersistentFlags().StringVarP(&a.output, "output", "o", "table", "输出格式：table 或 json")
 	root.PersistentFlags().BoolVar(&a.noColor, "no-color", false, "禁用彩色输出")
+	root.PersistentFlags().Var(languageValue{application: a}, "lang", "本次运行的语言：zh 或 en")
 
 	root.AddCommand(
 		a.initCommand(),
@@ -176,19 +268,25 @@ func New(backend Backend, stdout, stderr io.Writer) *cobra.Command {
 		a.logsCommand(),
 		a.scheduleCommand(),
 		a.doctorCommand(),
+		a.languageCommand(),
 		a.completionCommand(root),
 		a.versionCommand(),
 	)
-	return root
+	initializeHelpTexts(root)
+	a.root = root
+	a.captureTexts(root)
+	a.setLanguage(language)
+	return root, a
 }
 
 // Execute runs mihomoctl, writes failures to stderr, and returns a stable exit
 // code suitable for os.Exit.
 func Execute(ctx context.Context, backend Backend, stdout, stderr io.Writer) int {
-	cmd := New(backend, stdout, stderr)
+	language := i18n.FromContext(ctx)
+	cmd, application := newCommand(backend, stdout, stderr, language, i18n.PreferencesFromContext(ctx))
 	if err := cmd.ExecuteContext(ctx); err != nil {
 		if stderr != nil {
-			fmt.Fprintf(stderr, "mihomoctl: %s\n", cleanCell(err.Error()))
+			fmt.Fprintf(stderr, "mihomoctl: %s\n", cleanCell(i18n.Error(application.language, err)))
 		}
 		return exitCode(err)
 	}
@@ -213,7 +311,73 @@ func exitCode(err error) int {
 }
 
 func invalidf(format string, args ...any) error {
-	return &ExitError{Code: ExitInvalid, Err: fmt.Errorf(format, args...)}
+	return &ExitError{Code: ExitInvalid, Err: i18n.Errorf(format, args...)}
+}
+
+func (a *application) tr(key string, args ...any) string {
+	return i18n.T(a.language, key, args...)
+}
+
+func (a *application) captureTexts(root *cobra.Command) {
+	a.commandTexts = make(map[*cobra.Command]commandText)
+	a.flagTexts = make(map[string]string)
+	var visit func(*cobra.Command)
+	visit = func(command *cobra.Command) {
+		a.commandTexts[command] = commandText{short: command.Short, long: command.Long, example: command.Example}
+		command.LocalNonPersistentFlags().VisitAll(func(flag *pflag.Flag) {
+			a.flagTexts[command.CommandPath()+"\x00"+flag.Name] = flag.Usage
+		})
+		command.PersistentFlags().VisitAll(func(flag *pflag.Flag) {
+			a.flagTexts[command.CommandPath()+"\x00"+flag.Name] = flag.Usage
+		})
+		for _, child := range command.Commands() {
+			visit(child)
+		}
+	}
+	visit(root)
+}
+
+func (a *application) setLanguage(language i18n.Language) {
+	a.language = language
+	if a.root == nil {
+		return
+	}
+	a.root.SetHelpTemplate(cliHelpTemplate)
+	a.root.SetUsageTemplate(cliUsageTemplate(language))
+	for command, source := range a.commandTexts {
+		command.Short = i18n.T(language, source.short)
+		command.Long = i18n.T(language, source.long)
+		command.Example = i18n.T(language, source.example)
+		command.LocalNonPersistentFlags().VisitAll(func(flag *pflag.Flag) {
+			if text, ok := a.flagTexts[command.CommandPath()+"\x00"+flag.Name]; ok {
+				flag.Usage = i18n.T(language, text)
+			}
+		})
+		command.PersistentFlags().VisitAll(func(flag *pflag.Flag) {
+			if text, ok := a.flagTexts[command.CommandPath()+"\x00"+flag.Name]; ok {
+				flag.Usage = i18n.T(language, text)
+			}
+		})
+	}
+}
+
+func initializeHelpTexts(root *cobra.Command) {
+	root.InitDefaultHelpCmd()
+	var visit func(*cobra.Command)
+	visit = func(command *cobra.Command) {
+		command.InitDefaultHelpFlag()
+		if flag := command.Flags().Lookup("help"); flag != nil {
+			flag.Usage = "显示此命令的帮助"
+		}
+		for _, child := range command.Commands() {
+			if child.Name() == "help" {
+				child.Short = "查看任意命令的帮助"
+				child.Long = "查看指定命令的完整帮助。"
+			}
+			visit(child)
+		}
+	}
+	visit(root)
 }
 
 func (a *application) initCommand() *cobra.Command {
@@ -291,7 +455,7 @@ func (a *application) serviceCommand() *cobra.Command {
 				if err := a.backend.Service(cmd.Context(), action); err != nil {
 					return err
 				}
-				return a.writeResult(map[string]any{"action": action}, serviceDescription(action)+"完成")
+				return a.writeResult(map[string]any{"action": action}, a.tr("%s完成", a.tr(serviceDescription(action))))
 			},
 		})
 	}
@@ -339,7 +503,7 @@ func (a *application) modeCommand() *cobra.Command {
 			if err := a.backend.SetMode(cmd.Context(), mode); err != nil {
 				return err
 			}
-			return a.writeResult(map[string]any{"mode": mode}, "模式已切换为 "+string(mode))
+			return a.writeResult(map[string]any{"mode": mode}, a.tr("模式已切换为 %s", mode))
 		},
 	}
 }
@@ -358,7 +522,8 @@ func (a *application) tunCommand() *cobra.Command {
 			if err := a.backend.SetTUN(cmd.Context(), enabled); err != nil {
 				return err
 			}
-			return a.writeResult(map[string]any{"tun": enabled}, "TUN 已"+map[bool]string{true: "启用", false: "关闭"}[enabled])
+			state := map[bool]string{true: "启用", false: "关闭"}[enabled]
+			return a.writeResult(map[string]any{"tun": enabled}, a.tr("TUN 已%s", a.tr(state)))
 		},
 	}
 }
@@ -389,7 +554,7 @@ func (a *application) configCommand() *cobra.Command {
 			if err := a.backend.SetConfig(cmd.Context(), key, value); err != nil {
 				return err
 			}
-			return a.writeResult(map[string]any{"key": key, "value": value}, key+" 已更新")
+			return a.writeResult(map[string]any{"key": key, "value": value}, a.tr("%s 已更新", key))
 		},
 	})
 	cmd.AddCommand(&cobra.Command{
@@ -494,7 +659,7 @@ func (a *application) proxyCommand() *cobra.Command {
 			if err := a.backend.SelectProxy(cmd.Context(), args[0], args[1]); err != nil {
 				return err
 			}
-			return a.writeResult(map[string]any{"group": args[0], "proxy": args[1]}, args[0]+" 已切换到 "+args[1])
+			return a.writeResult(map[string]any{"group": args[0], "proxy": args[1]}, a.tr("%s 已切换到 %s", args[0], args[1]))
 		},
 	})
 	cmd.AddCommand(&cobra.Command{
@@ -567,13 +732,17 @@ func (a *application) profileCommand() *cobra.Command {
 					immutable = true
 				}
 			}
-			if err := a.backend.AddProfile(cmd.Context(), name, source, interval); err != nil {
+			created, err := a.backend.AddProfile(cmd.Context(), name, source, interval)
+			if err != nil {
 				return err
 			}
 			result := map[string]any{
-				"name":            name,
+				"id":              created.ID,
+				"name":            created.Name,
+				"kind":            created.Kind,
+				"active":          created.Active,
 				"source_added":    true,
-				"update_interval": interval.String(),
+				"update_interval": created.UpdateInterval.String(),
 				"immutable":       immutable,
 			}
 			message := "配置已添加"
@@ -642,7 +811,7 @@ func (a *application) profileCommand() *cobra.Command {
 					if action != "use" || !onlyWarnings(err) {
 						return err
 					}
-					warning = err.Error()
+					warning = i18n.Error(a.language, err)
 				}
 				return a.writeWarningResult(map[string]any{"action": action, "name": args[0]}, map[string]string{"use": "配置已激活", "remove": "配置已删除"}[action], warning)
 			},
@@ -712,7 +881,7 @@ func (a *application) logsCommand() *cobra.Command {
 			defer cancelLogs()
 			entries, errs := a.backend.WatchLogs(logContext, level)
 			if entries == nil && errs == nil {
-				return errors.New("日志流不可用")
+				return i18n.Errorf("日志流不可用")
 			}
 			var sampleTimer *time.Timer
 			var sampleExpired <-chan time.Time
@@ -811,6 +980,40 @@ func (a *application) doctorCommand() *cobra.Command {
 	return cmd
 }
 
+func (a *application) languageCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:       "language [zh|en]",
+		Aliases:   []string{"lang"},
+		Short:     "查看或设置界面语言",
+		Args:      maximumArgs(1),
+		ValidArgs: []string{string(i18n.Chinese), string(i18n.English)},
+		RunE: func(_ *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				return a.writeResult(map[string]string{"language": string(a.language)}, a.tr(languageName(a.language)))
+			}
+			language, err := i18n.Parse(args[0])
+			if err != nil {
+				return &ExitError{Code: ExitInvalid, Err: err}
+			}
+			if a.preferences == nil {
+				return i18n.Errorf("语言偏好不可用")
+			}
+			if err := a.preferences.SaveLanguage(language); err != nil {
+				return i18n.Errorf("保存语言偏好失败: %w", err)
+			}
+			a.setLanguage(language)
+			return a.writeResult(map[string]string{"language": string(language)}, a.tr("语言已保存：%s", a.tr(languageName(language))))
+		},
+	}
+}
+
+func languageName(language i18n.Language) string {
+	if language == i18n.English {
+		return "English"
+	}
+	return "简体中文"
+}
+
 func (a *application) completionCommand(root *cobra.Command) *cobra.Command {
 	return &cobra.Command{
 		Use:       "completion <bash|zsh|fish>",
@@ -865,7 +1068,7 @@ func sortedKeys[V any](values map[string]V) []string {
 func readProfileInput(reader io.Reader) (string, error) {
 	content, err := io.ReadAll(io.LimitReader(reader, int64(maxProfileInput+1)))
 	if err != nil {
-		return "", fmt.Errorf("读取标准输入失败: %w", err)
+		return "", i18n.Errorf("读取标准输入失败: %w", err)
 	}
 	if len(content) > maxProfileInput || (len(content) > maxProfileSourceInput && !bytes.HasPrefix(content, []byte(profile.InlineSnapshotPrefix))) {
 		return "", invalidf("标准输入不能超过 10 MiB")
@@ -881,7 +1084,7 @@ func runWithNoColor(run func() error) (err error) {
 		return run()
 	}
 	if err := os.Setenv("NO_COLOR", "1"); err != nil {
-		return fmt.Errorf("设置 NO_COLOR 失败: %w", err)
+		return i18n.Errorf("设置 NO_COLOR 失败: %w", err)
 	}
 	defer func() { err = errors.Join(err, os.Unsetenv("NO_COLOR")) }()
 	return run()
@@ -889,7 +1092,7 @@ func runWithNoColor(run func() error) (err error) {
 
 func requireNonBlank(name, value string) error {
 	if strings.TrimSpace(value) == "" {
-		return invalidf("%s不能为空", name)
+		return invalidf("%s不能为空", i18n.M(name))
 	}
 	return nil
 }

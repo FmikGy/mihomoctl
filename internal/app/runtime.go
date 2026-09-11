@@ -3,12 +3,12 @@ package app
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sort"
 	"sync"
 	"time"
 
 	"mihomoctl/internal/domain"
+	"mihomoctl/internal/i18n"
 	"mihomoctl/internal/mihomo"
 	"mihomoctl/internal/platform"
 	"mihomoctl/internal/profile"
@@ -181,7 +181,7 @@ func (a *App) CoreStatus(ctx context.Context) (domain.RuntimeStatus, error) {
 		a.mu.Unlock()
 	}
 	if versionErr != nil || configErr != nil {
-		status.CoreVersion = "控制器不可用"
+		status.CoreVersion = ""
 		return status, &UnavailableError{Message: "Mihomo 控制器不可用", Cause: errors.Join(versionErr, configErr)}
 	}
 	return status, nil
@@ -198,11 +198,11 @@ func effectiveStoredConfig(state persistedState, store *profile.Store) (domain.E
 		Settings:           state.Settings,
 	})
 	if err != nil {
-		return domain.EffectiveConfig{}, fmt.Errorf("生成活动配置状态失败: %w", err)
+		return domain.EffectiveConfig{}, i18n.Errorf("生成活动配置状态失败: %w", err)
 	}
 	effective, err := effectiveConfigFromYAML(managed)
 	if err != nil {
-		return domain.EffectiveConfig{}, fmt.Errorf("读取活动配置状态失败: %w", err)
+		return domain.EffectiveConfig{}, i18n.Errorf("读取活动配置状态失败: %w", err)
 	}
 	return effective, nil
 }
@@ -263,10 +263,10 @@ func (a *App) OverviewTelemetry(ctx context.Context) (tui.OverviewTelemetry, err
 	}
 	var telemetryErrors []error
 	if memoryErr != nil {
-		telemetryErrors = append(telemetryErrors, controllerError(fmt.Errorf("读取内存失败: %w", memoryErr)))
+		telemetryErrors = append(telemetryErrors, controllerError(i18n.Errorf("读取内存失败: %w", memoryErr)))
 	}
 	if connectionsErr != nil {
-		telemetryErrors = append(telemetryErrors, controllerError(fmt.Errorf("读取连接失败: %w", connectionsErr)))
+		telemetryErrors = append(telemetryErrors, controllerError(i18n.Errorf("读取连接失败: %w", connectionsErr)))
 	}
 	if err := errors.Join(telemetryErrors...); err != nil {
 		return telemetry, err
@@ -471,12 +471,12 @@ func (a *App) WatchTraffic(ctx context.Context) (<-chan domain.Traffic, <-chan e
 		close(streamDone)
 		select {
 		case <-watchdogExpired:
-			err = fmt.Errorf("流量流在 %s 内没有返回数据", trafficNoSampleTimeout)
+			err = i18n.Errorf("流量流在 %s 内没有返回数据", trafficNoSampleTimeout)
 		default:
 		}
 		if err != nil && ctx.Err() == nil {
 			select {
-			case errorsCh <- controllerError(fmt.Errorf("流量流已断开: %w", err)):
+			case errorsCh <- controllerError(i18n.Errorf("流量流已断开: %w", err)):
 			default:
 			}
 		}
@@ -510,7 +510,7 @@ func (a *App) WatchLogs(ctx context.Context, level string) (<-chan domain.LogEnt
 		})
 		if err != nil && ctx.Err() == nil {
 			select {
-			case errorsCh <- controllerError(fmt.Errorf("日志流已断开: %w", err)):
+			case errorsCh <- controllerError(i18n.Errorf("日志流已断开: %w", err)):
 			default:
 			}
 		}

@@ -3,7 +3,6 @@ package mihomo
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net"
 	"net/http"
 	"net/url"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"mihomoctl/internal/domain"
+	"mihomoctl/internal/i18n"
 )
 
 // ConnectionSnapshot is a point-in-time response from /connections.
@@ -137,7 +137,7 @@ func (c *Client) StreamConnections(
 	consume func(ConnectionSnapshot) error,
 ) error {
 	if interval < 0 {
-		return errors.New("连接刷新间隔不能为负数")
+		return i18n.Errorf("连接刷新间隔不能为负数")
 	}
 	query := url.Values{}
 	if interval > 0 {
@@ -149,7 +149,7 @@ func (c *Client) StreamConnections(
 
 func (c *Client) CloseConnection(ctx context.Context, id string) error {
 	if strings.TrimSpace(id) == "" {
-		return errors.New("连接 ID 不能为空")
+		return i18n.Errorf("连接 ID 不能为空")
 	}
 	return doNoContent(ctx, c, http.MethodDelete, []string{"connections", id}, url.Values{}, nil)
 }

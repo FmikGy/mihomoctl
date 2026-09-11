@@ -14,6 +14,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"mihomoctl/internal/domain"
+	"mihomoctl/internal/i18n"
 )
 
 type palette struct {
@@ -52,10 +53,10 @@ func (m Model) View() tea.View {
 
 func (m Model) render() string {
 	if m.width == 0 || m.height == 0 {
-		return "正在载入 mihomoctl..."
+		return m.tr("正在载入 mihomoctl...")
 	}
 	if m.width < 60 || m.height < 16 {
-		return centeredBlock("终端空间不足\n至少需要 60 × 16", m.width, m.height)
+		return centeredBlock(m.tr("终端空间不足\n至少需要 60 × 16"), m.width, m.height)
 	}
 
 	content := strings.Join([]string{
@@ -79,33 +80,33 @@ func (m Model) render() string {
 func (m Model) renderHeader() string {
 	c := colors()
 	brand := lipgloss.NewStyle().Bold(true).Foreground(c.text).Render("MIHOMOCTL")
-	state, stateColor := "已停止", c.muted
+	state, stateColor := m.tr("已停止"), c.muted
 	if m.status.Service.Active {
-		state, stateColor = "运行中", c.good
+		state, stateColor = m.tr("运行中"), c.good
 	}
 	if _, unavailable := m.errors[errorStatus]; unavailable && !serviceStatusAvailable(m.status.Service) {
-		state, stateColor = "不可用", c.bad
+		state, stateColor = m.tr("不可用"), c.bad
 	}
 	status := lipgloss.NewStyle().Foreground(stateColor).Render("● " + state)
 	profileValueWidth := max(4, m.width-lipgloss.Width(brand)-lipgloss.Width(status)-12)
-	profile := lipgloss.NewStyle().Foreground(c.muted).Render("配置 ") +
-		lipgloss.NewStyle().Foreground(c.text).Render(truncate(empty(m.status.ActiveProfile, "未接管"), profileValueWidth))
+	profile := lipgloss.NewStyle().Foreground(c.muted).Render(m.tr("配置 ")) +
+		lipgloss.NewStyle().Foreground(c.text).Render(truncate(empty(m.status.ActiveProfile, m.tr("未接管")), profileValueWidth))
 	first := joinSides(brand+"  "+status, profile, m.width-2)
 
-	modePrefix := "模式 "
+	modePrefix := m.tr("模式 ")
 	if m.width < 90 {
 		modePrefix = ""
 	}
 	mode := lipgloss.NewStyle().Foreground(c.muted).Render(modePrefix) +
-		lipgloss.NewStyle().Foreground(c.text).Render(modeLabel(m.status.Mode))
+		lipgloss.NewStyle().Foreground(c.text).Render(m.modeLabel(m.status.Mode))
 	tunColor := c.muted
 	if m.status.TUN {
 		tunColor = c.good
 	}
-	tun := lipgloss.NewStyle().Foreground(tunColor).Render("TUN " + compactOnOff(m.status.TUN))
+	tun := lipgloss.NewStyle().Foreground(tunColor).Render("TUN " + m.tr(compactOnOff(m.status.TUN)))
 	left := mode + "  " + tun
 	if m.width >= 90 {
-		left += "  " + lipgloss.NewStyle().Foreground(c.muted).Render("端口 "+portLabel(m.status.MixedPort))
+		left += "  " + lipgloss.NewStyle().Foreground(c.muted).Render(m.tr("端口 ")+m.portLabel(m.status.MixedPort))
 	}
 	rates := lipgloss.NewStyle().Foreground(c.accent).Render("↓ "+formatRate(m.status.Traffic.Down)) + "  " +
 		lipgloss.NewStyle().Foreground(c.good).Render("↑ "+formatRate(m.status.Traffic.Up))
@@ -124,7 +125,7 @@ func (m Model) renderTabs() string {
 		if i < m.width%len(pageNames) {
 			cellWidth++
 		}
-		label := centerText(name, cellWidth)
+		label := centerText(m.pageName(page(i), name), cellWidth)
 		style := lipgloss.NewStyle().Foreground(c.muted)
 		if page(i) == m.page {
 			style = style.Foreground(c.accent).Background(c.surfaceAlt).Bold(true)
@@ -136,6 +137,13 @@ func (m Model) renderTabs() string {
 	}
 	rule := lipgloss.NewStyle().Foreground(c.border).Render(strings.Repeat("─", m.width))
 	return fitLine(strings.Join(parts, ""), m.width) + "\n" + rule
+}
+
+func (m Model) pageName(current page, chinese string) string {
+	if m.language == i18n.English && current == pageConnections {
+		return "Conns"
+	}
+	return m.tr(chinese)
 }
 
 func (m Model) renderBody() string {
@@ -164,14 +172,14 @@ func (m Model) renderOverview(height int) string {
 	innerHeight := max(0, height-2)
 	chartHeight := max(2, innerHeight-6)
 	rows := []string{
-		titleLine("实时速度", trafficWindowLabel(m.trafficHistory), contentWidth),
+		titleLine(m.tr("实时速度"), m.trafficWindowLabel(m.trafficHistory), contentWidth),
 	}
 	if chartHeight < 6 {
 		graphWidth := max(8, contentWidth-39)
 		down, up, downPeak, upPeak := trafficChartSeries(m.trafficHistory, graphWidth)
 		rows = append(rows,
-			trafficChartLine("↓ 下载", m.status.Traffic.Down, downPeak, trafficSparkline(down, graphWidth, downPeak), c.accent, contentWidth),
-			trafficChartLine("↑ 上传", m.status.Traffic.Up, upPeak, trafficSparkline(up, graphWidth, upPeak), c.good, contentWidth),
+			m.trafficChartLine(m.tr("↓ 下载"), m.status.Traffic.Down, downPeak, trafficSparkline(down, graphWidth, downPeak), c.accent, contentWidth),
+			m.trafficChartLine(m.tr("↑ 上传"), m.status.Traffic.Up, upPeak, trafficSparkline(up, graphWidth, upPeak), c.good, contentWidth),
 		)
 		for len(rows) < chartHeight+1 {
 			rows = append(rows, "")
@@ -182,24 +190,24 @@ func (m Model) renderOverview(height int) string {
 		down, up, downPeak, upPeak := trafficChartSeries(m.trafficHistory, plotWidth)
 		downHeight := chartHeight / 2
 		upHeight := chartHeight - downHeight
-		rows = append(rows, trafficAreaChartRows("↓ 下载", m.status.Traffic.Down, downPeak, down, contentWidth, downHeight, c.accent)...)
-		rows = append(rows, trafficAreaChartRows("↑ 上传", m.status.Traffic.Up, upPeak, up, contentWidth, upHeight, c.good)...)
+		rows = append(rows, m.trafficAreaChartRows(m.tr("↓ 下载"), m.status.Traffic.Down, downPeak, down, contentWidth, downHeight, c.accent)...)
+		rows = append(rows, m.trafficAreaChartRows(m.tr("↑ 上传"), m.status.Traffic.Up, upPeak, up, contentWidth, upHeight, c.good)...)
 	}
 	rows = append(rows,
 		overviewColumns(contentWidth,
-			overviewMetric("累计下载", formatBytes(m.status.Traffic.DownTotal)),
-			overviewMetric("累计上传", formatBytes(m.status.Traffic.UpTotal))),
+			overviewMetric(m.tr("累计下载"), formatBytes(m.status.Traffic.DownTotal)),
+			overviewMetric(m.tr("累计上传"), formatBytes(m.status.Traffic.UpTotal))),
 		overviewColumns(contentWidth,
-			overviewMetric("活动连接", fmt.Sprintf("%d", m.status.ConnectionCount)),
-			overviewMetric("内存", formatBytes(m.status.Memory))),
-		titleLine("运行状态", serviceDetail(m.status.Service), contentWidth),
+			overviewMetric(m.tr("活动连接"), fmt.Sprintf("%d", m.status.ConnectionCount)),
+			overviewMetric(m.tr("内存"), formatBytes(m.status.Memory))),
+		titleLine(m.tr("运行状态"), serviceDetail(m.status.Service), contentWidth),
 		overviewColumns(contentWidth,
-			overviewMetric("活动配置", empty(m.status.ActiveProfile, "未接管")),
-			overviewMetric("核心版本", empty(m.status.CoreVersion, "未连接"))),
+			overviewMetric(m.tr("活动配置"), empty(m.status.ActiveProfile, m.tr("未接管"))),
+			overviewMetric(m.tr("核心版本"), empty(m.status.CoreVersion, m.tr("未连接")))),
 		overviewColumns(contentWidth,
-			overviewMetric("模式", modeLabel(m.status.Mode)),
-			overviewMetric("TUN", onOff(m.status.TUN)),
-			overviewMetric("混合端口", portLabel(m.status.MixedPort))),
+			overviewMetric(m.tr("模式"), m.modeLabel(m.status.Mode)),
+			overviewMetric("TUN", m.tr(onOff(m.status.TUN))),
+			overviewMetric(m.tr("混合端口"), m.portLabel(m.status.MixedPort))),
 	)
 	return renderPage(rows, m.width, height)
 }
@@ -276,26 +284,26 @@ func trafficSparkline(values []int64, width int, peak int64) string {
 	return string(result)
 }
 
-func trafficChartLine(label string, rate, peak int64, graph string, chartColor color.Color, width int) string {
+func (m Model) trafficChartLine(label string, rate, peak int64, graph string, chartColor color.Color, width int) string {
 	c := colors()
 	labelText := lipgloss.NewStyle().Bold(true).Foreground(chartColor).Render(padRight(label, 7))
 	rateText := lipgloss.NewStyle().Foreground(c.text).Render(padLeft(formatRate(rate), 11))
-	peakText := lipgloss.NewStyle().Foreground(c.muted).Render("  峰 " + padLeft(formatRate(peak), 11) + "  ")
+	peakText := lipgloss.NewStyle().Foreground(c.muted).Render("  " + m.tr("峰") + " " + padLeft(formatRate(peak), 11) + "  ")
 	available := max(0, width-lipgloss.Width(labelText)-lipgloss.Width(rateText)-lipgloss.Width(peakText))
 	chart := ansi.Truncate(graph, available, "")
 	chart = padRight(chart, available)
 	return labelText + rateText + peakText + lipgloss.NewStyle().Foreground(chartColor).Render(chart)
 }
 
-func trafficAreaChartRows(label string, rate, peak int64, values []int64, width, height int, chartColor color.Color) []string {
+func (m Model) trafficAreaChartRows(label string, rate, peak int64, values []int64, width, height int, chartColor color.Color) []string {
 	if height <= 0 {
 		return nil
 	}
 	c := colors()
 	header := joinSides(
 		lipgloss.NewStyle().Bold(true).Foreground(chartColor).Render(label),
-		lipgloss.NewStyle().Foreground(c.text).Render("当前 "+formatRate(rate))+"  "+
-			lipgloss.NewStyle().Foreground(c.muted).Render("峰 "+formatRate(peak)),
+		lipgloss.NewStyle().Foreground(c.text).Render(m.tr("当前 ")+formatRate(rate))+"  "+
+			lipgloss.NewStyle().Foreground(c.muted).Render(m.tr("峰 ")+formatRate(peak)),
 		width,
 	)
 	if height == 1 {
@@ -379,15 +387,15 @@ func formatCompactRate(bytes int64) string {
 	return formatCompactBytes(bytes) + "/s"
 }
 
-func trafficWindowLabel(history []trafficSample) string {
+func (m Model) trafficWindowLabel(history []trafficSample) string {
 	if len(history) < 2 || history[0].at.IsZero() || !history[len(history)-1].at.After(history[0].at) {
-		return "最近样本"
+		return m.tr("最近样本")
 	}
 	duration := history[len(history)-1].at.Sub(history[0].at).Round(time.Second)
 	if duration < time.Minute {
-		return fmt.Sprintf("最近 %d 秒", max(1, int(duration/time.Second)))
+		return m.tr("最近 %d 秒", max(1, int(duration/time.Second)))
 	}
-	return fmt.Sprintf("最近 %.1f 分钟", duration.Minutes())
+	return m.tr("最近 %.1f 分钟", duration.Minutes())
 }
 
 func serviceDetail(service domain.ServiceStatus) string {
@@ -425,11 +433,11 @@ func overviewColumns(width int, cells ...string) string {
 func (m Model) renderProxies(height int) string {
 	groups := m.currentGroupViews()
 	if len(groups) == 0 {
-		detail := "启动 Mihomo 或添加有效配置"
+		detail := m.tr("启动 Mihomo 或添加有效配置")
 		if m.filter != "" && len(m.groups) > 0 {
-			detail = "没有匹配当前筛选条件的策略组"
+			detail = m.tr("没有匹配当前筛选条件的策略组")
 		}
-		return emptyState("没有可用策略组", detail, m.width, height)
+		return emptyState(m.tr("没有可用策略组"), detail, m.width, height)
 	}
 	groupIndex := clamp(m.groupCursor, 0, len(groups)-1)
 	groupView := groups[groupIndex]
@@ -437,14 +445,14 @@ func (m Model) renderProxies(height int) string {
 	nodes := groupView.proxies
 	nodeStart, nodeEnd := viewportBounds(len(nodes), m.proxyCursor, m.proxyOffset, m.proxyListCapacity())
 	rowWidth := max(1, m.width-4)
-	position := fmt.Sprintf("组 %s  节点 %s", listPosition(groupIndex, len(groups)), listPosition(m.proxyCursor, len(nodes)))
+	position := m.tr("组 %s  节点 %s", listPosition(groupIndex, len(groups)), listPosition(m.proxyCursor, len(nodes)))
 	lines := []string{
-		titleLine("策略组 · "+group.Name, position, rowWidth),
+		titleLine(m.tr("策略组 · ")+group.Name, position, rowWidth),
 		m.proxyGroupViewSelector(groups, groupIndex, rowWidth),
-		proxyTableHeader(rowWidth),
+		m.proxyTableHeader(rowWidth),
 	}
 	if len(nodes) == 0 {
-		lines = append(lines, mutedLine("没有匹配节点", rowWidth))
+		lines = append(lines, mutedLine(m.tr("没有匹配节点"), rowWidth))
 	}
 	for i := nodeStart; i < nodeEnd; i++ {
 		proxyIndex := nodes[i].proxyIndex
@@ -561,13 +569,13 @@ func padDualWidth(value string, width int) string {
 
 func (m Model) renderProfiles(height int) string {
 	if len(m.profiles) == 0 {
-		return emptyState("还没有配置", "按 a 添加订阅、本地文件或节点链接", m.width, height)
+		return emptyState(m.tr("还没有配置"), m.tr("按 a 添加订阅、本地文件或节点链接"), m.width, height)
 	}
 	rowWidth := max(1, m.width-4)
-	nameWidth, widths := profileColumnWidths(rowWidth - 2)
+	nameWidth, widths := m.profileColumnWidths(rowWidth - 2)
 	lines := []string{
-		titleLine("配置", listPosition(m.profileCursor, len(m.profiles)), rowWidth),
-		tableHeader([]string{"", "名称", "类型", "更新时间", "额度", "到期"}, widths, rowWidth),
+		titleLine(m.tr("配置"), listPosition(m.profileCursor, len(m.profiles)), rowWidth),
+		tableHeader([]string{"", m.tr("名称"), m.tr("类型"), m.tr("更新时间"), m.tr("额度"), m.tr("到期")}, widths, rowWidth),
 	}
 	start, end := viewportBounds(len(m.profiles), m.profileCursor, m.profileOffset, m.listCapacity())
 	for i := start; i < end; i++ {
@@ -580,12 +588,12 @@ func (m Model) renderProfiles(height int) string {
 		if !profile.LastUpdated.IsZero() {
 			updated = profile.LastUpdated.Local().Format("01-02 15:04")
 		}
-		kind := map[domain.ProfileKind]string{domain.ProfileLocal: "本地", domain.ProfileRemote: "订阅", domain.ProfileURI: "节点"}[profile.Kind]
+		kind := map[domain.ProfileKind]string{domain.ProfileLocal: m.tr("本地"), domain.ProfileRemote: m.tr("订阅"), domain.ProfileURI: m.tr("节点")}[profile.Kind]
 		if kind == "" {
-			kind = "其他"
+			kind = m.tr("其他")
 		}
-		quota, quotaColor := profileQuota(profile.Subscription)
-		expiry, expiryColor := profileExpiry(profile.Subscription.Expire)
+		quota, quotaColor := m.profileQuota(profile.Subscription)
+		expiry, expiryColor := m.profileExpiry(profile.Subscription.Expire)
 		cells := []tableCell{
 			{text: state, width: widths[0], foreground: colors().accent, bold: profile.Active},
 			{text: profile.Name, width: nameWidth},
@@ -602,18 +610,18 @@ func (m Model) renderProfiles(height int) string {
 func (m Model) renderConnections(height int) string {
 	connections := m.currentConnectionViews()
 	if len(connections) == 0 {
-		detail := "连接建立后会自动显示"
+		detail := m.tr("连接建立后会自动显示")
 		if m.filter != "" && len(m.connections) > 0 {
-			detail = "没有匹配当前筛选条件的连接"
+			detail = m.tr("没有匹配当前筛选条件的连接")
 		}
-		return emptyState("当前没有活动连接", detail, m.width, height)
+		return emptyState(m.tr("当前没有活动连接"), detail, m.width, height)
 	}
 	rowWidth := max(1, m.width-4)
 	targetWidth, processWidth, ruleWidth := connectionColumnWidths(rowWidth - 2)
 	widths := []int{targetWidth, processWidth, 11, ruleWidth}
 	lines := []string{
-		titleLine("活动连接", listPosition(m.connectionCursor, len(connections)), rowWidth),
-		tableHeader([]string{"目标", "进程 / 网络", "流量", "规则"}, widths, rowWidth),
+		titleLine(m.tr("活动连接"), listPosition(m.connectionCursor, len(connections)), rowWidth),
+		tableHeader([]string{m.tr("目标"), m.tr("进程 / 网络"), m.tr("流量"), m.tr("规则")}, widths, rowWidth),
 	}
 	start, end := viewportBounds(len(connections), m.connectionCursor, m.connectionOffset, m.listCapacity())
 	for i := start; i < end; i++ {
@@ -639,29 +647,29 @@ func (m Model) renderLogs(height int) string {
 	logCount := m.logViewLen()
 	state := strings.ToUpper(empty(m.logLevel, "info"))
 	if !m.status.Service.Active {
-		state += "  服务已停止"
+		state += "  " + m.tr("服务已停止")
 	} else if m.logConnecting {
-		state += "  连接中"
+		state += "  " + m.tr("连接中")
 	} else if m.logReconnectPending {
-		state += "  重连中"
+		state += "  " + m.tr("重连中")
 	}
 	if m.logPaused {
-		state += "  已暂停"
+		state += "  " + m.tr("已暂停")
 		if m.logUnread > 0 {
-			state += fmt.Sprintf("  +%d 未读", m.logUnread)
+			state += m.tr("  +%d 未读", m.logUnread)
 		}
 	}
 	innerWidth := max(1, m.width-4)
 	visible := max(1, height-4)
 	end := clamp(logCount-m.logOffset, 0, logCount)
 	start := max(0, end-visible)
-	position := "等待数据"
+	position := m.tr("等待数据")
 	if logCount > 0 {
 		position = fmt.Sprintf("%d-%d/%d", start+1, end, logCount)
 	}
 	lines := []string{
-		titleLine("实时日志", state+"  "+position, innerWidth),
-		lipgloss.NewStyle().Foreground(c.muted).Render(padRight("  时间     级别   消息", innerWidth)),
+		titleLine(m.tr("实时日志"), state+"  "+position, innerWidth),
+		lipgloss.NewStyle().Foreground(c.muted).Render(padRight(m.tr("  时间     级别   消息"), innerWidth)),
 	}
 	for index := start; index < end; index++ {
 		entry := m.logViewEntry(index)
@@ -679,11 +687,11 @@ func (m Model) renderLogs(height int) string {
 		lines = append(lines, style.Render(prefix+"  "+padRight(entry.Message, messageWidth)))
 	}
 	if logCount == 0 {
-		message := "等待日志..."
+		message := m.tr("等待日志...")
 		if !m.status.Service.Active {
-			message = "Mihomo 服务未运行"
+			message = m.tr("Mihomo 服务未运行")
 		} else if m.filter != "" && len(m.logs) > 0 {
-			message = "没有匹配日志"
+			message = m.tr("没有匹配日志")
 		}
 		lines = append(lines, lipgloss.NewStyle().Foreground(c.muted).Render(message))
 	}
@@ -693,17 +701,17 @@ func (m Model) renderLogs(height int) string {
 func (m Model) renderSettings(height int) string {
 	rows := m.settingRows()
 	rowWidth := max(1, m.width-4)
-	meta := listPosition(m.settingCursor, len(rows)) + "  Enter 修改"
-	lines := []string{titleLine("设置", meta, rowWidth)}
+	meta := listPosition(m.settingCursor, len(rows)) + "  " + m.tr("Enter 修改")
+	lines := []string{titleLine(m.tr("设置"), meta, rowWidth)}
 	start, end := viewportBounds(len(rows), m.settingCursor, m.settingOffset, m.settingsCapacity())
 	group := ""
 	for i := start; i < end; i++ {
 		row := rows[i]
 		if row.group != group {
 			group = row.group
-			lines = append(lines, lipgloss.NewStyle().Foreground(colors().muted).Render(safeText(group)))
+			lines = append(lines, lipgloss.NewStyle().Foreground(colors().muted).Render(safeText(m.tr(group))))
 		}
-		lines = append(lines, selectedRow(i == m.settingCursor, row.name, row.value, rowWidth))
+		lines = append(lines, selectedRow(i == m.settingCursor, m.tr(row.name), m.tr(row.value), rowWidth))
 	}
 	return renderPage(lines, m.width, height)
 }
@@ -716,24 +724,24 @@ type settingViewRow struct {
 
 func (m Model) settingRows() []settingViewRow {
 	known := m.status.ConfigAvailable
-	schedule := "未知"
+	schedule := m.tr("未知")
 	if m.scheduleOK {
-		schedule = toggleLabel(m.schedule.Enabled)
+		schedule = m.toggleLabel(m.schedule.Enabled)
 	}
-	mode, tun, port := "未知", "未知", "未知"
-	allowLAN, ipv6, logLevel := "未知", "未知", "未知"
+	mode, tun, port := m.tr("未知"), m.tr("未知"), m.tr("未知")
+	allowLAN, ipv6, logLevel := m.tr("未知"), m.tr("未知"), m.tr("未知")
 	if known {
-		mode = modeLabel(m.status.Mode)
-		tun = toggleLabel(m.status.TUN)
-		port = portLabel(m.status.MixedPort)
-		allowLAN = toggleLabel(m.status.AllowLAN)
-		ipv6 = toggleLabel(m.status.IPv6)
+		mode = m.modeLabel(m.status.Mode)
+		tun = m.toggleLabel(m.status.TUN)
+		port = m.portLabel(m.status.MixedPort)
+		allowLAN = m.toggleLabel(m.status.AllowLAN)
+		ipv6 = m.toggleLabel(m.status.IPv6)
 		logLevel = strings.ToUpper(empty(m.status.LogLevel, "info"))
 	}
-	service, startup := "未知", "未知"
+	service, startup := m.tr("未知"), m.tr("未知")
 	if m.serviceStatusKnown() {
-		service = toggleLabel(m.status.Service.Active)
-		startup = toggleLabel(m.status.Service.Enabled)
+		service = m.toggleLabel(m.status.Service.Active)
+		startup = m.toggleLabel(m.status.Service.Enabled)
 	}
 	return []settingViewRow{
 		{id: settingService, group: "服务与运行", name: "Mihomo 服务", value: service},
@@ -744,6 +752,7 @@ func (m Model) settingRows() []settingViewRow {
 		{id: settingMixedPort, group: "监听与网络", name: "混合端口", value: port},
 		{id: settingAllowLAN, group: "监听与网络", name: "允许局域网", value: allowLAN},
 		{id: settingIPv6, group: "监听与网络", name: "IPv6", value: ipv6},
+		{id: settingLanguage, group: "界面", name: "语言", value: m.languageName()},
 		{id: settingLogLevel, group: "日志", name: "日志级别", value: logLevel},
 	}
 }
@@ -753,15 +762,15 @@ func (m Model) renderFooter() string {
 	message := ""
 	messageStyle := lipgloss.NewStyle().Foreground(c.muted)
 	if m.quitPending {
-		message = "正在取消并完成恢复…"
+		message = m.tr("正在取消并完成恢复…")
 	} else if m.authorizing {
-		message = "等待 sudo 授权…"
+		message = m.tr("等待 sudo 授权…")
 	} else if m.privilegedOperation {
-		message = "正在执行管理员操作…"
+		message = m.tr("正在执行管理员操作…")
 	} else if m.loading {
-		message = "正在处理…"
+		message = m.tr("正在处理…")
 	} else if m.err != "" {
-		message = "错误  " + safeText(m.err)
+		message = m.tr("错误") + "  " + safeText(m.err)
 		messageStyle = messageStyle.Foreground(c.bad)
 	} else if m.toast != "" {
 		message = safeText(m.toast)
@@ -771,17 +780,17 @@ func (m Model) renderFooter() string {
 			messageStyle = messageStyle.Foreground(c.good)
 		}
 	} else if m.filter != "" {
-		message = "筛选  " + safeText(m.filter)
+		message = m.tr("筛选") + "  " + safeText(m.filter)
 	}
 
 	contentWidth := max(0, m.width-2)
 	if message == "" {
-		hints := fitFooterHints(m.pageHints(), contentWidth)
+		hints := m.fitFooterHints(m.pageHints(), contentWidth)
 		line := " " + fitLine(hints, contentWidth) + " "
 		return lipgloss.NewStyle().Foreground(c.muted).Render(fitLine(line, m.width))
 	}
 
-	essentials := fitFooterHints(nil, contentWidth)
+	essentials := m.fitFooterHints(nil, contentWidth)
 	messageWidth := max(0, contentWidth-lipgloss.Width(essentials)-2)
 	message = ansi.Truncate(message, messageWidth, "…")
 	gap := max(0, contentWidth-lipgloss.Width(message)-lipgloss.Width(essentials))
@@ -793,28 +802,36 @@ func (m Model) renderFooter() string {
 func (m Model) pageHints() []string {
 	switch m.page {
 	case pageOverview:
-		return []string{"Enter启停", "r刷新", "Tab切页"}
+		return m.translateList("Enter启停", "r刷新", "Tab切页")
 	case pageProxies:
-		return []string{"↑↓选", "←→组", "Enter切换", "t测速", "/筛选"}
+		return m.translateList("↑↓选", "←→组", "Enter切换", "t测速", "/筛选")
 	case pageProfiles:
-		return []string{"↑↓选", "a添加", "u更新", "d删除", "Enter激活"}
+		return m.translateList("↑↓选", "a添加", "u更新", "d删除", "Enter激活")
 	case pageConnections:
-		return []string{"↑↓选", "Enter关闭", "x全部", "/筛选"}
+		return m.translateList("↑↓选", "Enter关闭", "x全部", "/筛选")
 	case pageLogs:
-		pause := "Space暂停"
+		pause := m.tr("Space暂停")
 		if m.logPaused {
-			pause = "Space继续"
+			pause = m.tr("Space继续")
 		}
-		return []string{pause, "/筛选", "r刷新", "PgUp/PgDn浏览", "Home/End首尾"}
+		return append([]string{pause}, m.translateList("/筛选", "r刷新", "PgUp/PgDn浏览", "Home/End首尾")...)
 	case pageSettings:
-		return []string{"↑↓选", "Enter修改", "r刷新"}
+		return m.translateList("↑↓选", "Enter修改", "r刷新")
 	default:
 		return nil
 	}
 }
 
-func fitFooterHints(actions []string, width int) string {
-	essentials := []string{"?帮助", "q退出"}
+func (m Model) translateList(values ...string) []string {
+	result := make([]string, len(values))
+	for index, value := range values {
+		result[index] = m.tr(value)
+	}
+	return result
+}
+
+func (m Model) fitFooterHints(actions []string, width int) string {
+	essentials := []string{m.tr("?帮助"), m.tr("q退出")}
 	essentialText := strings.Join(essentials, "  ")
 	if lipgloss.Width(essentialText) > width {
 		return ansi.Truncate(essentialText, width, "")
@@ -863,11 +880,11 @@ func (m Model) renderOverlay(content string) string {
 }
 
 func (m Model) renderInput() string {
-	title := "筛选"
+	title := m.tr("筛选")
 	if m.inMode == inputProfile {
-		title = "添加配置"
+		title = m.tr("添加配置")
 	} else if m.inMode == inputMixedPort {
-		title = "修改混合端口"
+		title = m.tr("修改混合端口")
 	}
 	inputWidth := m.inputFieldWidth()
 	inputView := m.input.View()
@@ -877,56 +894,58 @@ func (m Model) renderInput() string {
 	if m.inputError != "" {
 		lines = append(lines, "", lipgloss.NewStyle().Foreground(colors().bad).Render(safeText(m.inputError)))
 	}
-	lines = append(lines, "", "Enter 确认  ·  Esc 取消")
+	lines = append(lines, "", m.tr("Enter 确认  ·  Esc 取消"))
 	return strings.Join(lines, "\n")
 }
 
 func (m Model) renderPicker() string {
-	title := "选择设置"
+	title := m.tr("选择设置")
 	switch m.picker {
 	case pickerTUN:
-		title = "TUN 透明代理"
+		title = m.tr("TUN 透明代理")
 	case pickerAllowLAN:
-		title = "允许局域网"
+		title = m.tr("允许局域网")
 	case pickerIPv6:
 		title = "IPv6"
 	case pickerLogLevel:
-		title = "日志级别"
+		title = m.tr("日志级别")
+	case pickerLanguage:
+		title = m.tr("语言")
 	}
 	lines := []string{sectionTitle(title), ""}
 	for index, option := range m.pickerOptions() {
 		lines = append(lines, selectedRow(index == m.pickerCursor, option.label, "", 28))
 	}
-	lines = append(lines, "", "↑↓ 选择  ·  Enter 确认  ·  Esc 取消")
+	lines = append(lines, "", m.tr("↑↓ 选择  ·  Enter 确认  ·  Esc 取消"))
 	return strings.Join(lines, "\n")
 }
 
 func (m Model) confirmText() string {
-	message := "确认执行此操作？"
+	message := m.tr("确认执行此操作？")
 	switch m.confirm {
 	case confirmRemoveProfile:
-		message = "删除配置？"
+		message = m.tr("删除配置？")
 	case confirmCloseConnection:
-		message = "关闭连接？"
+		message = m.tr("关闭连接？")
 	case confirmCloseAll:
-		message = "关闭全部活动连接？"
+		message = m.tr("关闭全部活动连接？")
 	case confirmStopService:
-		message = "停止 Mihomo 服务？"
+		message = m.tr("停止 Mihomo 服务？")
 	case confirmEnableLAN:
-		message = "开启局域网访问？\n代理端口将对同一局域网开放。\n控制器仍仅限本机。"
+		message = m.tr("开启局域网访问？\n代理端口将对同一局域网开放。\n控制器仍仅限本机。")
 	}
 	if m.confirmTarget.label != "" && m.confirm != confirmCloseAll && m.confirm != confirmStopService {
 		message += "\n" + lipgloss.NewStyle().Foreground(colors().muted).Render(
 			truncate(m.confirmTarget.label, max(12, m.width-20)),
 		)
 	}
-	return sectionTitle("确认") + "\n\n" + message + "\n\ny / Enter 确认  ·  n / Esc 取消"
+	return sectionTitle(m.tr("确认")) + "\n\n" + message + "\n\n" + m.tr("y / Enter 确认  ·  n / Esc 取消")
 }
 
 func (m Model) helpText() string {
-	lines := []string{sectionTitle("快捷键"), ""}
+	lines := []string{sectionTitle(m.tr("快捷键")), ""}
 	if m.width < 90 {
-		lines = append(lines,
+		lines = append(lines, m.translateList(
 			"Tab / Shift+Tab / h l 切页  ↑↓ / jk 选择",
 			"Home / End 首尾    PgUp / PgDn 翻页",
 			"Enter 执行 / 修改  r 刷新",
@@ -935,10 +954,10 @@ func (m Model) helpText() string {
 			"a / u / d 配置",
 			"Space 暂停日志     x 关闭全部连接",
 			"? / Esc 关闭帮助   q 退出",
-		)
+		)...)
 		return strings.Join(lines, "\n")
 	}
-	lines = append(lines,
+	lines = append(lines, m.translateList(
 		"Tab / Shift+Tab / h l  切换页面          Home / End     移到首尾",
 		"j k / ↑ ↓     移动选择          PgUp / PgDn     翻页浏览",
 		"Enter          执行或修改当前项  r               刷新",
@@ -947,7 +966,7 @@ func (m Model) helpText() string {
 		"a / u / d       添加、更新、删除配置",
 		"Space          暂停或继续日志    x               关闭全部连接",
 		"? / Esc        关闭帮助          q               退出",
-	)
+	)...)
 	return strings.Join(lines, "\n")
 }
 
@@ -1050,26 +1069,35 @@ func selectableRow(selected bool, plain, styled string, width int) string {
 }
 
 func profileColumnWidths(contentWidth int) (int, []int) {
-	const (
-		stateWidth   = 1
-		kindWidth    = 4
-		updatedWidth = 11
-		quotaWidth   = 12
-		expiryWidth  = 11
-		gapCount     = 5
-	)
+	return profileColumnWidthsForLanguage(contentWidth, false)
+}
+
+func (m Model) profileColumnWidths(contentWidth int) (int, []int) {
+	return profileColumnWidthsForLanguage(contentWidth, m.language == i18n.English)
+}
+
+func profileColumnWidthsForLanguage(contentWidth int, english bool) (int, []int) {
+	const stateWidth = 1
+	kindWidth := 4
+	updatedWidth := 11
+	quotaWidth := 12
+	expiryWidth := 11
+	const gapCount = 5
+	if english {
+		kindWidth = 6
+	}
 	nameWidth := max(4, contentWidth-stateWidth-kindWidth-updatedWidth-quotaWidth-expiryWidth-gapCount)
 	return nameWidth, []int{stateWidth, nameWidth, kindWidth, updatedWidth, quotaWidth, expiryWidth}
 }
 
-func profileQuota(info domain.SubscriptionInfo) (string, color.Color) {
+func (m Model) profileQuota(info domain.SubscriptionInfo) (string, color.Color) {
 	c := colors()
 	used := nonNegativeTraffic(info.Upload) + nonNegativeTraffic(info.Download)
 	if info.Total <= 0 {
 		if used == 0 {
 			return "--", c.muted
 		}
-		return "已用 " + formatCompactBytes(used), c.muted
+		return m.tr("已用 ") + formatCompactBytes(used), c.muted
 	}
 	total := nonNegativeTraffic(info.Total)
 	text := formatCompactBytes(used) + "/" + formatCompactBytes(total)
@@ -1084,7 +1112,7 @@ func profileQuota(info domain.SubscriptionInfo) (string, color.Color) {
 	}
 }
 
-func profileExpiry(expiry time.Time) (string, color.Color) {
+func (m Model) profileExpiry(expiry time.Time) (string, color.Color) {
 	c := colors()
 	if expiry.IsZero() {
 		return "--", c.muted
@@ -1092,7 +1120,7 @@ func profileExpiry(expiry time.Time) (string, color.Color) {
 	expiry = expiry.Local()
 	remaining := time.Until(expiry)
 	if remaining < 0 {
-		return "已过期", c.bad
+		return m.tr("已过期"), c.bad
 	}
 	if remaining < 7*24*time.Hour {
 		return expiry.Format("01-02 15:04"), c.warn
@@ -1122,13 +1150,17 @@ func proxyColumnWidths(contentWidth int) []int {
 }
 
 func proxyTableHeader(rowWidth int) string {
+	return Model{language: i18n.Chinese}.proxyTableHeader(rowWidth)
+}
+
+func (m Model) proxyTableHeader(rowWidth int) string {
 	widths := proxyColumnWidths(max(0, rowWidth-2))
 	return tableHeaderCells([]tableCell{
 		{text: "", width: widths[0], alignment: tableAlignCenter},
-		{text: "在线", width: widths[1], alignment: tableAlignCenter},
-		{text: "测速", width: widths[2]},
-		{text: "类型", width: widths[3]},
-		{text: "节点", width: widths[4]},
+		{text: m.tr("在线"), width: widths[1], alignment: tableAlignCenter},
+		{text: m.tr("测速"), width: widths[2]},
+		{text: m.tr("类型"), width: widths[3]},
+		{text: m.tr("节点"), width: widths[4]},
 	}, rowWidth)
 }
 
@@ -1138,12 +1170,12 @@ func (m Model) proxyTableRowAt(group domain.ProxyGroup, proxy domain.Proxy, sour
 	if group.Now == proxy.Name {
 		active = "*"
 	}
-	alive, aliveColor := "否", c.bad
+	alive, aliveColor := m.tr("否"), c.bad
 	if proxy.Alive {
-		alive, aliveColor = "是", c.good
+		alive, aliveColor = m.tr("是"), c.good
 	}
 	testState, delay := m.proxyDisplayState(group.Name, group, sourceIndex)
-	test, testColor := proxyTestLabel(testState, delay)
+	test, testColor := m.proxyTestLabel(testState, delay)
 	widths := proxyColumnWidths(max(0, rowWidth-2))
 	cells := []tableCell{
 		{text: active, width: widths[0], alignment: tableAlignCenter, foreground: c.accent, bold: active != ""},
@@ -1155,23 +1187,23 @@ func (m Model) proxyTableRowAt(group domain.ProxyGroup, proxy domain.Proxy, sour
 	return tableDataRow(selected, cells, rowWidth)
 }
 
-func proxyTestLabel(state proxyTestState, delay uint16) (string, color.Color) {
+func (m Model) proxyTestLabel(state proxyTestState, delay uint16) (string, color.Color) {
 	c := colors()
 	switch state {
 	case proxyTestSuccess:
 		if delay == 0 {
-			return "成功", c.good
+			return m.tr("成功"), c.good
 		}
 		return fmt.Sprintf("%d ms", delay), c.good
 	case proxyTestTimeout:
-		return "超时", c.warn
+		return m.tr("超时"), c.warn
 	case proxyTestFailed:
-		return "失败", c.bad
+		return m.tr("失败"), c.bad
 	default:
 		if delay > 0 {
-			return fmt.Sprintf("核心 %dms", delay), c.muted
+			return m.tr("核心 %dms", delay), c.muted
 		}
-		return "未测试", c.muted
+		return m.tr("未测试"), c.muted
 	}
 }
 
@@ -1191,11 +1223,11 @@ func scheduleToggle(known, enabled bool) *bool {
 	return boolPointer(enabled)
 }
 
-func toggleLabel(enabled bool) string {
+func (m Model) toggleLabel(enabled bool) string {
 	if enabled {
-		return "● 开启"
+		return m.tr("● 开启")
 	}
-	return "○ 关闭"
+	return m.tr("○ 关闭")
 }
 
 func selectedRow(selected bool, name, detail string, width int) string {
@@ -1449,6 +1481,13 @@ func compactOnOff(enabled bool) string {
 func portLabel(port int) string {
 	if port <= 0 {
 		return "未设置"
+	}
+	return fmt.Sprintf("%d", port)
+}
+
+func (m Model) portLabel(port int) string {
+	if port <= 0 {
+		return m.tr("未设置")
 	}
 	return fmt.Sprintf("%d", port)
 }

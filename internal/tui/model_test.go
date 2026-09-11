@@ -14,6 +14,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"mihomoctl/internal/domain"
+	"mihomoctl/internal/i18n"
 )
 
 type fakeBackend struct {
@@ -67,12 +68,14 @@ func (f *fakeBackend) TestGroup(_ context.Context, group string) (map[string]uin
 	f.tested = group
 	return f.delays, f.groupErr
 }
-func (f *fakeBackend) AddProfile(context.Context, string, string, time.Duration) error { return nil }
-func (f *fakeBackend) UpdateProfile(context.Context, string) error                     { return nil }
-func (f *fakeBackend) UseProfile(context.Context, string) error                        { return nil }
-func (f *fakeBackend) RemoveProfile(context.Context, string) error                     { return nil }
-func (f *fakeBackend) CloseConnection(context.Context, string) error                   { return nil }
-func (f *fakeBackend) CloseAllConnections(context.Context) error                       { return nil }
+func (f *fakeBackend) AddProfile(context.Context, string, string, time.Duration) (domain.Profile, error) {
+	return domain.Profile{}, nil
+}
+func (f *fakeBackend) UpdateProfile(context.Context, string) error   { return nil }
+func (f *fakeBackend) UseProfile(context.Context, string) error      { return nil }
+func (f *fakeBackend) RemoveProfile(context.Context, string) error   { return nil }
+func (f *fakeBackend) CloseConnection(context.Context, string) error { return nil }
+func (f *fakeBackend) CloseAllConnections(context.Context) error     { return nil }
 
 func testModel() Model {
 	backend := &fakeBackend{
@@ -129,6 +132,42 @@ func TestRenderPagesFit(t *testing.T) {
 					t.Fatalf("page %d at %v line %d width = %d", p, size, lineNumber+1, width)
 				}
 			}
+		}
+	}
+}
+
+func TestEnglishPagesFitMinimumTerminal(t *testing.T) {
+	pageText := map[page][2]string{
+		pageOverview:    {"Live traffic", "实时速度"},
+		pageProxies:     {"Group ·", "策略组 ·"},
+		pageProfiles:    {"Updated", "更新时间"},
+		pageConnections: {"Active connections", "活动连接"},
+		pageLogs:        {"Live logs", "实时日志"},
+		pageSettings:    {"Settings", "设置"},
+	}
+	for current := pageOverview; current <= pageSettings; current++ {
+		m := testModel()
+		m.language = i18n.English
+		m.ctx = i18n.WithLanguage(m.ctx, i18n.English)
+		m.width, m.height, m.page = 60, 16, current
+		m.syncViewports()
+		view := m.render()
+		lines := strings.Split(view, "\n")
+		if len(lines) != m.height {
+			t.Fatalf("English page %d rendered %d lines", current, len(lines))
+		}
+		for lineNumber, line := range lines {
+			if width := ansi.StringWidth(line); width > m.width {
+				t.Fatalf("English page %d line %d width = %d", current, lineNumber+1, width)
+			}
+		}
+		plain := ansi.Strip(view)
+		if !strings.Contains(plain, "Overview") || !strings.Contains(plain, "Settings") || strings.Contains(plain, "总览") || strings.Contains(plain, "设置") {
+			t.Fatalf("English page %d has untranslated navigation:\n%s", current, plain)
+		}
+		texts := pageText[current]
+		if !strings.Contains(plain, texts[0]) || strings.Contains(plain, texts[1]) {
+			t.Fatalf("English page %d text mismatch, want %q and not %q:\n%s", current, texts[0], texts[1], plain)
 		}
 	}
 }

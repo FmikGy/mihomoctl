@@ -2,11 +2,11 @@ package app
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"mihomoctl/internal/i18n"
 	"mihomoctl/internal/platform"
 )
 
@@ -33,10 +33,10 @@ func rootApplicationDirectories(paths Paths) ([]rootApplicationDirectory, error)
 	seen := make(map[string]struct{}, len(candidates))
 	for _, candidate := range candidates {
 		if candidate.path == "" || !filepath.IsAbs(candidate.path) {
-			return nil, fmt.Errorf("%s路径必须是绝对路径", candidate.name)
+			return nil, i18n.Errorf("%s路径必须是绝对路径", i18n.M(candidate.name))
 		}
 		if strings.ContainsRune(candidate.path, '\x00') || filepath.Clean(candidate.path) != candidate.path {
-			return nil, fmt.Errorf("%s路径必须是规范路径", candidate.name)
+			return nil, i18n.Errorf("%s路径必须是规范路径", i18n.M(candidate.name))
 		}
 		directory := candidate.path
 		if candidate.isFilePath {
@@ -58,7 +58,7 @@ func ensureRootApplicationDirectories(paths Paths) error {
 	}
 	for _, directory := range directories {
 		if err := platform.EnsureRootManagedDirectory(directory.path); err != nil {
-			return fmt.Errorf("%s %s 不安全: %w", directory.name, directory.path, err)
+			return i18n.Errorf("%s %s 不安全: %w", i18n.M(directory.name), directory.path, err)
 		}
 	}
 	return nil
@@ -74,7 +74,7 @@ func validateExistingRootApplicationDirectories(paths Paths) error {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
-			return fmt.Errorf("%s %s 不安全: %w", directory.name, directory.path, err)
+			return i18n.Errorf("%s %s 不安全: %w", i18n.M(directory.name), directory.path, err)
 		}
 	}
 	return nil

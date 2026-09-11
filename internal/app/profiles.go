@@ -13,13 +13,16 @@ import (
 	"time"
 
 	"mihomoctl/internal/domain"
+	"mihomoctl/internal/i18n"
 	"mihomoctl/internal/platform"
 	"mihomoctl/internal/profile"
 )
 
 const profileUpdateBatchSize = 4
-const profileSelectionRestoreTimeout = 6 * time.Second
 const profileSelectionRestoreWorkers = 4
+
+var profileSelectionRestoreTimeout = 6 * time.Second
+var profileSelectionRestorePollInterval = 250 * time.Millisecond
 
 type preparedProfileUpdate struct {
 	target   domain.Profile
@@ -51,18 +54,18 @@ func (a *App) Profiles(context.Context) ([]domain.Profile, error) {
 	return nil, err
 }
 
-func (a *App) AddProfile(ctx context.Context, name, source string, interval time.Duration) error {
+func (a *App) AddProfile(ctx context.Context, name, source string, interval time.Duration) (domain.Profile, error) {
 	source = strings.TrimSpace(source)
 	name = strings.TrimSpace(name)
 	if source == "" {
-		return errors.New("配置来源不能为空")
+		return domain.Profile{}, i18n.Errorf("配置来源不能为空")
 	}
 	if interval <= 0 {
 		interval = profile.DefaultUpdateInterval
 	}
 	if !a.isRoot() {
 		if err := a.requireManagedInstallation(); err != nil {
-			return err
+			return domain.Profile{}, err
 		}
 		if detectProfileKind(source) == domain.ProfileLocal {
 			if name == "" {
@@ -70,7 +73,7 @@ func (a *App) AddProfile(ctx context.Context, name, source string, interval time
 			}
 			content, err := profile.ReadLocalSource(source)
 			if err != nil {
-				return err
+				return domain.Profile{}, err
 			}
 			source = profile.InlineSnapshotPrefix + string(content)
 		}
@@ -78,39 +81,72 @@ func (a *App) AddProfile(ctx context.Context, name, source string, interval time
 		if name != "" {
 			args = append(args, "--name", name)
 		}
-		return a.runElevated(ctx, args, source)
+		output, err := a.runElevatedOutput(ctx, args, source)
+		if err != nil {
+			return domain.Profile{}, err
+		}
+		var result struct {
+			ID             string             `json:"id"`
+			Name           string             `json:"name"`
+			Kind           domain.ProfileKind `json:"kind"`
+			Active         bool               `json:"active"`
+			UpdateInterval string             `json:"update_interval"`
+		}
+		if err := decodeElevatedData(output, &result); err != nil {
+			return domain.Profile{}, err
+		}
+		if strings.TrimSpace(result.Name) == "" {
+			return domain.Profile{}, i18n.Errorf("提权后的配置添加结果缺少名称")
+		}
+		created := domain.Profile{ID: result.ID, Name: result.Name, Kind: result.Kind, Active: result.Active}
+		if result.UpdateInterval != "" {
+			created.UpdateInterval, err = time.ParseDuration(result.UpdateInterval)
+			if err != nil {
+				return domain.Profile{}, i18n.Errorf("提权后的配置更新间隔无效: %w", err)
+			}
+		}
+		return created, nil
 	}
-	return a.withMutation(ctx, func() error {
-		return a.addProfileRoot(ctx, name, source, interval)
+	var created domain.Profile
+	err := a.withMutation(ctx, func() error {
+		var err error
+		created, err = a.addProfileRoot(ctx, name, source, interval)
+		return err
 	})
+	return created, err
 }
 
-func (a *App) addProfileRoot(ctx context.Context, name, source string, interval time.Duration) error {
+func (a *App) addProfileRoot(ctx context.Context, name, source string, interval time.Duration) (domain.Profile, error) {
 	a.mu.Lock()
 	state, store, err := a.requireRootState()
 	a.mu.Unlock()
 	if err != nil {
-		return err
+		return domain.Profile{}, err
 	}
-	if name == "" {
+	autoName := name == ""
+	if autoName {
 		name = defaultProfileName(source)
 	}
 	profiles, err := store.List()
 	if err != nil {
-		return err
+		return domain.Profile{}, err
 	}
-	for _, item := range profiles {
-		if item.Name == name {
-			return fmt.Errorf("配置名称 %q 已存在", name)
+	if autoName {
+		name = uniqueProfileName(name, profiles)
+	} else {
+		for _, item := range profiles {
+			if item.Name == name {
+				return domain.Profile{}, i18n.Errorf("配置名称 %q 已存在", name)
+			}
 		}
 	}
 	storeCheckpoint, err := store.Checkpoint()
 	if err != nil {
-		return err
+		return domain.Profile{}, err
 	}
 	rollback, err := a.fileRollback(a.paths.PublicFile, a.paths.ClientFile)
 	if err != nil {
-		return err
+		return domain.Profile{}, err
 	}
 	rollback.add("配置存储", func(context.Context) error { return store.RestoreCheckpoint(storeCheckpoint) })
 
@@ -120,13 +156,13 @@ func (a *App) addProfileRoot(ctx context.Context, name, source string, interval 
 	} else {
 		kind := detectProfileKind(source)
 		if err := validateLocalProfilePrivilege(runningUnderSudo(), kind); err != nil {
-			return err
+			return domain.Profile{}, err
 		}
 		request := profile.AddRequest{Name: name, Kind: kind, Source: source, UpdateInterval: interval}
 		created, err = store.Add(ctx, request)
 	}
 	if err != nil {
-		return a.failAndReload(ctx, rollback, err)
+		return domain.Profile{}, a.failAndReload(ctx, rollback, err)
 	}
 	createdConfig, err := store.Config(created.ID)
 	if err == nil {
@@ -137,7 +173,7 @@ func (a *App) addProfileRoot(ctx context.Context, name, source string, interval 
 		}, platform.MaxManagedConfigBytes)
 	}
 	if err != nil {
-		return a.failAndReload(ctx, rollback, fmt.Errorf("配置在应用管理设置后无效: %w", err))
+		return domain.Profile{}, a.failAndReload(ctx, rollback, i18n.Errorf("配置在应用管理设置后无效: %w", err))
 	}
 	if created.Active {
 		config, configErr := store.Config(created.ID)
@@ -146,32 +182,48 @@ func (a *App) addProfileRoot(ctx context.Context, name, source string, interval 
 			applied, configErr = a.applyProfileConfig(ctx, state, config)
 		}
 		if configErr != nil {
-			return a.failAndReload(ctx, rollback, configErr)
+			return domain.Profile{}, a.failAndReload(ctx, rollback, configErr)
 		}
 		rollback.add("Mihomo 配置", applied.rollback)
 		a.mu.Lock()
 		err = a.saveClient(state, created.Name)
 		a.mu.Unlock()
 		if err != nil {
-			return a.failAndReload(ctx, rollback, err)
+			return domain.Profile{}, a.failAndReload(ctx, rollback, err)
 		}
 	}
 	profiles, err = store.List()
 	if err != nil {
-		return a.failAndReload(ctx, rollback, err)
+		return domain.Profile{}, a.failAndReload(ctx, rollback, err)
 	}
 	a.mu.Lock()
 	err = a.writePublicProfiles(profiles)
 	a.mu.Unlock()
 	if err != nil {
-		return a.failAndReload(ctx, rollback, err)
+		return domain.Profile{}, a.failAndReload(ctx, rollback, err)
 	}
-	return nil
+	return created, nil
+}
+
+func uniqueProfileName(base string, profiles []domain.Profile) string {
+	used := make(map[string]struct{}, len(profiles))
+	for _, item := range profiles {
+		used[item.Name] = struct{}{}
+	}
+	if _, exists := used[base]; !exists {
+		return base
+	}
+	for suffix := 2; ; suffix++ {
+		candidate := fmt.Sprintf("%s (%d)", base, suffix)
+		if _, exists := used[candidate]; !exists {
+			return candidate
+		}
+	}
 }
 
 func validateLocalProfilePrivilege(sudoChild bool, kind domain.ProfileKind) error {
 	if sudoChild && kind == domain.ProfileLocal {
-		return &InvalidInputError{Cause: errors.New("sudo 子进程拒绝直接读取本地配置路径；请以普通用户运行 mihomoctl，由程序在提权前创建安全快照")}
+		return &InvalidInputError{Cause: i18n.Errorf("sudo 子进程拒绝直接读取本地配置路径；请以普通用户运行 mihomoctl，由程序在提权前创建安全快照")}
 	}
 	return nil
 }
@@ -223,7 +275,7 @@ func (a *App) updateProfilesRoot(ctx context.Context, options domain.ProfileUpda
 		target, err = resolveProfile(store, options.Name)
 		targets = []domain.Profile{target}
 	default:
-		return errors.New("请指定配置名称、--all 或 --due")
+		return i18n.Errorf("请指定配置名称、--all 或 --due")
 	}
 	if err != nil {
 		return err
@@ -280,7 +332,7 @@ func (a *App) commitProfileUpdateBatch(
 	var updateErrors []error
 	for _, item := range prepared {
 		if item.err != nil {
-			updateErrors = append(updateErrors, fmt.Errorf("%s: %w", item.target.Name, item.err))
+			updateErrors = append(updateErrors, i18n.Errorf("%s: %w", item.target.Name, item.err))
 			continue
 		}
 		if validateErr := item.prepared.ValidateManagedConfig(profile.OverlayOptions{
@@ -288,7 +340,7 @@ func (a *App) commitProfileUpdateBatch(
 			Secret:             state.Secret,
 			Settings:           state.Settings,
 		}, platform.MaxManagedConfigBytes); validateErr != nil {
-			updateErrors = append(updateErrors, fmt.Errorf("%s: 配置在应用管理设置后无效: %w", item.target.Name, validateErr))
+			updateErrors = append(updateErrors, i18n.Errorf("%s: 配置在应用管理设置后无效: %w", item.target.Name, validateErr))
 			continue
 		}
 		ids = append(ids, item.target.ID)
@@ -320,7 +372,7 @@ func (a *App) commitProfileUpdateBatch(
 		}
 		result, updateErr := store.CommitUpdate(item.prepared)
 		if updateErr != nil {
-			updateErrors = append(updateErrors, fmt.Errorf("%s: %w", item.target.Name, updateErr))
+			updateErrors = append(updateErrors, i18n.Errorf("%s: %w", item.target.Name, updateErr))
 			if errors.Is(updateErr, profile.ErrStaleUpdate) {
 				continue
 			}
@@ -336,13 +388,13 @@ func (a *App) commitProfileUpdateBatch(
 			if configErr != nil {
 				var applyErr *platform.ApplyError
 				if errors.As(configErr, &applyErr) && applyErr.RollbackErr != nil {
-					return updateErrors, a.failAndReload(ctx, rollback, fmt.Errorf("%s 激活失败且 Mihomo 配置回滚失败: %w", item.target.Name, configErr))
+					return updateErrors, a.failAndReload(ctx, rollback, i18n.Errorf("%s 激活失败且 Mihomo 配置回滚失败: %w", item.target.Name, configErr))
 				}
 				restoreErr := store.RestoreCheckpoint(storeCheckpoint)
 				if restoreErr != nil {
-					return updateErrors, a.failAndReload(ctx, rollback, fmt.Errorf("%s 激活失败且配置存储回滚失败: %w", item.target.Name, errors.Join(configErr, restoreErr)))
+					return updateErrors, a.failAndReload(ctx, rollback, i18n.Errorf("%s 激活失败且配置存储回滚失败: %w", item.target.Name, errors.Join(configErr, restoreErr)))
 				}
-				updateErrors = append(updateErrors, fmt.Errorf("%s 激活失败: %w", item.target.Name, configErr))
+				updateErrors = append(updateErrors, i18n.Errorf("%s 激活失败: %w", item.target.Name, configErr))
 				return updateErrors, nil
 			}
 			rollback.add("Mihomo 配置", applied.rollback)
@@ -442,12 +494,23 @@ func (a *App) rememberProfileSelections(ctx context.Context, store *profile.Stor
 		// configuration switch. Keep the last successful snapshot instead.
 		return nil
 	}
-	selections := make(map[string]string)
+	selections, err := store.Selections(id)
+	if err != nil {
+		return err
+	}
+	if selections == nil {
+		selections = make(map[string]string)
+	}
+	found := false
 	for _, group := range groups {
 		if !strings.EqualFold(group.Type, "selector") || group.Now == "" || !containsName(group.All, group.Now) {
 			continue
 		}
 		selections[group.Name] = group.Now
+		found = true
+	}
+	if !found {
+		return nil
 	}
 	return store.SaveSelections(id, selections)
 }
@@ -458,96 +521,142 @@ func (a *App) restoreProfileSelections(ctx context.Context, selections map[strin
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, profileSelectionRestoreTimeout)
 	defer cancel()
-	var (
-		groups  []domain.ProxyGroup
-		lastErr error
-	)
-	for {
+	pending := make(map[string]string, len(selections))
+	for group, proxy := range selections {
+		pending[group] = proxy
+	}
+	lastFailures := make(map[string]error, len(selections))
+	items := make([]error, 0, len(selections))
+	var lastGroupErr error
+	for len(pending) > 0 {
 		attemptCtx, attemptCancel := context.WithTimeout(requestCtx, 1500*time.Millisecond)
-		groups, lastErr = a.Groups(attemptCtx)
+		groups, groupErr := a.Groups(attemptCtx)
 		attemptCancel()
-		if lastErr == nil && len(groups) > 0 {
+		if groupErr != nil {
+			lastGroupErr = groupErr
+		} else if len(groups) == 0 {
+			lastGroupErr = i18n.Errorf("代理组尚未就绪")
+		} else {
+			lastGroupErr = nil
+			available := make(map[string]domain.ProxyGroup, len(groups))
+			for _, group := range groups {
+				available[group.Name] = group
+			}
+			jobs := make([]selectionJob, 0, len(pending))
+			for groupName, proxyName := range pending {
+				group, exists := available[groupName]
+				switch {
+				case !exists:
+					lastFailures[groupName] = i18n.Errorf("策略组不存在或尚未就绪")
+				case !strings.EqualFold(group.Type, "selector"):
+					items = append(items, i18n.Errorf("%s: 已不再是手动选择组", groupName))
+					delete(pending, groupName)
+					delete(lastFailures, groupName)
+				case !containsName(group.All, proxyName):
+					lastFailures[groupName] = i18n.Errorf("之前选择的节点不存在或尚未就绪")
+				default:
+					jobs = append(jobs, selectionJob{group: groupName, proxy: proxyName})
+				}
+			}
+			for result := range a.selectProfileJobs(requestCtx, jobs) {
+				if result.err != nil {
+					lastFailures[result.group] = result.err
+					continue
+				}
+				delete(pending, result.group)
+				delete(lastFailures, result.group)
+			}
+		}
+		if len(pending) == 0 {
 			break
 		}
 		select {
 		case <-requestCtx.Done():
-			if lastErr == nil {
-				lastErr = errors.New("代理组尚未就绪")
+			for _, groupName := range sortedSelectionNames(pending) {
+				failure := lastFailures[groupName]
+				if failure == nil {
+					failure = lastGroupErr
+				}
+				if failure == nil {
+					failure = i18n.Errorf("恢复超时")
+				}
+				items = append(items, i18n.Errorf("%s: %w", groupName, failure))
 			}
-			return &OperationWarning{Message: fmt.Sprintf("配置已激活，但无法恢复节点选择: %v", lastErr)}
-		case <-time.After(250 * time.Millisecond):
+			return profileSelectionWarning(items)
+		case <-time.After(profileSelectionRestorePollInterval):
 		}
 	}
-	available := make(map[string]domain.ProxyGroup, len(groups))
-	for _, group := range groups {
-		available[group.Name] = group
-	}
-	names := make([]string, 0, len(selections))
-	for groupName := range selections {
-		names = append(names, groupName)
-	}
-	sort.Strings(names)
-	type selectionJob struct {
-		group string
-		proxy string
+	return profileSelectionWarning(items)
+}
+
+type selectionJob struct {
+	group string
+	proxy string
+}
+
+type selectionResult struct {
+	group string
+	err   error
+}
+
+func (a *App) selectProfileJobs(ctx context.Context, pending []selectionJob) <-chan selectionResult {
+	results := make(chan selectionResult, len(pending))
+	if len(pending) == 0 {
+		close(results)
+		return results
 	}
 	jobs := make(chan selectionJob)
-	failures := make(chan string, len(names))
 	var wait sync.WaitGroup
-	workers := min(profileSelectionRestoreWorkers, len(names))
+	workers := min(profileSelectionRestoreWorkers, len(pending))
 	for range workers {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
 			for job := range jobs {
-				if err := a.SelectProxy(requestCtx, job.group, job.proxy); err != nil {
-					failures <- fmt.Sprintf("%s: %v", job.group, err)
-				}
+				results <- selectionResult{group: job.group, err: a.SelectProxy(ctx, job.group, job.proxy)}
 			}
 		}()
 	}
-	for _, groupName := range names {
-		group, exists := available[groupName]
-		proxyName := selections[groupName]
-		if !exists {
-			failures <- groupName + ": 策略组不存在"
-			continue
+	go func() {
+		defer close(results)
+		for _, job := range pending {
+			select {
+			case jobs <- job:
+			case <-ctx.Done():
+				close(jobs)
+				wait.Wait()
+				return
+			}
 		}
-		if !strings.EqualFold(group.Type, "selector") {
-			failures <- groupName + ": 已不再是手动选择组"
-			continue
-		}
-		if !containsName(group.All, proxyName) {
-			failures <- groupName + ": 之前选择的节点已不存在"
-			continue
-		}
-		select {
-		case jobs <- selectionJob{group: groupName, proxy: proxyName}:
-		case <-requestCtx.Done():
-			failures <- groupName + ": 恢复超时"
-		}
+		close(jobs)
+		wait.Wait()
+	}()
+	return results
+}
+
+func sortedSelectionNames(selections map[string]string) []string {
+	names := make([]string, 0, len(selections))
+	for name := range selections {
+		names = append(names, name)
 	}
-	close(jobs)
-	wait.Wait()
-	close(failures)
-	items := make([]string, 0, len(names))
-	for failure := range failures {
-		items = append(items, failure)
-	}
+	sort.Strings(names)
+	return names
+}
+
+func profileSelectionWarning(items []error) error {
 	if len(items) == 0 {
 		return nil
 	}
-	sort.Strings(items)
+	sort.Slice(items, func(i, j int) bool { return items[i].Error() < items[j].Error() })
 	const detailLimit = 6
 	detail := items
 	if len(detail) > detailLimit {
 		detail = detail[:detailLimit]
 	}
-	message := "配置已激活，但部分节点选择未恢复: " + strings.Join(detail, "；")
 	if len(items) > len(detail) {
-		message += fmt.Sprintf("；另有 %d 项", len(items)-len(detail))
+		return operationWarningf("配置已激活，但部分节点选择未恢复: %v；另有 %d 项", localizedErrorList(detail), len(items)-len(detail))
 	}
-	return &OperationWarning{Message: message}
+	return operationWarningf("配置已激活，但部分节点选择未恢复: %v", localizedErrorList(detail))
 }
 
 func containsName(names []string, wanted string) bool {
@@ -583,7 +692,7 @@ func (a *App) removeProfileRoot(ctx context.Context, name string) error {
 		return err
 	}
 	if target.Active {
-		return errors.New("不能删除当前活动配置，请先切换到其他配置")
+		return i18n.Errorf("不能删除当前活动配置，请先切换到其他配置")
 	}
 	storeCheckpoint, err := store.Checkpoint(target.ID)
 	if err != nil {
@@ -610,7 +719,7 @@ func (a *App) removeProfileRoot(ctx context.Context, name string) error {
 func resolveProfile(store *profile.Store, value string) (domain.Profile, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return domain.Profile{}, errors.New("配置名称不能为空")
+		return domain.Profile{}, i18n.Errorf("配置名称不能为空")
 	}
 	if byID, err := store.Get(value); err == nil {
 		return byID, nil
@@ -629,9 +738,9 @@ func resolveProfile(store *profile.Store, value string) (domain.Profile, error) 
 		return matches[0], nil
 	}
 	if len(matches) > 1 {
-		return domain.Profile{}, fmt.Errorf("存在多个名为 %q 的配置，请使用 ID", value)
+		return domain.Profile{}, i18n.Errorf("存在多个名为 %q 的配置，请使用 ID", value)
 	}
-	return domain.Profile{}, fmt.Errorf("找不到配置 %q", value)
+	return domain.Profile{}, i18n.Errorf("找不到配置 %q", value)
 }
 
 func detectProfileKind(source string) domain.ProfileKind {

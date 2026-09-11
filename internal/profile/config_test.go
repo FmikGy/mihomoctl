@@ -87,8 +87,24 @@ func TestNormalizeUntrustedSourceRejectsAdditionalListeners(t *testing.T) {
 	}
 }
 
-func TestNormalizeUntrustedSourceRemovesLegacyProxyPorts(t *testing.T) {
-	raw := []byte("port: 7890\nsocks-port: 7891\nredir-port: 7892\ntproxy-port: 7893\nproxies: []\n")
+func TestNormalizeUntrustedSourceRemovesInboundAccessSettings(t *testing.T) {
+	raw := []byte(`mixed-port: 7889
+port: 7890
+socks-port: 7891
+redir-port: 7892
+tproxy-port: 7893
+allow-lan: true
+bind-address: 0.0.0.0
+authentication:
+  - attacker:secret
+skip-auth-prefixes:
+  - 0.0.0.0/0
+lan-allowed-ips:
+  - 0.0.0.0/0
+lan-disallowed-ips:
+  - 127.0.0.1/32
+proxies: []
+`)
 	got, converted, err := NormalizeUntrustedSource(raw)
 	if err != nil {
 		t.Fatal(err)
@@ -100,7 +116,11 @@ func TestNormalizeUntrustedSourceRemovesLegacyProxyPorts(t *testing.T) {
 	if err := yaml.Unmarshal(got, &config); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"port", "socks-port", "redir-port", "tproxy-port"} {
+	for _, key := range []string{
+		"mixed-port", "port", "socks-port", "redir-port", "tproxy-port",
+		"allow-lan", "bind-address", "authentication", "skip-auth-prefixes",
+		"lan-allowed-ips", "lan-disallowed-ips",
+	} {
 		if _, exists := config[key]; exists {
 			t.Errorf("sanitized config retained %q: %s", key, got)
 		}

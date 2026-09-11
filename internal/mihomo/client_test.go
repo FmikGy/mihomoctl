@@ -261,3 +261,19 @@ func TestDefaultClientLimitsResponseHeaderWait(t *testing.T) {
 		t.Fatalf("default transport = %#v", client.httpClient.Transport)
 	}
 }
+
+type stubRoundTripper struct{}
+
+func (stubRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("stub transport")
+}
+
+func TestClientTransportAcceptsCustomAndNilDefaults(t *testing.T) {
+	custom := stubRoundTripper{}
+	if got := clientTransport(custom); got != custom {
+		t.Fatalf("custom transport was replaced: %#v", got)
+	}
+	if got := clientTransport(nil); got == nil {
+		t.Fatal("nil default transport was not replaced")
+	}
+}

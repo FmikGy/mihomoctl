@@ -3,6 +3,7 @@ package profile
 import (
 	"encoding/base64"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -75,6 +76,31 @@ func TestParseURIProtocols(t *testing.T) {
 				if got := node.Config[key]; got != want {
 					t.Errorf("Config[%q] = %#v, want %#v", key, got, want)
 				}
+			}
+		})
+	}
+}
+
+func TestParseURIUsesH2TransportOptions(t *testing.T) {
+	for name, uri := range map[string]string{
+		"vless":  "vless://uuid@example.com:443?encryption=none&security=tls&type=h2&host=one.example,two.example&path=%2Fedge#H2-VLESS",
+		"trojan": "trojan://secret@example.com:443?security=tls&type=h2&host=one.example,two.example&path=%2Fedge#H2-Trojan",
+	} {
+		t.Run(name, func(t *testing.T) {
+			node, err := ParseURI(uri)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := node.Config["http-opts"]; exists {
+				t.Fatalf("H2 node retained http-opts: %#v", node.Config)
+			}
+			got, ok := node.Config["h2-opts"].(map[string]any)
+			if !ok {
+				t.Fatalf("h2-opts = %#v", node.Config["h2-opts"])
+			}
+			want := map[string]any{"path": "/edge", "host": []string{"one.example", "two.example"}}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("h2-opts = %#v, want %#v", got, want)
 			}
 		})
 	}

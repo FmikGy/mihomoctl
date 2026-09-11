@@ -36,6 +36,27 @@ func TestRedactURL(t *testing.T) {
 	}
 }
 
+func TestFetchRemoteRequestsMihomoCompatibleSubscription(t *testing.T) {
+	var userAgent, accept string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		userAgent = request.Header.Get("User-Agent")
+		accept = request.Header.Get("Accept")
+		_, _ = writer.Write([]byte(validYAML))
+	}))
+	defer server.Close()
+
+	store := newHTTPTestStore(t, server.Client())
+	if _, err := store.fetchRemote(context.Background(), server.URL, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if userAgent != subscriptionUserAgent {
+		t.Fatalf("User-Agent = %q, want %q", userAgent, subscriptionUserAgent)
+	}
+	if !strings.Contains(accept, "application/yaml") {
+		t.Fatalf("Accept = %q, want YAML support", accept)
+	}
+}
+
 func TestFetchRemoteRedirectsNeverForwardReferer(t *testing.T) {
 	tests := []struct {
 		name  string

@@ -26,17 +26,17 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.repository.default_branch || github.ref }}
 
+      - name: Validate release version
+        env:
+          RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+        run: bash scripts/validate-release-version.sh "$RELEASE_VERSION"
+
       - name: Prepare release version
         id: version
         if: github.event_name == 'workflow_dispatch'
         env:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          if [[ ! "$RELEASE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Invalid version: $RELEASE_VERSION (expected e.g. v0.1.0)"
-            exit 1
-          fi
-
           git fetch --tags --force
 
           if git rev-parse --verify --quiet "refs/tags/$RELEASE_VERSION" >/dev/null; then

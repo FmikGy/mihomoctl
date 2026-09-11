@@ -152,10 +152,14 @@ type ProfileUpdateOptions struct {
 }
 
 type DoctorCheck struct {
-	Name    string `json:"name"`
-	OK      bool   `json:"ok"`
-	Message string `json:"message"`
-	Fixed   bool   `json:"fixed,omitempty"`
+	ID           string `json:"-"`
+	Name         string `json:"name"`
+	OK           bool   `json:"ok"`
+	Message      string `json:"message"`
+	Fixed        bool   `json:"fixed,omitempty"`
+	MessageKey   string `json:"-"`
+	MessageArgs  []any  `json:"-"`
+	MessageError error  `json:"-"`
 }
 
 type ScheduleStatus struct {

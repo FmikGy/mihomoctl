@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"mihomoctl/internal/domain"
+	"mihomoctl/internal/i18n"
 	"mihomoctl/internal/mihomo"
 	"mihomoctl/internal/platform"
 	"mihomoctl/internal/profile"
@@ -37,6 +37,17 @@ func (e *UnavailableError) Error() string {
 
 func (e *UnavailableError) Unwrap() error { return e.Cause }
 func (e *UnavailableError) ExitCode() int { return 4 }
+func (e *UnavailableError) Localized(language i18n.Language) string {
+	message := "Mihomo 控制器不可用"
+	if e != nil && e.Message != "" {
+		message = e.Message
+	}
+	message = i18n.T(language, message)
+	if e != nil && e.Cause != nil {
+		message += ": " + i18n.Error(language, e.Cause)
+	}
+	return message
+}
 
 var ErrNotInitialized = &UnavailableError{Message: "mihomoctl 尚未初始化，请先运行 mihomoctl init"}
 
@@ -52,6 +63,13 @@ func (e *InvalidStateError) Error() string {
 }
 func (e *InvalidStateError) Unwrap() error { return e.Cause }
 func (e *InvalidStateError) ExitCode() int { return 2 }
+func (e *InvalidStateError) Localized(language i18n.Language) string {
+	message := i18n.T(language, "mihomoctl 状态文件无效")
+	if e != nil && e.Cause != nil {
+		message += ": " + i18n.Error(language, e.Cause)
+	}
+	return message
+}
 
 type InvalidInputError struct {
 	Cause error
@@ -65,11 +83,43 @@ func (e *InvalidInputError) Error() string {
 }
 func (e *InvalidInputError) Unwrap() error { return e.Cause }
 func (e *InvalidInputError) ExitCode() int { return 2 }
+func (e *InvalidInputError) Localized(language i18n.Language) string {
+	if e == nil || e.Cause == nil {
+		return i18n.T(language, "输入无效")
+	}
+	return i18n.Error(language, e.Cause)
+}
 
 // OperationWarning reports a completed operation with non-fatal follow-up
 // failures. Presentation layers should show it as a warning, not a hard error.
 type OperationWarning struct {
 	Message string
+	message *i18n.Message
+}
+
+func operationWarningf(key string, args ...any) *OperationWarning {
+	message := i18n.M(key, args...)
+	return &OperationWarning{Message: message.String(), message: &message}
+}
+
+type localizedErrorList []error
+
+func (items localizedErrorList) Error() string {
+	return items.Localized(i18n.Chinese)
+}
+
+func (items localizedErrorList) Localized(language i18n.Language) string {
+	separator := "；"
+	if language == i18n.English {
+		separator = "; "
+	}
+	messages := make([]string, 0, len(items))
+	for _, err := range items {
+		if err != nil {
+			messages = append(messages, i18n.Error(language, err))
+		}
+	}
+	return strings.Join(messages, separator)
 }
 
 func (e *OperationWarning) Error() string {
@@ -80,6 +130,15 @@ func (e *OperationWarning) Error() string {
 }
 
 func (e *OperationWarning) Warning() bool { return true }
+func (e *OperationWarning) Localized(language i18n.Language) string {
+	if e == nil || strings.TrimSpace(e.Message) == "" {
+		return i18n.T(language, "操作已完成，但存在警告")
+	}
+	if e.message != nil {
+		return e.message.Text(language)
+	}
+	return i18n.T(language, e.Message)
+}
 
 type App struct {
 	paths               Paths
@@ -153,14 +212,14 @@ func New(options ...Option) (*App, error) {
 		a.paths.OperationLock = filepath.Join(a.paths.DataDir, ".operation.lock")
 	}
 	if a.runner == nil || a.privilegeExecutor == nil || a.euid == nil || a.executable == nil || a.executableValidator == nil || a.sudoPath == nil {
-		return nil, errors.New("mihomoctl 运行依赖不能为空")
+		return nil, i18n.Errorf("mihomoctl 运行依赖不能为空")
 	}
 	if a.paths.ProfileRoot == "" || a.paths.ConfigFile == "" || a.paths.ClientFile == "" || a.paths.DataDir == "" || a.paths.BackupDir == "" || a.paths.OperationLock == "" || a.paths.PublicFile == "" || a.paths.DefaultService == "" || a.paths.TimerUnit == "" {
-		return nil, errors.New("mihomoctl 路径配置不完整")
+		return nil, i18n.Errorf("mihomoctl 路径配置不完整")
 	}
 	if runningUnderSudo() {
 		if _, _, err := elevatedEnvironment(a.paths); err != nil {
-			return nil, &InvalidInputError{Cause: fmt.Errorf("sudo 子进程拒绝自定义受管路径: %w", err)}
+			return nil, &InvalidInputError{Cause: i18n.Errorf("sudo 子进程拒绝自定义受管路径: %w", err)}
 		}
 	}
 	// Use the real process identity here. WithEUID controls application-level
@@ -168,14 +227,14 @@ func New(options ...Option) (*App, error) {
 	// operations in a non-root process.
 	if os.Geteuid() == 0 {
 		if err := validateExistingRootApplicationDirectories(a.paths); err != nil {
-			return nil, &InvalidInputError{Cause: fmt.Errorf("验证 root 受管目录失败: %w", err)}
+			return nil, &InvalidInputError{Cause: i18n.Errorf("验证 root 受管目录失败: %w", err)}
 		}
 	}
 	stateErr := a.loadState()
 	if stateErr == nil {
 		if os.Geteuid() == 0 {
 			if err := ensureRootApplicationDirectories(a.paths); err != nil {
-				return nil, &InvalidInputError{Cause: fmt.Errorf("验证 root 受管目录失败: %w", err)}
+				return nil, &InvalidInputError{Cause: i18n.Errorf("验证 root 受管目录失败: %w", err)}
 			}
 		}
 		store, err := profile.NewStore(a.paths.ProfileRoot)
@@ -234,7 +293,7 @@ func (a *App) serviceName() string {
 
 func (a *App) requireRootState() (persistedState, *profile.Store, error) {
 	if !a.isRoot() {
-		return persistedState{}, nil, errors.New("此操作需要 root 权限")
+		return persistedState{}, nil, i18n.Errorf("此操作需要 root 权限")
 	}
 	if a.state == nil {
 		if a.stateLoadErr != nil {
@@ -360,5 +419,5 @@ func joinErrors(prefix string, errs []error) error {
 	if len(errs) == 0 {
 		return nil
 	}
-	return fmt.Errorf("%s: %w", prefix, errors.Join(errs...))
+	return i18n.Errorf("%s: %w", i18n.M(prefix), errors.Join(errs...))
 }

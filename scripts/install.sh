@@ -103,7 +103,7 @@ docdir="$destdir$prefix/share/doc/mihomoctl"
 "${install_prefix[@]}" install -d -m 0700 "$configdir"
 "${install_prefix[@]}" install -d -m 0755 "$statedir"
 "${install_prefix[@]}" install -d -m 0755 "$docdir"
-"${install_prefix[@]}" install -m 0644 "$repo_dir/LICENSE" "$repo_dir/README.md" "$docdir/"
+"${install_prefix[@]}" install -m 0644 "$repo_dir/LICENSE" "$repo_dir/README.md" "$repo_dir/GUIDE.md" "$docdir/"
 
 if ((install_units)); then
 	sed "s|^ExecStart=.*|ExecStart=$prefix/bin/mihomoctl profile update --due --output json|" \

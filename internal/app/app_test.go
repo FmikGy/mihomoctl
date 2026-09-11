@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"mihomoctl/internal/domain"
+	"mihomoctl/internal/i18n"
 	"mihomoctl/internal/mihomo"
 	"mihomoctl/internal/platform"
 )
@@ -142,6 +143,40 @@ func TestClientConfigPathIgnoresSudoUIDOutsideElevatedProcess(t *testing.T) {
 	}
 }
 
+func TestClientOwnershipIgnoresSudoIdentityOutsideElevatedProcess(t *testing.T) {
+	t.Setenv("SUDO_UID", "not-a-user")
+	t.Setenv("SUDO_GID", "not-a-group")
+	plan, err := planClientOwnershipForEUID(filepath.Join(t.TempDir(), "client.yaml"), 1000)
+	if err != nil || plan != nil {
+		t.Fatalf("ordinary user ownership plan = %#v, %v", plan, err)
+	}
+}
+
+func TestInferSettingsMigratesLegacyPortAndUsesSafeLANDefault(t *testing.T) {
+	settings := inferSettings([]byte("port: 7980\nmode: rule\n"))
+	if settings.MixedPort == nil || *settings.MixedPort != 7980 {
+		t.Fatalf("legacy port was not migrated: %#v", settings.MixedPort)
+	}
+	if settings.AllowLAN == nil || *settings.AllowLAN {
+		t.Fatalf("missing allow-lan did not default to false: %#v", settings.AllowLAN)
+	}
+
+	settings = inferSettings([]byte("mixed-port: 7990\nport: 7980\nallow-lan: true\n"))
+	if settings.MixedPort == nil || *settings.MixedPort != 7990 || settings.AllowLAN == nil || !*settings.AllowLAN {
+		t.Fatalf("explicit managed settings were not preserved: %#v", settings)
+	}
+}
+
+func TestNormalizeManagedSettingsCompletesLegacyState(t *testing.T) {
+	settings := normalizeManagedSettings(domain.ManagedSettings{})
+	if settings.MixedPort == nil || *settings.MixedPort != 7890 {
+		t.Fatalf("default mixed port = %#v", settings.MixedPort)
+	}
+	if settings.AllowLAN == nil || *settings.AllowLAN {
+		t.Fatalf("default allow-lan = %#v", settings.AllowLAN)
+	}
+}
+
 func TestApplicationStateReadersRejectSymlinks(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "target")
@@ -259,6 +294,29 @@ func TestInitializeImportsAndAppliesWithoutStartingService(t *testing.T) {
 	}
 }
 
+func TestAddProfileReturnsUniqueGeneratedNames(t *testing.T) {
+	fixture := newTransactionFixture(t)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write([]byte("mode: rule\nproxies: []\nproxy-groups: []\nrules:\n  - MATCH,DIRECT\n"))
+	}))
+	defer server.Close()
+
+	first, err := fixture.application.AddProfile(context.Background(), "", server.URL+"/first", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := fixture.application.AddProfile(context.Background(), "", server.URL+"/second", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Name == "" || second.Name != first.Name+" (2)" {
+		t.Fatalf("generated names = %q, %q", first.Name, second.Name)
+	}
+	if _, err := fixture.application.AddProfile(context.Background(), first.Name, server.URL+"/third", time.Hour); err == nil {
+		t.Fatal("explicit duplicate profile name was accepted")
+	}
+}
+
 func TestSystemConfigSnapshotSurvivesRemoteSwitchAndBulkUpdates(t *testing.T) {
 	root := t.TempDir()
 	paths := testPaths(root)
@@ -314,7 +372,7 @@ func TestSystemConfigSnapshotSurvivesRemoteSwitchAndBulkUpdates(t *testing.T) {
 		_, _ = writer.Write([]byte(remoteConfig))
 	}))
 	defer server.Close()
-	if err := application.AddProfile(context.Background(), "远程配置", server.URL, time.Nanosecond); err != nil {
+	if _, err := application.AddProfile(context.Background(), "远程配置", server.URL, time.Nanosecond); err != nil {
 		t.Fatal(err)
 	}
 	if err := application.UseProfile(context.Background(), "远程配置"); err != nil {
@@ -391,7 +449,7 @@ func TestBulkUpdateUsesBoundedBatchesWithActiveProfileFirst(t *testing.T) {
 	defer server.Close()
 	for index := range 9 {
 		name := fmt.Sprintf("远程-%d", index)
-		if err := fixture.application.AddProfile(context.Background(), name, fmt.Sprintf("%s/%d", server.URL, index), time.Hour); err != nil {
+		if _, err := fixture.application.AddProfile(context.Background(), name, fmt.Sprintf("%s/%d", server.URL, index), time.Hour); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -479,7 +537,7 @@ func TestBulkUpdateStopsWhenActiveConfigRollbackFails(t *testing.T) {
 	}))
 	defer server.Close()
 	for index := range 2 {
-		if err := fixture.application.AddProfile(context.Background(), fmt.Sprintf("远程-%d", index), fmt.Sprintf("%s/%d", server.URL, index), time.Hour); err != nil {
+		if _, err := fixture.application.AddProfile(context.Background(), fmt.Sprintf("远程-%d", index), fmt.Sprintf("%s/%d", server.URL, index), time.Hour); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -838,7 +896,7 @@ func TestUseProfileRemembersSelectorChoicesPerProfile(t *testing.T) {
 	if err := os.WriteFile(secondPath, secondConfig, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.application.AddProfile(context.Background(), "Second", secondPath, time.Hour); err != nil {
+	if _, err := fixture.application.AddProfile(context.Background(), "Second", secondPath, time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	profiles, err := fixture.application.Profiles(context.Background())
@@ -945,6 +1003,13 @@ func TestUseAlreadyActiveProfileDoesNotRestartCore(t *testing.T) {
 }
 
 func TestRestoreProfileSelectionsReturnsPartialSuccessWarning(t *testing.T) {
+	oldTimeout, oldPoll := profileSelectionRestoreTimeout, profileSelectionRestorePollInterval
+	profileSelectionRestoreTimeout = 80 * time.Millisecond
+	profileSelectionRestorePollInterval = 5 * time.Millisecond
+	t.Cleanup(func() {
+		profileSelectionRestoreTimeout = oldTimeout
+		profileSelectionRestorePollInterval = oldPoll
+	})
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch {
@@ -966,6 +1031,82 @@ func TestRestoreProfileSelectionsReturnsPartialSuccessWarning(t *testing.T) {
 	var warning *OperationWarning
 	if !errors.As(err, &warning) || !strings.Contains(err.Error(), "配置已激活") {
 		t.Fatalf("restore warning = %T %v", err, err)
+	}
+}
+
+func TestRestoreProfileSelectionsWaitsForProviderAndRetriesSelection(t *testing.T) {
+	oldTimeout, oldPoll := profileSelectionRestoreTimeout, profileSelectionRestorePollInterval
+	profileSelectionRestoreTimeout = 500 * time.Millisecond
+	profileSelectionRestorePollInterval = 5 * time.Millisecond
+	t.Cleanup(func() {
+		profileSelectionRestoreTimeout = oldTimeout
+		profileSelectionRestorePollInterval = oldPoll
+	})
+	var groupCalls atomic.Int32
+	var selectCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/proxies":
+			switch groupCalls.Add(1) {
+			case 1:
+				_, _ = writer.Write([]byte(`{"proxies":{"GLOBAL":{"name":"GLOBAL","type":"Selector","now":"DIRECT","all":["DIRECT"]},"DIRECT":{"name":"DIRECT","type":"Direct","alive":true}}}`))
+			case 2:
+				_, _ = writer.Write([]byte(`{"proxies":{"Proxies":{"name":"Proxies","type":"Selector","now":"","all":[]}}}`))
+			default:
+				_, _ = writer.Write([]byte(`{"proxies":{"Proxies":{"name":"Proxies","type":"Selector","now":"A","all":["A"]},"A":{"name":"A","type":"AnyTLS","alive":true}}}`))
+			}
+		case request.Method == http.MethodPut && request.URL.Path == "/proxies/Proxies":
+			if selectCalls.Add(1) == 1 {
+				http.Error(writer, "provider is settling", http.StatusServiceUnavailable)
+				return
+			}
+			writer.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	api, err := mihomo.New(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	application := &App{api: api, euid: func() int { return 1000 }}
+	if err := application.restoreProfileSelections(context.Background(), map[string]string{"Proxies": "A"}); err != nil {
+		t.Fatal(err)
+	}
+	if groupCalls.Load() < 4 || selectCalls.Load() != 2 {
+		t.Fatalf("provider polling calls=%d selection calls=%d", groupCalls.Load(), selectCalls.Load())
+	}
+}
+
+func TestRememberProfileSelectionsKeepsSnapshotOnIncompleteResponse(t *testing.T) {
+	fixture := newTransactionFixture(t)
+	active, err := fixture.application.store.Active()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.application.store.SaveSelections(active.ID, map[string]string{"Proxies": "A"}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"proxies":{"DIRECT":{"name":"DIRECT","type":"Direct","alive":true}}}`))
+	}))
+	defer server.Close()
+	api, err := mihomo.New(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.application.mu.Lock()
+	fixture.application.api = api
+	fixture.application.mu.Unlock()
+	if err := fixture.application.rememberProfileSelections(context.Background(), fixture.application.store, active.ID); err != nil {
+		t.Fatal(err)
+	}
+	selections, err := fixture.application.store.Selections(active.ID)
+	if err != nil || selections["Proxies"] != "A" {
+		t.Fatalf("remembered selections = %#v, %v", selections, err)
 	}
 }
 
@@ -1305,7 +1446,7 @@ func TestStatusReturnsUnavailableWhenRunningControllerFails(t *testing.T) {
 		api:    api,
 	}
 	status, err := application.Status(context.Background())
-	if !status.Service.Active || status.CoreVersion != "控制器不可用" {
+	if !status.Service.Active || status.CoreVersion != "" {
 		t.Fatalf("partial status = %#v", status)
 	}
 	if !status.ConfigAvailable || status.Mode != snapshot.Mode || status.MixedPort != snapshot.MixedPort || !status.AllowLAN || status.LogLevel != snapshot.LogLevel {
@@ -1455,5 +1596,26 @@ func TestUninitializedMutationDoesNotAttemptElevation(t *testing.T) {
 	var coded interface{ ExitCode() int }
 	if !errors.As(err, &coded) || coded.ExitCode() != 4 {
 		t.Fatalf("uninitialized update = %T %v, want exit code 4", err, err)
+	}
+}
+
+func TestApplicationErrorsAndWarningsLocalizeWithoutChangingChinese(t *testing.T) {
+	err := i18n.Errorf("配置名称 %q 已存在", "Daily")
+	if got := i18n.Error(i18n.English, err); got != `profile name "Daily" already exists` {
+		t.Fatalf("English application error = %q", got)
+	}
+	if got := err.Error(); got != `配置名称 "Daily" 已存在` {
+		t.Fatalf("Chinese application error changed = %q", got)
+	}
+
+	warning := operationWarningf(
+		"配置已激活，但部分节点选择未恢复: %v",
+		localizedErrorList{i18n.Errorf("%s: 策略组不存在", "Fallback")},
+	)
+	if got := warning.Localized(i18n.English); got != "profile activated, but some node selections were not restored: Fallback: proxy group does not exist" {
+		t.Fatalf("English operation warning = %q", got)
+	}
+	if got := warning.Error(); got != "配置已激活，但部分节点选择未恢复: Fallback: 策略组不存在" {
+		t.Fatalf("Chinese operation warning changed = %q", got)
 	}
 }

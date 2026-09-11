@@ -22,7 +22,7 @@ type Backend interface {
 	SetSchedule(context.Context, bool) error
 	SelectProxy(context.Context, string, string) error
 	TestGroup(context.Context, string) (map[string]uint16, error)
-	AddProfile(context.Context, string, string, time.Duration) error
+	AddProfile(context.Context, string, string, time.Duration) (domain.Profile, error)
 	UpdateProfile(context.Context, string) error
 	UseProfile(context.Context, string) error
 	RemoveProfile(context.Context, string) error

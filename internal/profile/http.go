@@ -13,6 +13,8 @@ import (
 	"mihomoctl/internal/domain"
 )
 
+const subscriptionUserAgent = "mihomo"
+
 type fetchResult struct {
 	body                []byte
 	notModified         bool
@@ -32,7 +34,9 @@ func (s *Store) fetchRemote(ctx context.Context, rawURL, etag, lastModified stri
 		return fetchResult{}, fmt.Errorf("create subscription request for %s: invalid request", RedactURL(rawURL))
 	}
 	request.Header.Set("Accept", "application/yaml, text/yaml, text/plain, */*")
-	request.Header.Set("User-Agent", "mihomoctl/1")
+	// Subscription services commonly select their output format from the
+	// client identifier. Request Mihomo-compatible YAML explicitly.
+	request.Header.Set("User-Agent", subscriptionUserAgent)
 	if etag != "" {
 		request.Header.Set("If-None-Match", etag)
 	}

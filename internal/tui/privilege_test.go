@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"mihomoctl/internal/domain"
+	"mihomoctl/internal/i18n"
 	"mihomoctl/internal/platform"
 )
 
@@ -182,6 +183,10 @@ func TestInteractiveOperationCommandForwardsTerminalAndExplainsAction(t *testing
 	}
 	if width := ansi.StringWidth(authorizationPrompt(strings.Repeat("很长的操作名称", 20))); width > 60 {
 		t.Fatalf("authorization prompt width = %d, want at most 60", width)
+	}
+	englishPrompt := authorizationPromptForLanguage(i18n.English, "启动 Mihomo 服务")
+	if !strings.Contains(englishPrompt, "Start the Mihomo") || strings.Contains(englishPrompt, "启动") || strings.Contains(englishPrompt, "验证") {
+		t.Fatalf("authorization prompt was not fully translated: %q", englishPrompt)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"mihomoctl/internal/domain"
+	"mihomoctl/internal/i18n"
 	"mihomoctl/internal/platform"
 )
 
@@ -38,7 +39,7 @@ func (a *App) SetSchedule(ctx context.Context, enabled bool) error {
 			}
 		}
 		if _, err := a.runner.Run(ctx, "systemctl", "daemon-reload"); err != nil {
-			return fmt.Errorf("重新载入 systemd 失败: %w", err)
+			return i18n.Errorf("重新载入 systemd 失败: %w", err)
 		}
 		timer, err := platform.NewSystemd(a.runner, normalizeUnit(a.paths.TimerUnit, ".timer"))
 		if err != nil {
@@ -54,32 +55,32 @@ func (a *App) SetSchedule(ctx context.Context, enabled bool) error {
 func validateScheduleCompatibility(paths Paths, state persistedState, profiles []domain.Profile) error {
 	defaults := defaultElevatedPaths()
 	managedPaths := []struct {
-		name string
+		name i18n.Message
 		got  string
 		want string
 	}{
-		{"状态文件", paths.ConfigFile, defaults.ConfigFile},
-		{"数据目录", paths.DataDir, defaults.DataDir},
-		{"配置存储", paths.ProfileRoot, defaults.ProfileRoot},
-		{"备份目录", paths.BackupDir, defaults.BackupDir},
-		{"操作锁", paths.OperationLock, defaults.OperationLock},
-		{"公开状态", paths.PublicFile, defaults.PublicFile},
-		{"定时器", paths.TimerUnit, defaults.TimerUnit},
+		{i18n.M("状态文件"), paths.ConfigFile, defaults.ConfigFile},
+		{i18n.M("数据目录"), paths.DataDir, defaults.DataDir},
+		{i18n.M("配置存储"), paths.ProfileRoot, defaults.ProfileRoot},
+		{i18n.M("备份目录"), paths.BackupDir, defaults.BackupDir},
+		{i18n.M("操作锁"), paths.OperationLock, defaults.OperationLock},
+		{i18n.M("公开状态"), paths.PublicFile, defaults.PublicFile},
+		{i18n.M("定时器"), paths.TimerUnit, defaults.TimerUnit},
 	}
 	for _, item := range managedPaths {
 		if item.got != item.want {
-			return fmt.Errorf("当前%s使用自定义位置 %q，系统定时任务只支持默认受管位置 %q；请保持定时更新关闭并手动更新", item.name, item.got, item.want)
+			return i18n.Errorf("当前%s使用自定义位置 %q，系统定时任务只支持默认受管位置 %q；请保持定时更新关闭并手动更新", item.name, item.got, item.want)
 		}
 	}
 	for _, item := range []struct {
-		name string
+		name i18n.Message
 		path string
 	}{
-		{"Mihomo 配置文件", state.Installation.ConfigPath},
-		{"Mihomo 配置目录", state.Installation.ConfigDir},
+		{i18n.M("Mihomo 配置文件"), state.Installation.ConfigPath},
+		{i18n.M("Mihomo 配置目录"), state.Installation.ConfigDir},
 	} {
 		if timerWriteRestricted(item.path) {
-			return fmt.Errorf("%s %q 位于 systemd 定时任务的只读或隔离目录中；请保持定时更新关闭并手动更新", item.name, item.path)
+			return i18n.Errorf("%s %q 位于 systemd 定时任务的只读或隔离目录中；请保持定时更新关闭并手动更新", item.name, item.path)
 		}
 	}
 	for _, item := range profiles {
@@ -88,10 +89,10 @@ func validateScheduleCompatibility(paths Paths, state persistedState, profiles [
 		}
 		resolved, err := filepath.EvalSymlinks(item.Source)
 		if err != nil {
-			return fmt.Errorf("本地配置 %q 无法用于定时更新: %w", item.Name, err)
+			return i18n.Errorf("本地配置 %q 无法用于定时更新: %w", item.Name, err)
 		}
 		if timerPrivatePath(resolved) {
-			return fmt.Errorf("本地配置 %q 位于定时任务不可见的临时目录 %q；请移动配置或保持定时更新关闭", item.Name, resolved)
+			return i18n.Errorf("本地配置 %q 位于定时任务不可见的临时目录 %q；请移动配置或保持定时更新关闭", item.Name, resolved)
 		}
 	}
 	return nil
@@ -158,43 +159,70 @@ func (a *App) Doctor(ctx context.Context, fix bool) ([]domain.DoctorCheck, error
 	a.mu.RUnlock()
 	if result, err := a.runner.Run(ctx, binary, "-v"); err == nil {
 		installationOK = true
-		checks = append(checks, domain.DoctorCheck{Name: "Mihomo 内核", OK: true, Message: strings.TrimSpace(string(result.Stdout))})
+		checks = append(checks, domain.DoctorCheck{ID: "core", Name: "Mihomo 内核", OK: true, Message: strings.TrimSpace(string(result.Stdout))})
 	} else {
-		checks = append(checks, domain.DoctorCheck{Name: "Mihomo 内核", OK: false, Message: err.Error()})
+		check := domain.DoctorCheck{ID: "core", Name: "Mihomo 内核"}
+		setDoctorError(&check, err)
+		checks = append(checks, check)
 	}
 	systemd, systemdErr := platform.NewSystemd(a.runner, a.serviceName())
 	if systemdErr == nil {
 		status, statusErr := systemd.Status(ctx)
 		if statusErr == nil {
-			checks = append(checks, domain.DoctorCheck{Name: "systemd 服务", OK: true, Message: status.State})
+			checks = append(checks, domain.DoctorCheck{ID: "service", Name: "systemd 服务", OK: true, Message: status.State})
 		} else {
-			checks = append(checks, domain.DoctorCheck{Name: "systemd 服务", OK: false, Message: statusErr.Error()})
+			check := domain.DoctorCheck{ID: "service", Name: "systemd 服务"}
+			setDoctorError(&check, statusErr)
+			checks = append(checks, check)
 		}
 	} else {
-		checks = append(checks, domain.DoctorCheck{Name: "systemd 服务", OK: false, Message: systemdErr.Error()})
+		check := domain.DoctorCheck{ID: "service", Name: "systemd 服务"}
+		setDoctorError(&check, systemdErr)
+		checks = append(checks, check)
 	}
 	if rootState != nil && systemdErr == nil {
 		checks = append(checks, checkManagedConfigPermissions(ctx, systemd, rootState.Installation.ConfigPath))
 	}
-	stateMessage := boolMessage(initialized, "状态文件可用", "尚未初始化")
-	stateOK := initialized
+	stateCheck := domain.DoctorCheck{ID: "initialized", Name: "mihomoctl 初始化", OK: initialized}
 	if loadErr != nil {
-		stateOK = false
-		stateMessage = loadErr.Error()
+		stateCheck.OK = false
+		setDoctorError(&stateCheck, loadErr)
+	} else if initialized {
+		setDoctorMessage(&stateCheck, "状态文件可用")
+	} else {
+		setDoctorMessage(&stateCheck, "尚未初始化")
 	}
-	checks = append(checks, domain.DoctorCheck{Name: "mihomoctl 初始化", OK: stateOK, Message: stateMessage})
+	checks = append(checks, stateCheck)
 	profiles, profileErr := a.Profiles(ctx)
-	checks = append(checks, domain.DoctorCheck{Name: "活动配置", OK: profileErr == nil && hasActive(profiles), Message: profileMessage(profiles, profileErr)})
+	profileCheck := domain.DoctorCheck{ID: "active-profile", Name: "活动配置", OK: profileErr == nil && hasActive(profiles)}
+	switch {
+	case profileErr != nil:
+		setDoctorError(&profileCheck, profileErr)
+	case profileCheck.OK:
+		for _, item := range profiles {
+			if item.Active {
+				profileCheck.Message = item.Name
+				break
+			}
+		}
+	default:
+		setDoctorMessage(&profileCheck, "没有活动配置")
+	}
+	checks = append(checks, profileCheck)
 	apiOK := false
 	if client, err := a.checkAPI(); err == nil {
 		if version, versionErr := client.Version(ctx); versionErr == nil {
 			apiOK = true
-			checks = append(checks, domain.DoctorCheck{Name: "控制器 API", OK: true, Message: version.Version})
+			checks = append(checks, domain.DoctorCheck{ID: "controller", Name: "控制器 API", OK: true, Message: version.Version})
 		} else {
-			checks = append(checks, domain.DoctorCheck{Name: "控制器 API", OK: false, Message: versionErr.Error()})
+			check := domain.DoctorCheck{ID: "controller", Name: "控制器 API"}
+			setDoctorError(&check, versionErr)
+			checks = append(checks, check)
 		}
 	} else {
-		checks = append(checks, domain.DoctorCheck{Name: "控制器 API", OK: false, Message: err.Error()})
+		check := domain.DoctorCheck{ID: "controller", Name: "控制器 API"}
+		setDoctorError(&check, err)
+		checks = append(checks, check)
 	}
 
 	if fix && a.isRoot() && installationOK {
@@ -240,11 +268,11 @@ func (a *App) Doctor(ctx context.Context, fix bool) ([]domain.DoctorCheck, error
 			return checks, err
 		}
 		for index := range checks {
-			if checks[index].Name == "mihomoctl 初始化" || checks[index].Name == "活动配置" || checks[index].Name == "Mihomo 配置权限" {
+			if checks[index].ID == "initialized" || checks[index].ID == "active-profile" || checks[index].ID == "config-permissions" {
 				checks[index].OK = true
 				checks[index].Fixed = true
-				if checks[index].Name == "Mihomo 配置权限" {
-					checks[index].Message = "已按 Mihomo 服务用户收紧"
+				if checks[index].ID == "config-permissions" {
+					setDoctorMessage(&checks[index], "已按 Mihomo 服务用户收紧")
 				}
 			}
 		}
@@ -256,15 +284,15 @@ func (a *App) Doctor(ctx context.Context, fix bool) ([]domain.DoctorCheck, error
 }
 
 func checkManagedConfigPermissions(ctx context.Context, systemd *platform.Systemd, path string) domain.DoctorCheck {
-	check := domain.DoctorCheck{Name: "Mihomo 配置权限"}
+	check := domain.DoctorCheck{ID: "config-permissions", Name: "Mihomo 配置权限"}
 	access, err := serviceConfigAccess(ctx, systemd)
 	if err != nil {
-		check.Message = err.Error()
+		setDoctorError(&check, err)
 		return check
 	}
 	info, err := os.Lstat(path)
 	if err != nil {
-		check.Message = fmt.Sprintf("检查 %s 失败: %v", path, err)
+		setDoctorMessage(&check, "检查 %s 失败: %v", path, err)
 		return check
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
@@ -273,11 +301,11 @@ func checkManagedConfigPermissions(ctx context.Context, systemd *platform.System
 		wantMode = 0o640
 	}
 	if !ok || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		check.Message = "配置路径不是普通文件"
+		setDoctorMessage(&check, "配置路径不是普通文件")
 		return check
 	}
 	if int(stat.Uid) != access.UID || int(stat.Gid) != access.GID || info.Mode().Perm() != wantMode {
-		check.Message = fmt.Sprintf("当前 %d:%d %04o，期望 %d:%d %04o", stat.Uid, stat.Gid, info.Mode().Perm(), access.UID, access.GID, wantMode)
+		setDoctorMessage(&check, "当前 %d:%d %04o，期望 %d:%d %04o", stat.Uid, stat.Gid, info.Mode().Perm(), access.UID, access.GID, wantMode)
 		return check
 	}
 	check.OK = true
@@ -294,21 +322,17 @@ func hasActive(profiles []domain.Profile) bool {
 	return false
 }
 
-func profileMessage(profiles []domain.Profile, err error) string {
-	if err != nil {
-		return err.Error()
-	}
-	for _, item := range profiles {
-		if item.Active {
-			return item.Name
-		}
-	}
-	return "没有活动配置"
+func setDoctorMessage(check *domain.DoctorCheck, key string, args ...any) {
+	message := i18n.M(key, args...)
+	check.Message = message.String()
+	check.MessageKey = key
+	check.MessageArgs = append([]any(nil), args...)
+	check.MessageError = nil
 }
 
-func boolMessage(value bool, yes, no string) string {
-	if value {
-		return yes
-	}
-	return no
+func setDoctorError(check *domain.DoctorCheck, err error) {
+	check.Message = err.Error()
+	check.MessageKey = ""
+	check.MessageArgs = nil
+	check.MessageError = err
 }
