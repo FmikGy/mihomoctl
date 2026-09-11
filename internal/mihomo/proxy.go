@@ -13,6 +13,8 @@ import (
 	"mihomoctl/internal/i18n"
 )
 
+const defaultDelayTimeout = 5 * time.Second
+
 type proxyResponse struct {
 	Proxies map[string]proxyPayload `json:"proxies"`
 }
@@ -142,7 +144,7 @@ func delayQuery(testURL string, timeout time.Duration) (url.Values, error) {
 		return nil, i18n.Errorf("测速超时不能为负数")
 	}
 	if timeout == 0 {
-		timeout = 5 * time.Second
+		timeout = defaultDelayTimeout
 	}
 	milliseconds := int64(math.Ceil(float64(timeout) / float64(time.Millisecond)))
 	if milliseconds < 1 {

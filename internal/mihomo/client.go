@@ -17,7 +17,7 @@ import (
 
 const (
 	defaultRequestTimeout        = 10 * time.Second
-	defaultResponseHeaderTimeout = 5 * time.Second
+	defaultResponseHeaderTimeout = 10 * time.Second
 	maxErrorBody                 = 64 << 10
 	maxErrorMessageRunes         = 512
 	authErrorMessage             = "认证失败"
@@ -200,9 +200,10 @@ func (c *Client) request(
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		requestErr := requestCtx.Err()
 		cancel()
-		if requestCtx.Err() != nil {
-			return nil, nil, i18n.Errorf("Mihomo API 请求已取消或超时: %w", requestCtx.Err())
+		if requestErr != nil {
+			return nil, nil, i18n.Errorf("Mihomo API 请求已取消或超时: %w", requestErr)
 		}
 		return nil, nil, i18n.Errorf("无法连接 Mihomo API: %w", err)
 	}

@@ -260,12 +260,32 @@ func TestDefaultClientLimitsResponseHeaderWait(t *testing.T) {
 	if !ok || transport.ResponseHeaderTimeout != defaultResponseHeaderTimeout {
 		t.Fatalf("default transport = %#v", client.httpClient.Transport)
 	}
+	if transport.ResponseHeaderTimeout <= defaultDelayTimeout {
+		t.Fatalf("response header timeout = %v, must exceed delay probe timeout %v", transport.ResponseHeaderTimeout, defaultDelayTimeout)
+	}
 }
+
+var errStubTransport = errors.New("stub transport")
 
 type stubRoundTripper struct{}
 
 func (stubRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
-	return nil, errors.New("stub transport")
+	return nil, errStubTransport
+}
+
+func TestRequestPreservesTransportError(t *testing.T) {
+	client, err := NewClient("http://127.0.0.1:9090", "", WithHTTPClient(&http.Client{Transport: stubRoundTripper{}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.Version(context.Background())
+	if !errors.Is(err, errStubTransport) {
+		t.Fatalf("Version() error = %v, want original transport error", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("transport error was incorrectly reclassified as canceled: %v", err)
+	}
 }
 
 func TestClientTransportAcceptsCustomAndNilDefaults(t *testing.T) {
